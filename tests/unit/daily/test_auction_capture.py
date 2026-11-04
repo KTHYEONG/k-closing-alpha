@@ -700,6 +700,74 @@ def test_open_roster_merges_positions_with_previous(tmp_path, monkeypatch) -> No
     assert {"000001", "000002"} <= {e.symbol for e in manifest.entries}
 
 
+class _FlakyOrderbookClient(_FakeClient):
+    def __init__(self, failures: list[dict[str, Any]]) -> None:
+        super().__init__(calls=[])
+        self._failures = list(failures)
+
+    async def get_orderbook_snapshot(self, session: Any, code: str, market_div_code: str | None = None) -> dict[str, Any]:
+        self.calls.append(("orderbook", code))
+        if self._failures:
+            return dict(self._failures.pop(0))
+        return {"rt_cd": "0", "output1": {"a": "1"}, "output2": [{"b": "2"}]}
+
+
+def _close_with_orderbook_failures(tmp_path, failures):
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-17", ["000001"])
+    client = _FlakyOrderbookClient(failures)
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="close",
+            profile=_profile(tmp_path),
+            store=store,
+            clients=[client],
+            session_clock=_clock("2026-09-17"),
+            now_fn=lambda: _seoul(2026, 9, 17, 15, 0),
+        )
+    )
+    return manifest, client
+
+
+_TRANSIENT = {"rt_cd": "1", "msg_cd": "EGW00316", "msg1": "retry please"}
+
+
+def test_transient_gateway_error_is_requeried_once_and_completes(tmp_path, caplog) -> None:
+    """EGW00316 on the first call no longer costs the round's snapshot."""
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    caplog.set_level("WARNING")
+    manifest, client = _close_with_orderbook_failures(tmp_path, [_TRANSIENT])
+    book = [e for e in manifest.entries if e.dataset == CaptureDataset.ORDERBOOK]
+    assert book and all(e.status == CaptureStatus.COMPLETE for e in book)
+    assert "status=VENDOR_ERROR" in caplog.text and "msg_cd=EGW00316" in caplog.text
+    first_round_calls = [c for c in client.calls if c == ("orderbook", "000001")]
+    assert len(first_round_calls) == len(book) + 1
+
+
+def test_persistent_gateway_error_stays_partial_with_cause_logged(tmp_path, caplog) -> None:
+    """A second consecutive failure is bounded: PARTIAL and the vendor code is in the journal."""
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    caplog.set_level("WARNING")
+    manifest, _ = _close_with_orderbook_failures(tmp_path, [_TRANSIENT, _TRANSIENT])
+    book = [e for e in manifest.entries if e.dataset == CaptureDataset.ORDERBOOK]
+    assert book[0].status == CaptureStatus.PARTIAL and book[0].reason == "vendor_failure"
+    assert manifest.status == CaptureStatus.PARTIAL
+    assert caplog.text.count("status=VENDOR_ERROR") == 2
+
+
+def test_non_transient_vendor_error_is_not_retried(tmp_path) -> None:
+    manifest, client = _close_with_orderbook_failures(tmp_path, [{"rt_cd": "1", "msg_cd": "EGW00123", "msg1": "bad"}])
+    from src.data.capture_contracts import CaptureDataset
+
+    book = [e for e in manifest.entries if e.dataset == CaptureDataset.ORDERBOOK]
+    assert len([c for c in client.calls if c[0] == "orderbook"]) == len(book)
+
+
 def test_program_vendor_failure_stays_partial(tmp_path) -> None:
     """Failed program attribution never certifies COMPLETE."""
     from src.daily import auction_capture
@@ -851,6 +919,42 @@ def test_main_skip_and_success(tmp_path, monkeypatch, caplog) -> None:
         raise AssertionError("expected ValueError")
     except ValueError:
         pass
+
+
+def test_main_logs_not_complete_detail_for_partial_manifest(tmp_path, monkeypatch, caplog) -> None:
+    """A PARTIAL run names the symbol, round and reason in the journal without opening the manifest."""
+    import logging
+
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus, CoverageEntry
+
+    entry = CoverageEntry(
+        symbol="029460",
+        dataset=CaptureDataset.ORDERBOOK,
+        venue="KRX",
+        session="regular",
+        scheduled_at=_seoul(2026, 9, 17, 15, 25),
+        status=CaptureStatus.PARTIAL,
+        rows=0,
+        first_event_time=None,
+        last_event_time=None,
+        reason="vendor_failure",
+        raw_refs=(),
+    )
+
+    class _Manifest:
+        status = CaptureStatus.PARTIAL
+        entries = (entry,)
+
+    async def _fake_async(snapshot_date: str, phase: str, profile: Any) -> Any:
+        return _Manifest()
+
+    monkeypatch.setattr(auction_capture, "CollectionSettings", lambda: _profile(tmp_path))
+    monkeypatch.setattr(auction_capture, "_run_async", _fake_async)
+    with caplog.at_level(logging.INFO, logger=auction_capture.logger.name):
+        auction_capture.main(["--phase", "close", "--date", "2026-09-17"])
+    detail = [r.message for r in caplog.records if "NOT_COMPLETE_DETAIL" in r.message]
+    assert detail and "ORDERBOOK:PARTIAL:vendor_failure" in detail[0] and "029460@15:25:00" in detail[0]
 
 
 def test_module_execution_actually_invokes_main(monkeypatch, caplog) -> None:

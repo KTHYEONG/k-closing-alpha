@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import functools
 import logging
 import uuid
@@ -42,6 +43,9 @@ logger = logging.getLogger(__name__)
 _OPEN_OFFSET_MINUTES: tuple[int, ...] = (-20, -10, -5, -2, -1)
 _PROGRAM_OFFSET_MINUTES: tuple[int, ...] = (-8, -4)
 _OPEN_TRUST_FLOOR_SECONDS: int = 30
+# KIS gateway asks the caller to simply re-query for this code (observed 2026-11-04 15:25, one symbol lost).
+_TRANSIENT_VENDOR_CODES: frozenset[str] = frozenset({"EGW00316"})
+_TRANSIENT_VENDOR_RETRIES: int = 1
 
 
 def _previous_trading_day(snapshot_date: str) -> str:
@@ -402,27 +406,45 @@ async def _observe_orderbook_symbol(
 ) -> CoverageEntry:
     """Request and persist one symbol's orderbook snapshot for a scheduled round."""
     started = now_fn()
-    try:
-        payload = await client.get_orderbook_snapshot(session, symbol, market_div_code=KRX_CLOSE_MARKET_DIV_CODE)
-    except Exception as exc:
+    retries = 0
+    while True:
+        try:
+            payload = await client.get_orderbook_snapshot(session, symbol, market_div_code=KRX_CLOSE_MARKET_DIV_CODE)
+        except Exception as exc:
+            received = now_fn()
+            degraded.append(symbol)
+            return CoverageEntry(
+                symbol=symbol,
+                dataset=CaptureDataset.ORDERBOOK,
+                venue="KRX",
+                session="regular",
+                scheduled_at=scheduled_at,
+                status=CaptureStatus.FAILED,
+                rows=0,
+                first_event_time=started,
+                last_event_time=received,
+                reason=type(exc).__name__,
+                raw_refs=(),
+            )
         received = now_fn()
-        degraded.append(symbol)
-        return CoverageEntry(
-            symbol=symbol,
-            dataset=CaptureDataset.ORDERBOOK,
-            venue="KRX",
-            session="regular",
-            scheduled_at=scheduled_at,
-            status=CaptureStatus.FAILED,
-            rows=0,
-            first_event_time=started,
-            last_event_time=received,
-            reason=type(exc).__name__,
-            raw_refs=(),
+        body = dict(payload) if isinstance(payload, dict) else None
+        ok = isinstance(body, dict) and body.get("rt_cd") == "0"
+        if ok:
+            break
+        msg_cd = str(body.get("msg_cd")) if body else "non_dict_payload"
+        logger.warning(
+            "[DATA] stage=auction_capture status=VENDOR_ERROR phase=%s symbol=%s scheduled=%s retry=%d rt_cd=%s msg_cd=%s msg=%s",
+            phase,
+            symbol,
+            scheduled_at.isoformat(),
+            retries,
+            body.get("rt_cd") if body else "-",
+            msg_cd,
+            str(body.get("msg1", ""))[:80] if body else "-",
         )
-    received = now_fn()
-    body = dict(payload) if isinstance(payload, dict) else None
-    ok = isinstance(body, dict) and body.get("rt_cd") == "0"
+        if retries >= _TRANSIENT_VENDOR_RETRIES or msg_cd not in _TRANSIENT_VENDOR_CODES or received >= deadline:
+            break
+        retries += 1
     context = CaptureContext(
         trading_date=trading_day,
         run_id=run_id,
@@ -1037,6 +1059,18 @@ def main(argv: list[str] | None = None) -> None:
         snapshot_date,
         len(manifest.entries),
     )
+    not_complete = [entry for entry in manifest.entries if entry.status is not CaptureStatus.COMPLETE]
+    if not_complete:
+        reasons = collections.Counter(f"{entry.dataset.value}:{entry.status.value}:{entry.reason}" for entry in not_complete)
+        sample = ",".join(f"{entry.symbol}@{entry.scheduled_at:%H:%M:%S}" for entry in not_complete[:5])
+        logger.warning(
+            "[DATA] stage=auction_capture status=NOT_COMPLETE_DETAIL phase=%s date=%s n=%d reasons=%s sample=%s",
+            args.phase,
+            snapshot_date,
+            len(not_complete),
+            dict(reasons),
+            sample,
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
