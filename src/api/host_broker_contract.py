@@ -222,7 +222,7 @@ def _read_record_file(path: Path) -> TokenRecord | None:
         raise TokenStoreReadError("token record is unreadable") from None
     try:
         payload = json.loads(raw)
-    except (json.JSONDecodeError, ValueError, TypeError):
+    except (json.JSONDecodeError, ValueError, TypeError, RecursionError):
         raise TokenStoreReadError("token record is malformed") from None
     record = _parse_record(payload)
     if record is None:
