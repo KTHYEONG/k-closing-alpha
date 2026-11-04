@@ -55,10 +55,10 @@ class CollectionSettings(EnvSettings):
         COLLECTION_EXTENDED_EXHAUSTED_DAILY_MAX: Audit WARN threshold on newly EXHAUSTED keys, default 100.
         COLLECTION_EXTENDED_EXHAUSTED_AUDIT_CUTOFF_HHMMSS: KST wall time bounding the audit window, default 230000.
         COLLECTION_PIT_BACKFILL_ENABLED: Run the regular-session (decision-time) backfill stream, default True.
-        COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO: Lower EOD chg bound of the fetch superset, default 0.01
-            [redacted]
-        COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO: Exclusive upper EOD chg bound of the fetch superset, default 0.12
-            (training chg_max 0.10 plus 2%; near-limit names carry larger auction moves).
+        COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO: Lower EOD chg bound of the fetch superset, default -1.0
+            (direction-free: research reconstructs 15:20 state for every liquid name; still contains training chg_min).
+        COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO: Exclusive upper EOD chg bound of the fetch superset, default 1.0
+            (above the +-30% daily limit, so no listed name is excluded; still contains training chg_max).
         COLLECTION_PIT_BACKFILL_MIN_TRADE_VALUE_100M: EOD trade-value floor in 100M KRW, default 100.0; cumulative
             value is monotone to the close, so EOD >= floor is necessary for 15:20 >= floor (no margin).
         COLLECTION_PIT_BACKFILL_MIN_MARKET_CAP_100M: EOD market-cap floor in 100M KRW, default 495.0 (a 1% band below
@@ -148,8 +148,8 @@ class CollectionSettings(EnvSettings):
     COLLECTION_EXTENDED_EXHAUSTED_DAILY_MAX: int = Field(default=100, ge=0)
     COLLECTION_EXTENDED_EXHAUSTED_AUDIT_CUTOFF_HHMMSS: str = Field(default="230000", pattern=r"^\d{6}$")
     COLLECTION_PIT_BACKFILL_ENABLED: bool = Field(default=True)
-    COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO: float = Field(default=0.01, ge=-1.0, le=1.0, allow_inf_nan=False)
-    COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO: float = Field(default=0.12, ge=-1.0, le=1.0, allow_inf_nan=False)
+    COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO: float = Field(default=-1.0, ge=-1.0, le=1.0, allow_inf_nan=False)
+    COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO: float = Field(default=1.0, ge=-1.0, le=1.0, allow_inf_nan=False)
     COLLECTION_PIT_BACKFILL_MIN_TRADE_VALUE_100M: float = Field(default=100.0, ge=0.0, allow_inf_nan=False)
     COLLECTION_PIT_BACKFILL_MIN_MARKET_CAP_100M: float = Field(default=495.0, ge=0.0, allow_inf_nan=False)
     COLLECTION_PIT_BACKFILL_COMMON_STOCK_ONLY: bool = Field(default=False)
