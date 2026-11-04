@@ -379,7 +379,9 @@ class CaptureStore:
             for item in self.read_manifests(snapshot_date)
             if item.status == CaptureStatus.COMPLETE
             and item.completed_at <= cutoff
-            and (run_id is None or item.context.run_id == run_id)
+            # Unnamed reads skip cohort-less task manifests (auction, roster) completing after the decision;
+            # a named run stays selectable so its inconsistency is reported instead of hidden.
+            and (item.cohort is not None if run_id is None else item.context.run_id == run_id)
         ]
         if not qualifying:
             raise FileNotFoundError(f"no qualifying verified decision capture: {snapshot_date!r}")
