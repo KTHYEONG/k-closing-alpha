@@ -368,3 +368,76 @@ def test_skipped_sealed_prune_is_not_a_failure(monkeypatch, caplog) -> None:
     summary = [r for r in caplog.records if "stage=backup_prune" in r.getMessage() and "dry_run=" in r.getMessage()]
     assert len(summary) == 1
     assert "sealed_skipped=seal_lock_held" in summary[0].getMessage()
+
+
+def _stub_other_steps(monkeypatch) -> None:
+    from src.tools import backup_prune
+    import src.tools.capture_offsite as capture_offsite
+
+    monkeypatch.setattr(backup_prune, "prune_backups", lambda **kw: [])
+    monkeypatch.setattr(backup_prune, "prune_local_intraday_backups", lambda **kw: [])
+    monkeypatch.setattr(
+        backup_prune, "prune_local_sealed_capture",
+        lambda *a, **kw: capture_offsite.LocalRetentionReport(removed=(), kept=(), bytes_removed=0),
+    )
+
+
+def test_prune_history_step_disabled_by_default(monkeypatch, caplog) -> None:
+    import logging
+
+    from src.tools import backup_prune
+
+    _stub_other_steps(monkeypatch)
+    monkeypatch.delenv("HISTORY_EVICTION_ENABLED", raising=False)
+
+    def _never(**kwargs):
+        raise AssertionError("eviction must not run when disabled")
+
+    monkeypatch.setattr(backup_prune, "evict_verified_partitions", _never)
+    with caplog.at_level(logging.INFO, logger="src.tools.backup_prune"):
+        backup_prune.main([])
+
+    assert any("step=local_history status=disabled" in r.getMessage() for r in caplog.records)
+    assert any("history_evicted=0" in r.getMessage() for r in caplog.records)
+
+
+def test_prune_history_step_runs_when_enabled(monkeypatch, tmp_path) -> None:
+    from src import settings
+    from src.data.partition_eviction import EvictionReport
+    from src.tools import backup_prune
+
+    _stub_other_steps(monkeypatch)
+    monkeypatch.setenv("HISTORY_EVICTION_ENABLED", "true")
+    monkeypatch.setattr(settings, "HISTORY_DIR", tmp_path)
+    seen: dict = {}
+
+    def _fake(**kwargs):
+        seen.update(kwargs)
+        return EvictionReport(("a",), (), 5, False, False)
+
+    monkeypatch.setattr(backup_prune, "evict_verified_partitions", _fake)
+    backup_prune.main(["--dry-run"])
+
+    assert seen["dry_run"] is True and seen["max_files"] == 400
+    assert seen["remote_base"].endswith("/data/history")
+    assert [f.name for f in seen["families"]] == ["bars", "ticks", "sameday"]
+
+
+def test_prune_history_step_failure_isolated(monkeypatch) -> None:
+    import pytest
+
+    from src.tools import backup_prune
+
+    ran: list[str] = []
+    _stub_other_steps(monkeypatch)
+    monkeypatch.setattr(backup_prune, "prune_backups", lambda **kw: ran.append("remote") or [])
+    monkeypatch.setenv("HISTORY_EVICTION_ENABLED", "true")
+
+    def _boom(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(backup_prune, "evict_verified_partitions", _boom)
+    with pytest.raises(SystemExit) as excinfo:
+        backup_prune.main([])
+
+    assert excinfo.value.code == 1 and ran == ["remote"]

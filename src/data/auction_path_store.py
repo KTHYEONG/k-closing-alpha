@@ -19,6 +19,7 @@ from src.config.market_session import (
     DECISION_WINDOW_END_HHMMSS,
 )
 from src.data.io_utils import atomic_write_parquet
+from src.data.partition_eviction import require_writable
 
 __all__ = [
     "AUCTION_PATH_COLUMNS",
@@ -143,8 +144,10 @@ def write_auction_path_partition(frame: pd.DataFrame, snapshot_date: str) -> int
     """Atomically replace one day's partition with ``frame``."""
     if frame is None or len(frame) == 0:
         return 0
+    target = auction_path_partition_path(str(snapshot_date))
+    require_writable(target)
     ordered = frame.reindex(columns=list(AUCTION_PATH_COLUMNS)).copy()
     for column in ("seq", "ts_hms", "price", "buy_qty", "sell_qty"):
         ordered[column] = pd.to_numeric(ordered[column], errors="raise").astype("int64")
-    atomic_write_parquet(ordered, auction_path_partition_path(str(snapshot_date)))
+    atomic_write_parquet(ordered, target)
     return len(ordered)

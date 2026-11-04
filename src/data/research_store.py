@@ -10,6 +10,7 @@ import pandas as pd
 
 from src import settings
 from src.data.io_utils import atomic_write_parquet
+from src.data.partition_eviction import require_writable
 
 RESEARCH_DIR_NAME: str = "research"
 _DATASET_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -41,6 +42,7 @@ def write_research_partition(frame: pd.DataFrame, dataset: str, snapshot_date: s
         OSError: Publication failed; the destination is untouched.
     """
     path = research_partition_path(dataset, snapshot_date)
+    require_writable(path)
     if path.exists() and not overwrite:
         raise FileExistsError(f"research partition already exists: {path}")
     if len(frame) == 0:

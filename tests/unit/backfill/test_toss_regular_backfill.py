@@ -964,3 +964,60 @@ def test_consolidated_replan_retries_failed_rows_but_not_terminal_ones(env) -> N
     ledger.record(_DAY1, "regular_consolidated", [done], run_id="r2", attempted_at=_FIXED_NOW, vendor="toss")
     plan = trb.enumerate_toss_consolidated_tasks(ledger=ledger)
     assert {t.snapshot_date: t.symbols for t in plan.tasks} == {_DAY1: ("000005",)}
+
+
+def _evict(path, symbols: tuple[str, ...]) -> None:
+    import json
+
+    from src.data.partition_eviction import tombstone_path
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tombstone_path(path).write_text(json.dumps({
+        "partition": "p", "remote_path": "r", "md5": "0" * 32, "size": 1, "rows": 1,
+        "symbols": list(symbols), "evicted_at": "t",
+    }))
+
+
+def test_evicted_partition_counts_tombstone_symbols_as_stored(env) -> None:
+    from src.data.intraday_store import intraday_partition_path
+
+    profile, store, ledger = env
+    _evict(intraday_partition_path(1, _DAY1, "regular"), ("000001", "000002"))
+    client = _complete_client(["000001", "000002"], _DAY1)
+
+    summary = _run(profile, store, ledger, client, [_task(_DAY1, ("000001", "000002"))],
+                   _eod([_DAY1], ["000001", "000002"]))
+
+    assert client.calls == [] and summary.evicted == 0 and summary.tasks_done == 1
+
+
+def test_evicted_write_is_terminal_skip(env) -> None:
+    from src.data.intraday_store import intraday_partition_path
+
+    profile, store, ledger = env
+    _evict(intraday_partition_path(1, _DAY1, "regular"), ("000001",))
+    client = _complete_client(["000002"], _DAY1)
+
+    summary = _run(profile, store, ledger, client, [_task(_DAY1, ("000001", "000002"))],
+                   _eod([_DAY1], ["000001", "000002"]))
+
+    assert summary.evicted == 1 and summary.failed == 0 and summary.complete == 0
+    assert client.calls == []
+    assert summary.tasks_done == 1 and not summary.outage_aborted
+    assert ledger.terminal_symbols(_DAY1, "regular") == frozenset()
+
+
+def test_consolidated_evicted_partition_is_terminal_skip(env) -> None:
+    from src.data.intraday_store import intraday_partition_path
+
+    profile, store, ledger = env
+    _seed_regular_consolidated_ledger(ledger, _DAY1, ("000005",))
+    plan = trb.enumerate_toss_consolidated_tasks(ledger=ledger)
+    _evict(intraday_partition_path(1, _DAY1, "regular_consolidated"), ("000009",))
+    client = _complete_client(["000005"], _DAY1, volume=150)
+
+    summary = _run_consolidated(
+        profile, store, ledger, client, list(plan.tasks), _eod([_DAY1], ["000005"], volume=39000.0)
+    )
+
+    assert summary.evicted == 1 and summary.failed == 0 and client.calls == []

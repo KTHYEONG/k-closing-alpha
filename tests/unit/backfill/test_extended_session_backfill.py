@@ -1596,3 +1596,46 @@ def test_legacy_ledger_without_adjusted_copy_column_loads_and_reopens(env) -> No
     assert rows.loc["000001", "status"] == "EXHAUSTED"
     assert rows.loc["000001", "reason"] == "exhausted:price_basis_raw_basis_unavailable"
     assert bool(rows.loc["000001", "adjusted_copy"]) is True and bool(rows.loc["000002", "adjusted_copy"]) is False
+
+
+def _evict_partition(path, symbols) -> None:
+    import json
+
+    from src.data.partition_eviction import tombstone_path
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tombstone_path(path).write_text(json.dumps({
+        "partition": "p", "remote_path": "r", "md5": "0" * 32, "size": 1, "rows": 1,
+        "symbols": list(symbols), "evicted_at": "t",
+    }))
+
+
+def test_evicted_partition_counts_tombstone_symbols_as_stored(env) -> None:
+    from src.data.intraday_store import intraday_partition_path
+
+    profile, store, ledger = env
+    day = "2026-03-02"
+    _evict_partition(intraday_partition_path(1, day, "nxt_aftermarket"), ("000001", "000002"))
+    kis = _FakeKis(day, traded={"000001", "000002"})
+
+    summary = _run(profile, store, ledger, [kis], [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001", "000002"))],
+                   _raw_ref(day, {"000001", "000002"}))
+
+    assert kis.requested == [] and summary.evicted == 0
+
+
+def test_evicted_write_is_terminal_skip(env) -> None:
+    from src.data.intraday_store import intraday_partition_path
+
+    profile, store, ledger = env
+    day = "2026-03-02"
+    _evict_partition(intraday_partition_path(1, day, "nxt_aftermarket"), ("000001",))
+    kis = _FakeKis(day, traded={"000002"})
+
+    summary = _run(profile, store, ledger, [kis], [ExtendedBackfillTask(day, "nxt_aftermarket", ("000001", "000002"))],
+                   _raw_ref(day, {"000002"}))
+
+    assert summary.evicted == 1 and summary.failed == 0 and summary.complete == 0
+    assert kis.requested == [] and summary.tasks_done == 1
+    assert classify_extended_backfill_outcome(summary)[0] == "OK"
+    assert not ledger.terminal_symbols(day, "nxt_aftermarket")
