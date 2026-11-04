@@ -726,3 +726,11 @@ def test_build_runtime_fragment_succeeds_without_mock_keys(tmp_path) -> None:
     fragment = build_runtime_fragment(source)
 
     assert "KIS_MOCK_" not in fragment
+
+
+def test_vps_selectors_enable_research_roster_and_postclose() -> None:
+    from src.tools.provision_env import VPS_SELECTORS
+
+    selectors = dict(VPS_SELECTORS)
+    assert selectors["COLLECTION_RESEARCH_ROSTER_ENABLED"] == "true"
+    assert selectors["COLLECTION_POSTCLOSE_SNAPSHOT_ENABLED"] == "true"

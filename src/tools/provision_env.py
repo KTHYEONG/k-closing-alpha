@@ -89,6 +89,8 @@ VPS_SELECTORS: tuple[tuple[str, str], ...] = (
     ("COLLECTION_AFTERMARKET_BOOK_ENABLED", "true"),
     ("COLLECTION_AFTERMARKET_BOOK_SLOTS", "2,3"),
     ("DB_AUCTION_PATH_ENABLED", "true"),
+    ("COLLECTION_RESEARCH_ROSTER_ENABLED", "true"),
+    ("COLLECTION_POSTCLOSE_SNAPSHOT_ENABLED", "true"),
 )
 
 # Slot assignment SSOT: deploy/shared/kis_slot_assignments.toml (vendored from krx-alpha); tests enforce parity.
