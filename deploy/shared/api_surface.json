@@ -1,6 +1,6 @@
 {
  "schema_version": 1,
- "generated_at": "2026-10-20T08:11:23+00:00",
+ "generated_at": "2026-11-04T06:18:55+00:00",
  "projects": {
   "kca": {
    "/api/dostk/chart": {
@@ -412,6 +412,14 @@
    }
   },
   "krx": {
+   "/api/dostk/websocket": {
+    "brokers": [
+     "kiwoom"
+    ],
+    "files": [
+     "src/realtime/adapters/kiwoom.py"
+    ]
+   },
    "/api/v1/market-calendar/KR": {
     "brokers": [
      "toss"
@@ -480,6 +488,14 @@
      "src/brokers/kis/data.py"
     ]
    },
+   "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
    "/uapi/domestic-stock/v1/quotations/inquire-time-indexchartprice": {
     "brokers": [
      "kis"
@@ -489,6 +505,14 @@
     ]
    },
    "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
+   "/uapi/domestic-stock/v1/quotations/inquire-time-itemconclusion": {
     "brokers": [
      "kis"
     ],
@@ -616,6 +640,14 @@
      "src/brokers/kis/data.py"
     ]
    },
+   "fhkst03010230": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
    "fhkup03500200": {
     "brokers": [
      "kis"
@@ -632,6 +664,14 @@
      "src/brokers/kis/data.py"
     ]
    },
+   "fhpst01060000": {
+    "brokers": [
+     "kis"
+    ],
+    "files": [
+     "src/brokers/kis/data.py"
+    ]
+   },
    "fhpst01700000": {
     "brokers": [
      "kis"
@@ -641,14 +681,6 @@
     ]
    },
    "fhpst01710000": {
-    "brokers": [
-     "kis"
-    ],
-    "files": [
-     "src/brokers/kis/data.py"
-    ]
-   },
-   "fhpst01720000": {
     "brokers": [
      "kis"
     ],
@@ -687,6 +719,7 @@
     "files": [
      "src/realtime/adapters/db.py",
      "src/realtime/adapters/kis.py",
+     "src/realtime/adapters/kiwoom.py",
      "src/realtime/adapters/ls.py"
     ]
    },
@@ -697,6 +730,7 @@
     "files": [
      "src/realtime/adapters/db.py",
      "src/realtime/adapters/kis.py",
+     "src/realtime/adapters/kiwoom.py",
      "src/realtime/adapters/ls.py"
     ]
    },
@@ -883,7 +917,6 @@
      "kis"
     ],
     "files": [
-     "config/providers.toml",
      "src/integrations/kis/client.py",
      "src/integrations/kis/investor_flow.py"
     ]
