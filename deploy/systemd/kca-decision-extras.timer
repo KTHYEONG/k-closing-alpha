@@ -1,0 +1,10 @@
+[Unit]
+Description=KCA decision extras extraction (Mon-Fri 16:30:00 KST)
+
+[Timer]
+OnCalendar=Mon..Fri 16:30:00 Asia/Seoul
+Persistent=false
+Unit=kca-decision-extras.service
+
+[Install]
+WantedBy=timers.target

@@ -833,3 +833,59 @@ def test_capture_root_has_single_owner_across_consumers() -> None:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "_capture_root"
         )
     assert offenders == []
+
+
+def test_iter_run_envelopes_scoped_to_run(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    store.append_response(_response(context=_context(run_id="run-2", symbol="005930")))
+    store.append_response(_response(context=_context(run_id="run-1", symbol="005930", endpoint="price")))
+    store.append_response(_response(context=_context(run_id="run-1", symbol="000660", endpoint="price")))
+    store.append_response(_response(context=_context(run_id="run-1", symbol="000660", endpoint="price"), page_index=1))
+
+    yielded = list(store.iter_run_envelopes(DAY.isoformat(), "run-1"))
+
+    assert [path for path, _ in yielded] == [
+        "raw/2026-09-17/kis/PRICE/price/run-1/000660-p0000-a00.json.gz",
+        "raw/2026-09-17/kis/PRICE/price/run-1/000660-p0001-a00.json.gz",
+        "raw/2026-09-17/kis/PRICE/price/run-1/005930-p0000-a00.json.gz",
+    ]
+    assert all(envelope["context"]["run_id"] == "run-1" for _, envelope in yielded)
+    assert yielded[0][1]["payload"] == {"output": {"code": "005930", "price": "72000"}}
+
+
+def test_iter_run_envelopes_absent_run_yields_nothing(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    store.append_response(_response())
+
+    assert list(store.iter_run_envelopes(DAY.isoformat(), "run-missing")) == []
+    assert list(store.iter_run_envelopes("2026-09-18", "run-1")) == []
+
+
+def test_iter_run_envelopes_does_not_treat_glob_metacharacters_as_wildcards(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    store.append_response(_response(context=_context(run_id="run-1")))
+
+    assert list(store.iter_run_envelopes(DAY.isoformat(), "*")) == []
+
+
+def test_iter_run_envelopes_rejects_traversal(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+
+    with pytest.raises(ValueError, match="run_id must be path-safe"):
+        store.iter_run_envelopes(DAY.isoformat(), "../x")
+    with pytest.raises(ValueError, match="Invalid isoformat string"):
+        store.iter_run_envelopes("2026-9-17", "run-1")
+
+
+def test_iter_run_envelopes_rejects_non_envelope_artifacts(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    run_dir = tmp_path / "capture" / "raw" / DAY.isoformat() / "kis" / "PRICE" / "price" / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "005930-p0000-a00.json.gz").write_bytes(b"not gzip at all")
+
+    with pytest.raises(ValueError, match=r"corrupt raw evidence: 'raw/2026-09-17/kis/PRICE/price/run-1/005930-p0000-a00\.json\.gz'"):
+        list(store.iter_run_envelopes(DAY.isoformat(), "run-1"))
+
+    (run_dir / "005930-p0000-a00.json.gz").write_bytes(gzip.compress(b'["bare list"]', mtime=0))
+    with pytest.raises(ValueError, match="malformed raw evidence"):
+        list(store.iter_run_envelopes(DAY.isoformat(), "run-1"))

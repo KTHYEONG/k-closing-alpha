@@ -1,0 +1,12 @@
+[Unit]
+Description=KCA decision-run extras extraction from raw capture (research, no orders)
+OnFailure=kca-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/k-closing-alpha
+EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
+Environment=TZ=Asia/Seoul
+TimeoutStartSec=20min
+ExecStart=%h/.local/lib/kca/kca-run decision-extras --admission bulk -- uv run python -m src.daily.extras_extract
+ExecStopPost=-/usr/bin/docker rm -f kca-decision-extras

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import glob
 import gzip
 import hashlib
 import json
 import os
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from src.data.capture_contracts import (
     Cohort,
     CoverageEntry,
     RawCaptureError,
+    _require_path_safe,
 )
 from src.data.io_utils import atomic_write_bytes
 from src.utils.file_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, exclusive_file_lock, sidecar_lock_path
@@ -529,3 +531,34 @@ class CaptureStore:
         if not isinstance(envelope, dict) or "payload" not in envelope or "context" not in envelope:
             raise ValueError(f"malformed raw evidence: {ref.path!r}")
         return envelope
+
+    def iter_run_envelopes(self, snapshot_date: str, run_id: str) -> Iterator[tuple[str, BrokerPayload]]:
+        """Stream the raw envelopes of one run on one date, sorted by root-relative path.
+
+        Args:
+            snapshot_date: ISO trading date of the run.
+            run_id: Path-safe capture identity; only artifacts of this run are yielded.
+
+        Returns:
+            Lazy iterator of (root-relative path, decoded envelope); empty when the run has no raw evidence.
+
+        Raises:
+            ValueError: Unsafe run identity, invalid date, or a raw artifact that is not gzip-compressed JSON.
+        """
+        day = date.fromisoformat(snapshot_date)
+        _require_path_safe(run_id, "run_id")
+        rels = sorted(
+            path.relative_to(self._root).as_posix()
+            for path in self._root.glob(f"raw/{day.isoformat()}/*/*/*/{glob.escape(run_id)}/*.json.gz")
+        )
+        return self._iter_envelopes(rels)
+
+    def _iter_envelopes(self, rels: Sequence[str]) -> Iterator[tuple[str, BrokerPayload]]:
+        for rel in rels:
+            try:
+                envelope = json.loads(gzip.decompress(self._resolve(rel).read_bytes()).decode("utf-8"))
+            except (OSError, EOFError, ValueError) as exc:
+                raise ValueError(f"corrupt raw evidence: {rel!r}") from exc
+            if not isinstance(envelope, dict) or "payload" not in envelope or "context" not in envelope:
+                raise ValueError(f"malformed raw evidence: {rel!r}")
+            yield rel, envelope
