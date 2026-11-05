@@ -51,7 +51,7 @@ class CollectionSettings(EnvSettings):
         COLLECTION_BACKFILL_SLOTS: Explicit backfill key slots, default empty.
         [redacted]
         COLLECTION_KIS_MINUTE_RETENTION_DAYS: KIS minute history window, default 365.
-        HISTORY_EVICTION_ENABLED: Evict offsite-verified history partitions behind tombstones, default False.
+        HISTORY_EVICTION_ENABLED: Evict offsite-verified history partitions behind tombstones, default True.
         HISTORY_EVICTION_BARS_RETENTION_DAYS: Local retention of intraday/1m and 1m_kis_adjusted partitions, default 400.
         HISTORY_EVICTION_TICKS_RETENTION_DAYS: Local retention of intraday/ticks partitions, default 40.
         HISTORY_EVICTION_SAMEDAY_RETENTION_DAYS: Local retention of orderbook, auction_path and research partitions, default 40.
@@ -149,7 +149,7 @@ class CollectionSettings(EnvSettings):
     COLLECTION_BACKFILL_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
     [redacted]
     COLLECTION_KIS_MINUTE_RETENTION_DAYS: int = Field(default=365, gt=0)
-    HISTORY_EVICTION_ENABLED: bool = Field(default=False)
+    HISTORY_EVICTION_ENABLED: bool = Field(default=True)
     HISTORY_EVICTION_BARS_RETENTION_DAYS: int = Field(default=400, gt=0)
     HISTORY_EVICTION_TICKS_RETENTION_DAYS: int = Field(default=40, gt=0)
     HISTORY_EVICTION_SAMEDAY_RETENTION_DAYS: int = Field(default=40, gt=0)
