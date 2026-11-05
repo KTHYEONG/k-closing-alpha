@@ -921,18 +921,22 @@ Baselines (trailing rule: compare with the prev-5 trading-day median, never with
 | archive rows/day | 93–1,247 (10-12..16); 156–172 (10-29/30) |
 | price_history rows/day | ~2,762–2,767 (10-30) |
 | 1m regular | 485 k bars / 1,273 symbols, vendor `ls`, vol ratio median 0.959 (10-16) |
-| aftermarket-book manifests | 35 primary (18 × krx/nxt batches; 10-30); `-research` siblings from 11-05 (seed pending) |
-| research roster | 254 members of 400 ranking rows; drops 138 `not_listed_in_panel` (135 ETF/ETN), 7 `non_screenable_class` (11-04 21:10 dry run) |
+| aftermarket-book manifests | 35 primary (18 × krx/nxt batches; 10-30); `-research` siblings: 35 primary + 21 research dirs (56 total; 11-05), auction-path 1 primary + 1 research, cut_share 0.0 |
+| research roster | 261 members (11-05 live, finished 15:20:40, 10 s; run 15:20:30); 254 of 400 ranking rows in the 11-04 dry run; drops 138 `not_listed_in_panel` (135 ETF/ETN), 7 `non_screenable_class` (11-04 21:10 dry run) |
 | tape sweep | needs 771, recovered 604, unresolved 167, expired 0 (10-30) |
 | backup | 3–13 min; `segments` 2–170 per night (11-01: 2) |
-| runtimes | collect 25–95 s, predict ~12 s, finalize 10 s–2.5 min, archive-regular 28–57 min, archive 9–33 min, tape-sweep 24–31 min, daily-audit 1.5–4.5 min (incl. ~80 s chown), extended-backfill ~2.5 min (until 11-04; direction-free superset drain runs to the 06:50 stop) |
+| runtimes | postclose-snapshot 44 s (15:31:30–15:32:14, 591 entries: 432 TRADE_TICKS + 159 INVESTOR_ESTIMATE), research-roster 10 s, collect 40 s (11-05), predict done 15:21:13, collect 25–95 s, predict ~12 s, finalize 10 s–2.5 min, archive-regular 28–57 min, archive 9–33 min, tape-sweep 24–31 min, daily-audit 1.5–4.5 min (incl. ~80 s chown), extended-backfill ~2.5 min (until 11-04; direction-free superset drain runs to the 06:50 stop) |
 | paper NAV | 8,005,721 KRW, 0 open lots after exit (11-02) |
 
 Known conditions:
 | Since | Condition | Expected verdict while open | Re-check / expiry | Close when |
 |---|---|---|---|---|
-| 2026-11-04 | Direction-free PIT superset (`d6abd78`): extended-backfill drains ~40 k new KIS symbol-days over several nights and stops at 06:50 | R02/R03 WARN `tasks_remaining>0` on the 23:05 run | 2026-11-12 | `status=DONE tasks_remaining=0` again |
-| 2026-11-04 | Manual Toss pre-retention backfill `kca-toss-backfill-manual.service` (transient, 927 dates, started 21:16) | X01 WARN `TOKEN_REPLACED` (Toss) possible; Q11 lists `toss_regular` FAILED rows; H03 sees container `kca-toss-backfill` | 2026-11-06 | unit inactive with `status=DONE`; rerun once for FAILED rows |
+| 2026-11-05 | CLOSED: extended-backfill reached `status=DONE tasks_remaining=0 complete=47611` on the 11-04 23:05 run (00:51) | — | — | — |
+| 2026-11-04 | (closed 11-05, see above) Direction-free PIT superset (`d6abd78`): extended-backfill drains ~40 k new KIS symbol-days over several nights and stops at 06:50 | R02/R03 WARN `tasks_remaining>0` on the 23:05 run | 2026-11-12 | `status=DONE tasks_remaining=0` again |
+| 2026-11-05 | Toss manual backfill finished `status=DONE tasks_done=927 tasks_remaining=0`, but `failed=6771` rows remain: one rerun for FAILED rows is still open (needs the Toss token: not run by the ops audit) | Q11 lists `toss_regular` FAILED rows | 2026-11-06 | rerun done and Q11 clean |
+| 2026-11-04 | (unit part finished 11-05) Manual Toss pre-retention backfill `kca-toss-backfill-manual.service` (transient, 927 dates, started 21:16) | X01 WARN `TOKEN_REPLACED` (Toss) possible; Q11 lists `toss_regular` FAILED rows; H03 sees container `kca-toss-backfill` | 2026-11-06 | unit inactive with `status=DONE`; rerun once for FAILED rows |
+| 2026-11-05 | A01 WARN `collection:ticks:273:session_violation` + `terminal_proof_missing` on N: the `postclose-*` manifest (`postclose-snapshot`, session `regular` TRADE_TICKS, last_event after close) is counted by `_audit_regular_bars` (`daily_audit.py:326-381`) as regular-tick coverage; audit false positive from the postclose snapshot, not a tick loss (C03/C04/C05 PASS) | A01 WARN each N until fixed | 2026-11-12 | the audit skips `reason=postclose-snapshot` entries (fix pending, spec first) |
+| 2026-11-05 | C15 WARN `cntr_str_share=0.857` (39/273 rows NaN incl. 005930, 000660, 005490): rule needs >= 0.9; 11-04 was 0.945 (530 rows) | C15 WARN | 2026-11-12 | cause found (Kiwoom ranking list coverage vs cohort) or rule recalibrated |
 | 2026-11-04 | `decision_extras` absent for 2026-09-18..10-02 (local raw already pruned after sealing) | none (C15 is N-only, D-scoped) | — | restore sealed raw if those days are needed |
 | 2026-11-04 | `pit1520_panel` rebuilt before the superset drain finishes shows many `NOT_FETCHED` exclusions | none (manual build only) | 2026-11-12 | rebuild after the drain |
 | 2026-11-03 | Local capture backlog: on 10-30 a sweep rewrote 85 old-date `raw/` dirs (2026-01..10); `capture_prune` drains it under its time budget (`status=DEADLINE`, removed 82 on 11-02, one `rclone md5sum` per sealed entry), disk 35% | B05 WARN `kept_local_pre_prune` shrinking each run | 2026-11-05 M | still listing 2026-0x dirs at 11-05 M → prune throughput defect (batch md5 via one `lsjson --hash` instead of per-entry `md5sum`) |
@@ -970,6 +974,7 @@ Known conditions:
 - Last probe execution log:
 | Date (KST) | Rev | Window / D | Result |
 |---|---|---|---|
+| 2026-11-05 21:50 | a8a01fc09 | E 15:48, N 21:50 / 11-05 (first research day) | E all PASS (C12 261 members 15:20:36, C13 auction-close 1749 entries cut 0.0, C14 15:32:14 good_share 1.0, P01-P06, X01 clean); N: R01 R03 C03 C04 C05 C06 C13(auction-path+aftermarket-book 3498 entries) C08 C11 Q06-Q10 A03 X01 PASS; WARN C15 (0.857), B05 (known prune), A01 (postclose false positive, see §7) |
 | 2026-11-04 21:37 | 3dfe41f | E, N / 11-04 (research rows added) | C03 C04 C06 C15 PASS (C15 rows 530 = cohort, cntr_str 0.945); R01 FAIL / C12 C14 FAIL / C13 WARN only because research-roster, postclose-snapshot and decision-extras first fire on 11-05 (expected for any D ≤ 11-04); C05 WARN close partial (one KIS vendor_failure 15:25) |
 | 2026-11-02 09:40 | 88d3452 | O / 11-02 | all PASS except X01 WARN (`EGW00121`/`AUTH_REJECTED`/`ADOPTED_ROTATED` ×1, D10); 5.6 s |
 | 2026-11-02 09:41 | 88d3452 | M / 10-30 (re-audit) | CORE all PASS; WARN R03 (`auction_path DEGRADED`), X01 (D10), A04 (`kca.api_actions`); 23 s |
