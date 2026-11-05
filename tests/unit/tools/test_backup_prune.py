@@ -382,13 +382,13 @@ def _stub_other_steps(monkeypatch) -> None:
     )
 
 
-def test_prune_history_step_disabled_by_default(monkeypatch, caplog) -> None:
+def test_prune_history_step_disabled_by_env(monkeypatch, caplog) -> None:
     import logging
 
     from src.tools import backup_prune
 
     _stub_other_steps(monkeypatch)
-    monkeypatch.delenv("HISTORY_EVICTION_ENABLED", raising=False)
+    monkeypatch.setenv("HISTORY_EVICTION_ENABLED", "false")
 
     def _never(**kwargs):
         raise AssertionError("eviction must not run when disabled")
