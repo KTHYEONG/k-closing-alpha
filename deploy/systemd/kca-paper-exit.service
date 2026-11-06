@@ -8,7 +8,7 @@ WorkingDirectory=%h/k-closing-alpha
 EnvironmentFile=%h/quant-secrets/k-closing-alpha.env
 Environment=TZ=Asia/Seoul
 Environment=KIS_DATA_ROLE=decision
-# 실측 최대 4초 → 15분 (기존 유지)
-TimeoutStartSec=15min
+# Ceiling covering the 600 s max pre-start wait plus the extended-open retry budget (measured runtime is seconds).
+TimeoutStartSec=30min
 ExecStart=%h/.local/lib/kca/kca-run paper-exit --kis-data --admission critical --role decision -- uv run python -m src.daily.paper_trade --phase exit
 ExecStopPost=-/usr/bin/docker rm -f kca-paper-exit
