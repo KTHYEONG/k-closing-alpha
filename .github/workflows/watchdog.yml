@@ -16,7 +16,7 @@ jobs:
     steps:
       # GitHub 러너(Azure 대역)는 Oracle Cloud 인바운드가 드롭되므로 Tailscale 사설망으로 접속한다.
       - name: Connect to Tailscale
-        uses: tailscale/github-action@v4
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
@@ -24,7 +24,9 @@ jobs:
 
       - name: Probe VPS liveness over Tailscale
         env:
-          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY: ${{ secrets.SSH_OPS_KEY }}
+          # or-vps SSH host key (public): pinned so a host impersonating the VPS on the tailnet is refused.
+          VPS_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII444atEBxL7GUKeZS0hpR6M2QvL5H3GeBPLhNO/fTNq
           HOST: ${{ secrets.HOST }}
           REMOTE_USER: ${{ secrets.USERNAME }}
         run: |
@@ -32,10 +34,12 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/watchdog_key
           chmod 600 ~/.ssh/watchdog_key
-          SSH_OPTS="-i $HOME/.ssh/watchdog_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20"
+          printf '* %s\n' "$VPS_HOST_KEY" > ~/.ssh/known_hosts_vps
+          SSH_OPTS="-i $HOME/.ssh/watchdog_key -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts_vps -o ConnectTimeout=20"
 
           # 프로브는 PyPI 없이 돌아야 하므로 --no-sync로 실행한다.
-          ssh $SSH_OPTS "$REMOTE_USER@$HOST" "cd ~/k-closing-alpha && ~/.local/bin/uv run --no-sync python -m src.tools.watchdog_probe"
+          # The ops key is forced through ~/bin/ci-ops-gate (krx-alpha deploy/host/ci-ops-gate.sh); the name selects the allowlisted probe.
+          ssh $SSH_OPTS "$REMOTE_USER@$HOST" kca-watchdog-probe
 
       - name: Check GHCR PAT expiry
         env:

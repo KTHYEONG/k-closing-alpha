@@ -122,8 +122,13 @@ def test_watchdog_workflow_schedule_and_probe() -> None:
     workflow = Path(".github/workflows/watchdog.yml").read_text(encoding="utf-8")
 
     assert 'cron: "40 22 * * 1-5"' in workflow
-    assert "src.tools.watchdog_probe" in workflow
-    assert "uv run --no-sync" in workflow
+    # The ops key is forced through krx-alpha deploy/host/ci-ops-gate.sh, which maps this name to
+    # `uv run --no-sync python -m src.tools.watchdog_probe` in ~/k-closing-alpha.
+    assert 'ssh $SSH_OPTS "$REMOTE_USER@$HOST" kca-watchdog-probe' in workflow
+    assert "secrets.SSH_OPS_KEY" in workflow
+    assert "secrets.SSH_PRIVATE_KEY" not in workflow
+    assert "StrictHostKeyChecking=yes" in workflow
+    assert Path("src/tools/watchdog_probe.py").is_file()
     assert "tailscale/github-action" in workflow
     assert "timeout-minutes:" in workflow
 
