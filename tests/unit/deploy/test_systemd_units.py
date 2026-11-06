@@ -600,7 +600,7 @@ def test_paper_exit_service_timeout_covers_quote_retry_budget_only() -> None:
     root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
     lines = (root / "kca-paper-exit.service").read_text(encoding="utf-8").splitlines()
 
-    assert "TimeoutStartSec=15min" in lines
+    assert "TimeoutStartSec=30min" in lines
     assert not any(line.startswith("TimeoutStartSec=") and line.endswith("h") for line in lines)
 
 

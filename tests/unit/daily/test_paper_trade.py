@@ -583,6 +583,59 @@ def test_run_paper_session_exit_retries_open_quote_then_leaves_unavailable_lot_o
     assert "OPEN_UNAVAILABLE" in caplog.text
 
 
+def test_exit_quote_retry_resolves_extended_open(tmp_path, monkeypatch) -> None:
+    import asyncio
+
+    import pandas as pd
+
+    from src.daily import paper_trade
+    from src.execution.paper_broker import PaperLedger
+
+    kst = "Asia/Seoul"
+    monkeypatch.setattr(paper_trade.settings, "PAPER_SEED_CAPITAL", 10_000_000)
+    ledger = PaperLedger(root=tmp_path)
+    ledger.record(
+        [
+            {"order_id": "2026-09-10:005930:entry", "symbol": "005930", "side": "buy", "qty": 10, "fill_price": 70_000,
+             "filled_at": pd.Timestamp("2026-09-10 15:30:20", tz=kst), "decision_date": "2026-09-10", "trigger": "auction_close"},
+            {"order_id": "2026-09-10:000660:entry", "symbol": "000660", "side": "buy", "qty": 3, "fill_price": 200_000,
+             "filled_at": pd.Timestamp("2026-09-10 15:30:20", tz=kst), "decision_date": "2026-09-10", "trigger": "auction_close"},
+        ],
+        kind="fills",
+    )
+    calls: dict[str, int] = {"005930": 0, "000660": 0}
+
+    async def _quote(code: str) -> paper_trade.DatedOpenQuote:
+        calls[code] += 1
+        # 005930 prints its open only on the 15th poll (extended auction); 000660 is open at once
+        if code == "005930" and calls[code] >= 15:
+            return paper_trade.DatedOpenQuote(symbol=code, business_date="2026-09-11", open_price=71_000)
+        if code == "000660":
+            return paper_trade.DatedOpenQuote(symbol=code, business_date="2026-09-11", open_price=201_000)
+        return paper_trade.DatedOpenQuote(symbol=code, business_date="", open_price=0)
+
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    # When
+    n = asyncio.run(
+        paper_trade.run_paper_session(
+            pd.Timestamp("2026-09-11"), phase="exit", ledger=ledger, quote_fn=_quote, trading_day_fn=_open_day,
+            now_fn=lambda: pd.Timestamp("2026-09-11 09:01:00", tz=kst), sleep_fn=_sleep,
+        )
+    )
+
+    # Then
+    assert n == 2
+    assert calls == {"005930": 15, "000660": 1}
+    assert sleeps == [paper_trade.PAPER_EXIT_OPEN_QUOTE_RETRY_SECONDS] * 14
+    orders = pd.read_parquet(tmp_path / "orders.parquet").set_index("symbol")
+    assert orders.loc["005930", "status"] == "FILLED"
+    assert orders.loc["000660", "status"] == "FILLED"
+
+
 def test_run_paper_session_exit_waits_until_open_quote_is_trustworthy(tmp_path, monkeypatch) -> None:
     import asyncio
 
@@ -2750,6 +2803,16 @@ def test_paper_ledger_lock_timeout_exceeds_exit_quote_sleep_budget() -> None:
 
     # Given / Then: 락 타임아웃이 청산 시세 재시도 sleep 예산을 초과한다
     sleep_budget = (PAPER_EXIT_OPEN_QUOTE_MAX_ATTEMPTS - 1) * PAPER_EXIT_OPEN_QUOTE_RETRY_SECONDS
+    assert sleep_budget < PAPER_LEDGER_LOCK_TIMEOUT_SECONDS
+
+
+def test_exit_quote_retry_budget_covers_extended_open_and_fits_lock() -> None:
+    from src.daily.paper_trade import PAPER_EXIT_OPEN_QUOTE_MAX_ATTEMPTS, PAPER_EXIT_OPEN_QUOTE_RETRY_SECONDS
+    from src.execution.paper_broker import PAPER_LEDGER_LOCK_TIMEOUT_SECONDS
+
+    # Given / Then: 2분 시가 연장(180 s)을 덮고, 락 타임아웃 아래에 머문다
+    sleep_budget = (PAPER_EXIT_OPEN_QUOTE_MAX_ATTEMPTS - 1) * PAPER_EXIT_OPEN_QUOTE_RETRY_SECONDS
+    assert sleep_budget >= 180
     assert sleep_budget < PAPER_LEDGER_LOCK_TIMEOUT_SECONDS
 
 

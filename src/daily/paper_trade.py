@@ -65,8 +65,9 @@ from src.utils.numeric import safe_float
 
 logger = logging.getLogger(__name__)
 
-# 시가 형성 직후 stck_oprc 반영 지연에 대비한 재조회 한도: 6회 x 10초
-PAPER_EXIT_OPEN_QUOTE_MAX_ATTEMPTS: int = 6
+# Retry budget covers an extended opening auction (about 2 minutes after 09:00) and stays
+# below PAPER_LEDGER_LOCK_TIMEOUT_SECONDS: (24 - 1) * 10 s = 230 s < 300 s.
+PAPER_EXIT_OPEN_QUOTE_MAX_ATTEMPTS: int = 24
 PAPER_EXIT_OPEN_QUOTE_RETRY_SECONDS: float = 10.0
 # 휴장 연휴(추석 등 최대 ~10 달력일)에도 직전 세션 행이 포함되도록 하는 조회 창 — 빈 응답(장애)과 휴장을 구분한다
 PAPER_EXIT_DATED_QUOTE_LOOKBACK_DAYS: int = 14
