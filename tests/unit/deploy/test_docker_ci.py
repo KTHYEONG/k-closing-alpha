@@ -25,9 +25,10 @@ def test_deploy_workflow_gates_build_on_tests_and_targets_arm64() -> None:
     assert "uv run pytest -q" in text
     assert "platforms: linux/arm64" in text
     build_block = text.split("build-and-push:", 1)[1].split("\n  deploy:", 1)[0]
-    assert "needs" not in build_block
+    # Build waits only for the runtime-impact classifier, never for the test job.
+    assert "needs: changes\n" in build_block
     deploy_block = text.split("\n  deploy:", 1)[1]
-    assert "needs: [test, build-and-push]" in deploy_block
+    assert "needs: [changes, test, build-and-push]" in deploy_block
 
 
 def test_dockerfile_and_dockerignore_and_workflow_content() -> None:
@@ -153,9 +154,10 @@ def test_deploy_workflow_builds_native_arm64_and_tags_commit_sha() -> None:
     assert "sha-${{ github.sha }}" in workflow
     assert "${{ env.IMAGE }}:latest" in workflow
     build_block = workflow.split("build-and-push:", 1)[1].split("\n  deploy:", 1)[0]
-    assert "needs" not in build_block
+    # Build waits only for the runtime-impact classifier, never for the test job.
+    assert "needs: changes\n" in build_block
     deploy_block = workflow.split("\n  deploy:", 1)[1]
-    assert "needs: [test, build-and-push]" in deploy_block
+    assert "needs: [changes, test, build-and-push]" in deploy_block
     assert "uv run pytest -q" in workflow
     assert "KCA_CODE_COMMIT=${{ github.sha }}" in workflow
 
@@ -166,9 +168,10 @@ def test_build_runs_in_parallel_with_tests() -> None:
     text = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
 
     build_block = text.split("build-and-push:", 1)[1].split("\n  deploy:", 1)[0]
-    assert "needs" not in build_block
+    # Build waits only for the runtime-impact classifier, never for the test job.
+    assert "needs: changes\n" in build_block
     deploy_block = text.split("\n  deploy:", 1)[1]
-    assert "needs: [test, build-and-push]" in deploy_block
+    assert "needs: [changes, test, build-and-push]" in deploy_block
 
 
 def test_deploy_verifies_commit_image_before_any_wait() -> None:
