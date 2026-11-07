@@ -45,8 +45,8 @@ def test_runtime_env_spec_excludes_legacy_data_single_key_fields() -> None:
     targets = [key.target for key in RUNTIME_ENV_SPEC]
     sources = [source for key in RUNTIME_ENV_SPEC for source in key.sources]
 
-    assert len(targets) == 23
-    assert len(set(targets)) == 23
+    assert len(targets) == 27
+    assert len(set(targets)) == 27
     for forbidden in ("KIS_DATA_APP_KEY", "KIS_DATA_APP_SECRET", "KIS_DATA_HTS_ID"):
         assert forbidden not in targets
         assert forbidden not in sources
@@ -58,8 +58,8 @@ def test_runtime_env_spec_excludes_shared_keypool_keys() -> None:
     targets = [key.target for key in RUNTIME_ENV_SPEC]
     sources = [source for key in RUNTIME_ENV_SPEC for source in key.sources]
 
-    assert len(targets) == 23
-    assert len(set(targets)) == 23
+    assert len(targets) == 27
+    assert len(set(targets)) == 27
     for forbidden in ("KIS_DATA_SLOTS", "KIS_HOST_DATA_SLOTS"):
         assert forbidden not in targets
         assert forbidden not in sources
@@ -734,3 +734,12 @@ def test_vps_selectors_enable_research_roster_and_postclose() -> None:
     selectors = dict(VPS_SELECTORS)
     assert selectors["COLLECTION_RESEARCH_ROSTER_ENABLED"] == "true"
     assert selectors["COLLECTION_POSTCLOSE_SNAPSHOT_ENABLED"] == "true"
+
+
+def test_runtime_env_spec_carries_live_order_limits() -> None:
+    """Live bindings require these limits explicitly, so provisioning must be able to deliver them."""
+    from src.api.kis.trading import LIVE_REQUIRED_ORDER_LIMITS
+    from src.tools.provision_env import RUNTIME_ENV_SPEC
+
+    targets = {key.target for key in RUNTIME_ENV_SPEC}
+    assert set(LIVE_REQUIRED_ORDER_LIMITS) <= targets

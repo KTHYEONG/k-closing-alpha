@@ -59,6 +59,14 @@ def _mock_settings(**overrides: object) -> Settings:
     return Settings(_env_file=None, **base)  # type: ignore[arg-type]
 
 
+_LIVE_ORDER_LIMITS: dict[str, object] = {
+    "ORDER_SEED_CAPITAL": 6_000_000,
+    "ORDER_ENTRY_LIMIT_BUFFER_BP": 150.0,
+    "ORDER_MAX_NOTIONAL_PER_ORDER_KRW": 1_000_000,
+    "ORDER_MAX_SENDS_PER_RUN": 4,
+}
+
+
 def _live_settings(**overrides: object) -> Settings:
     base: dict[str, object] = {
         "KIS_TRADING_ENV": "live",
@@ -70,6 +78,7 @@ def _live_settings(**overrides: object) -> Settings:
         "KIS_MOCK_APP_KEY": "MOCKKEY111",
         "KIS_LIVE_TRADING_CONFIRM": "LIVE-5678",
         "KIS_BASE_URL": "https://openapi.koreainvestment.com:9443",
+        **_LIVE_ORDER_LIMITS,
     }
     base.update(overrides)
     return Settings(_env_file=None, **base)  # type: ignore[arg-type]
@@ -940,3 +949,36 @@ def test_disconnect_on_response_exit_keeps_known_status(tmp_path) -> None:
     assert result.verdict is SubmitVerdict.AMBIGUOUS
     assert result.http_status == 200
     assert len(session.requests) == 1
+
+
+@pytest.mark.parametrize("missing", sorted(_LIVE_ORDER_LIMITS))
+def test_live_binding_refuses_default_order_limits(missing: str) -> None:
+    """A live binding never sizes real orders from public code defaults."""
+    base = {
+        "KIS_TRADING_ENV": "live", "KIS_APP_KEY": "LIVEKEY111", "KIS_APP_SECRET": "LIVESECRET1",
+        "KIS_ACCOUNT_ID": "12345678", "KIS_ACCOUNT_PRODUCT_CODE": "01", "KIS_HTS_ID": "hts1",
+        "KIS_MOCK_APP_KEY": "MOCKKEY111", "KIS_LIVE_TRADING_CONFIRM": "LIVE-5678",
+        "KIS_BASE_URL": "https://openapi.koreainvestment.com:9443",
+        **{k: v for k, v in _LIVE_ORDER_LIMITS.items() if k != missing},
+    }
+    with pytest.raises(TradingConfigError, match=missing) as exc_info:
+        resolve_trading_binding(Settings(_env_file=None, **base))  # type: ignore[arg-type]
+    assert "12345678" not in str(exc_info.value)
+
+
+def test_live_binding_accepts_explicit_order_limits_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Limits supplied through the environment count as explicit."""
+    for key, value in _LIVE_ORDER_LIMITS.items():
+        monkeypatch.setenv(key, str(value))
+    cfg = Settings(_env_file=None, **{  # type: ignore[arg-type]
+        "KIS_TRADING_ENV": "live", "KIS_APP_KEY": "LIVEKEY111", "KIS_APP_SECRET": "LIVESECRET1",
+        "KIS_ACCOUNT_ID": "12345678", "KIS_ACCOUNT_PRODUCT_CODE": "01", "KIS_HTS_ID": "hts1",
+        "KIS_MOCK_APP_KEY": "MOCKKEY111", "KIS_LIVE_TRADING_CONFIRM": "LIVE-5678",
+        "KIS_BASE_URL": "https://openapi.koreainvestment.com:9443",
+    })
+    assert resolve_trading_binding(cfg).env == "live"
+
+
+def test_mock_binding_keeps_default_order_limits() -> None:
+    """Mock rehearsal still runs on code defaults."""
+    assert _mock_binding().env == "mock"

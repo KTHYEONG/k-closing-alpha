@@ -147,6 +147,15 @@ def _validate_mock(cfg: Settings) -> None:
         raise TradingConfigError("mock: KIS_MOCK_ACCOUNT_PRODUCT_CODE must be 2 digits")
 
 
+LIVE_REQUIRED_ORDER_LIMITS: tuple[str, ...] = (
+    "ORDER_SEED_CAPITAL",
+    "ORDER_ENTRY_LIMIT_BUFFER_BP",
+    "ORDER_MAX_NOTIONAL_PER_ORDER_KRW",
+    "ORDER_MAX_SENDS_PER_RUN",
+)
+"""Order-sizing limits a live binding refuses to infer from defaults (names only; values come from env)."""
+
+
 def _validate_live(cfg: Settings) -> None:
     _validate_endpoint(cfg.KIS_BASE_URL, KIS_LIVE_HOST, "live")
     if not cfg.KIS_APP_KEY.strip() or not cfg.KIS_APP_SECRET.strip() or not cfg.KIS_ACCOUNT_ID.strip():
@@ -160,6 +169,10 @@ def _validate_live(cfg: Settings) -> None:
     expected_confirm = "LIVE-" + cfg.KIS_ACCOUNT_ID[-4:]
     if expected_confirm != cfg.KIS_LIVE_TRADING_CONFIRM:
         raise TradingConfigError("live: KIS_LIVE_TRADING_CONFIRM must match the account")
+    # Real money is never sized from public code defaults: each limit must be set explicitly.
+    missing = [name for name in LIVE_REQUIRED_ORDER_LIMITS if name not in cfg.model_fields_set]
+    if missing:
+        raise TradingConfigError("live: order limits must be set explicitly: " + ", ".join(missing))
 
 
 def _parse_int(value: Any) -> int | None:
