@@ -8,10 +8,12 @@ def test_screen_config_rejects_invalid_bands() -> None:
     from src.ml.universe import COST_AWARE_SCREEN, ScreenConfig
 
     # The cost-aware screen is pinned as the control arm, never as a default
-    assert COST_AWARE_SCREEN.change_lower == 0.02
-    assert COST_AWARE_SCREEN.change_upper == 0.10
-    assert COST_AWARE_SCREEN.min_trade_value_100m == 100.0
-    assert COST_AWARE_SCREEN.min_market_cap_100m == 500.0
+    from src.strategy.contract import COST_AWARE_UNIVERSE
+
+    assert COST_AWARE_SCREEN.change_lower == COST_AWARE_UNIVERSE.chg_min
+    assert COST_AWARE_SCREEN.change_upper == COST_AWARE_UNIVERSE.chg_max
+    assert COST_AWARE_SCREEN.min_trade_value_100m == COST_AWARE_UNIVERSE.min_trade_value_100m
+    assert COST_AWARE_SCREEN.min_market_cap_100m == COST_AWARE_UNIVERSE.min_market_cap_100m
     assert COST_AWARE_SCREEN.exclude_ceiling is True
 
     band = ScreenConfig(change_lower=0.02, change_upper=0.15, min_trade_value_100m=1000.0)
@@ -262,17 +264,21 @@ def test_build_universe_panel_cost_aware_screen_matches_select_universe_row_for_
     # NaN but close*volume/1e8 (tv_clean) clears the 100e8 floor; 000003 has it NaN and
     # tv_clean also fails -- exercising the exact clean-column-preference edge this
     # contract fixes.
+    floor_tv = COST_AWARE_UNIVERSE.min_trade_value_100m
+    cap = COST_AWARE_UNIVERSE.min_market_cap_100m * 1.2
+    close = 15000.0 * (1.0 + (COST_AWARE_UNIVERSE.chg_min + COST_AWARE_UNIVERSE.chg_max) / 2.0)
     rows = []
     for d in ("2023-02-01", "2023-02-02"):
-        rows.append({"date": pd.Timestamp(d), "symbol": "000001", "prev_close": 15000.0, "close": 15750.0,
-                     "open": 15000.0, "high": 15900.0, "low": 14900.0, "volume": 10000.0,
-                     "market_cap_100m": 600.0, "trade_value_100m": 150.0, "market": "KOSPI"})
-        rows.append({"date": pd.Timestamp(d), "symbol": "000002", "prev_close": 15000.0, "close": 15750.0,
-                     "open": 15000.0, "high": 15900.0, "low": 14900.0, "volume": 1_000_000.0,
-                     "market_cap_100m": 600.0, "trade_value_100m": np.nan, "market": "KOSPI"})
-        rows.append({"date": pd.Timestamp(d), "symbol": "000003", "prev_close": 15000.0, "close": 15750.0,
-                     "open": 15000.0, "high": 15900.0, "low": 14900.0, "volume": 100.0,
-                     "market_cap_100m": 600.0, "trade_value_100m": np.nan, "market": "KOSPI"})
+        rows.append({"date": pd.Timestamp(d), "symbol": "000001", "prev_close": 15000.0, "close": close,
+                     "open": 15000.0, "high": close + 150.0, "low": 14900.0, "volume": 10000.0,
+                     "market_cap_100m": cap, "trade_value_100m": floor_tv * 1.5, "market": "KOSPI"})
+        rows.append({"date": pd.Timestamp(d), "symbol": "000002", "prev_close": 15000.0, "close": close,
+                     "open": 15000.0, "high": close + 150.0, "low": 14900.0,
+                     "volume": floor_tv * 2.0 * 1e8 / close,
+                     "market_cap_100m": cap, "trade_value_100m": np.nan, "market": "KOSPI"})
+        rows.append({"date": pd.Timestamp(d), "symbol": "000003", "prev_close": 15000.0, "close": close,
+                     "open": 15000.0, "high": close + 150.0, "low": 14900.0, "volume": 100.0,
+                     "market_cap_100m": cap, "trade_value_100m": np.nan, "market": "KOSPI"})
     ph = pd.DataFrame(rows)
     prepared, _ = prepare_price_panel(ph)
 
@@ -314,7 +320,8 @@ def test_upper_change_bound_is_exclusive_like_contract() -> None:
 
     from src.ml.universe import COST_AWARE_SCREEN, build_universe_panel
 
-    # Given a synthetic panel with changes 0.02, 0.0999, 0.10
+    # Given a synthetic panel at the lower bound, just under the upper bound, and at the upper bound
+    lo, hi = COST_AWARE_SCREEN.change_lower, COST_AWARE_SCREEN.change_upper
     ph = pd.DataFrame({
         "date": pd.to_datetime(["2024-01-02"] * 3),
         "symbol": ["000001", "000002", "000003"],
@@ -322,7 +329,7 @@ def test_upper_change_bound_is_exclusive_like_contract() -> None:
         "high": [10200.0, 10200.0, 10200.0],
         "low": [9800.0, 9800.0, 9800.0],
         "close": [10000.0, 10000.0, 10000.0],
-        "daily_change_pct": [0.02, 0.0999, 0.10],
+        "daily_change_pct": [lo, hi - 0.0001, hi],
         "market_cap_100m": [1000.0, 1000.0, 1000.0],
         "trade_value_100m": [500.0, 500.0, 500.0],
         "tick_cost_bp": [5.0, 5.0, 5.0],
@@ -332,5 +339,5 @@ def test_upper_change_bound_is_exclusive_like_contract() -> None:
     # When
     panel, _ = build_universe_panel(ph, COST_AWARE_SCREEN, start_date="2024-01-02", end_date="2024-01-02")
 
-    # Then: 0.02 and 0.0999 admitted, 0.10 excluded
+    # Then: the lower bound and just-under are admitted, the upper bound is excluded
     assert set(panel["symbol"].tolist()) == {"000001", "000002"}

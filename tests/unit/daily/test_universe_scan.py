@@ -58,8 +58,10 @@ def test_fetch_candidate_stock_list_uses_universe_bounds_as_percent() -> None:
 
     kw_client.get_fluctuation_ranking.assert_awaited_once()
     kwargs = kw_client.get_fluctuation_ranking.await_args.kwargs
-    assert kwargs["rate_min_pct"] == 2.0
-    assert kwargs["rate_max_pct"] == 10.0
+    from src.strategy.contract import PRODUCTION_STRATEGY
+
+    assert kwargs["rate_min_pct"] == pytest.approx(PRODUCTION_STRATEGY.universe.chg_min * 100.0)
+    assert kwargs["rate_max_pct"] == pytest.approx(PRODUCTION_STRATEGY.universe.chg_max * 100.0)
     assert out == []
 
 

@@ -1331,3 +1331,14 @@ def test_exit_sells_despite_carryover_contradiction(mock_binding, runner) -> Non
     report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("084010")] * 30)
     assert report.metrics["n_carryover_adopted"] == 0
     assert len(broker.submit_calls) == 1
+
+
+def test_order_session_no_sends_on_example_store(mock_binding, runner, monkeypatch) -> None:
+    """The private strategy store gates every active environment before the broker is touched."""
+    from src.strategy import store
+
+    monkeypatch.setattr(store, "strategy_values", lambda: store.load_strategy_values(store.EXAMPLE_STORE_ROOT))
+    broker, journal = FakeBroker(), runner.journal()
+    report = runner.run("entry", DAY, broker=broker, journal=journal, clock=[ts("152115")], decisions=[three_picks()])
+    assert (report.outcome, report.reason) == ("DEGRADED", "strategy_store_unavailable")
+    broker.assert_quiet()

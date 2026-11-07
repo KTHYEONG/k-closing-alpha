@@ -40,6 +40,7 @@ from src.data.research_roster import (
 )
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.strategy.contract import PRODUCTION_STRATEGY
+from src.strategy.store import StrategyStoreError, require_production_store
 from src.tools.alerts import redact_for_egress
 from src.tools.run_outcome import (
     RUN_OUTCOME_DEGRADED,
@@ -279,6 +280,11 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="KCA research roster capture at the closing auction (no orders)")
     parser.add_argument("--date", default=None)
     args = parser.parse_args(argv)
+    try:
+        require_production_store()
+    except StrategyStoreError as exc:
+        logger.error("[SYS] stage=%s status=FAIL reason=%s", "roster_capture", exc)
+        raise SystemExit(1) from exc
     profile = CollectionSettings()
     snapshot_date = args.date or _now().date().isoformat()
     trading_day = date.fromisoformat(snapshot_date)

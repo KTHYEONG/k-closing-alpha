@@ -40,6 +40,7 @@ from src.ml.topk_ranker_research import (
     topk_ranker_report_to_frame,
     train_production_bundle,
 )
+from src.strategy.store import StrategyStoreError, require_production_store
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     """Parse retrain arguments and dispatch to the ranker research pipeline."""
     configure_cli_logging()
+    try:
+        require_production_store()
+    except StrategyStoreError as exc:
+        logger.error("[SYS] stage=%s status=FAIL reason=%s", "retrain", exc)
+        raise SystemExit(1) from exc
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 

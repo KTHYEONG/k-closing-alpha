@@ -20,6 +20,7 @@ from src.serving.realtime.inference import (
     _WEAK_PCT,
 )
 from src.strategy.contract import DEFAULT_REALIZED_VOL, LABEL_BAD_THRESHOLD, LABEL_GOOD_THRESHOLD
+from src.strategy.store import strategy_values
 
 _CATEGORICAL_FEATURE_COLS: tuple[str, ...] = (
     "market_type",
@@ -27,7 +28,7 @@ _CATEGORICAL_FEATURE_COLS: tuple[str, ...] = (
     "chart_analysis",
 )
 
-CHAMPION_DEFAULT_MODEL_PARAMS: dict[str, Any] = {}  # private strategy store
+CHAMPION_DEFAULT_MODEL_PARAMS: dict[str, Any] = dict(strategy_values().champion_model_params)
 
 
 class SeedEnsembleModel:

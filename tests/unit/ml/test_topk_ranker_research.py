@@ -1666,11 +1666,10 @@ def test_ranker_configuration_is_single_certified_source() -> None:
     from src.ml.topk_history_features import TOPK_FEATURE_COLS_V2
 
     # Then: one constant set drives both CPCV certification and the production bundle
-    assert mod.RANKER_MODEL_PARAMS == {
-        "n_estimators": 400, "learning_rate": 0.02, "num_leaves": 15, "min_child_samples": 300,
-        "subsample": 0.8, "subsample_freq": 1, "colsample_bytree": 0.8, "reg_lambda": 5.0,
-    }
-    assert mod.RANKER_SEEDS == (1, 2, 3, 4, 5)
+    from src.strategy.store import strategy_values
+
+    assert dict(strategy_values().ranker_model_params) == mod.RANKER_MODEL_PARAMS
+    assert strategy_values().ranker_seeds == mod.RANKER_SEEDS
     assert mod.RANKER_FEATURE_COLS == TOPK_FEATURE_COLS_V2
     assert len(mod.RANKER_FEATURE_COLS) == 27
     assert mod.RANKER_FEATURE_COLS[: len(FEATURE_COLS)] == list(FEATURE_COLS)
@@ -1811,8 +1810,8 @@ def test_assert_bundle_screen_parity_accepts_certified_bundle() -> None:
 
     # And: joblib 왕복으로 정수화된 값도 동일 스크린으로 인정
     coerced = dataclasses.asdict(PRODUCTION_STRATEGY.universe)
-    coerced["min_trade_value_100m"] = 100
-    coerced["min_market_cap_100m"] = 500
+    coerced["min_trade_value_100m"] = int(PRODUCTION_STRATEGY.universe.min_trade_value_100m)
+    coerced["min_market_cap_100m"] = int(PRODUCTION_STRATEGY.universe.min_market_cap_100m)
     assert assert_bundle_screen_parity({"select_universe": coerced}) is None
 
 

@@ -15,6 +15,7 @@ from src.ml.topk_contract import (
 )
 from src.serving.realtime.artifacts import load_model_bundle
 from src.strategy.contract import MIN_TOP_K
+from src.strategy.store import StrategyStoreError, require_production_store
 from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,11 @@ def main(argv: list[str] | None = None) -> None:
     """
     from src.daily.predict import bundle_model_version
 
+    try:
+        require_production_store()
+    except StrategyStoreError as exc:
+        logger.error("[SYS] stage=%s status=FAIL reason=%s", "deploy_preflight", exc)
+        raise SystemExit(1) from exc
     parser = argparse.ArgumentParser(description="Deploy preflight: bundle/serving compatibility gate")
     parser.add_argument("--bundle-dir", default=TOPK_RANKER_BUNDLE_DIR)
     args = parser.parse_args(argv)

@@ -75,6 +75,8 @@ catboost_info/
 *.joblib
 /data/
 artifacts/models/
+# Research outputs are published only through the private strategy store.
+artifacts/research/
 # Archived research snapshots are not part of the active source/test tree.
 legacy/
 .legacy/

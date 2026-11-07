@@ -1640,3 +1640,35 @@ def test_topk_persist_lock_timeout_fails_closed(tmp_path, monkeypatch) -> None:
         assert not target.exists()
     else:
         assert target.read_bytes() == before
+
+
+def test_predict_no_decision_on_example_store(monkeypatch) -> None:
+    from src.strategy import store
+
+    monkeypatch.setattr(store, "strategy_values", lambda: store.load_strategy_values(store.EXAMPLE_STORE_ROOT))
+    failures: list[Exception] = []
+    out = predict.run_topk_ranker_sleeve(pd.Timestamp("2026-09-09"), on_failure=failures.append)
+    assert out.empty
+    assert len(failures) == 1
+    assert isinstance(failures[0], store.StrategyStoreError)
+
+
+def test_run_topk_ranker_sleeve_requires_certified_top_k(monkeypatch) -> None:
+    """A bundle without its certified top_k never falls back to a code default."""
+    import src.daily.predict as predict_mod
+    import src.ml.topk_history_features as thf
+    from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
+
+    wide, hist, decision = _sleeve_wide_and_history()
+    bundle = build_fixed_serving_bundle(list(thf.TOPK_FEATURE_COLS_V2))
+    bundle.pop("top_k", None)
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, **_kw: wide)
+    monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
+    monkeypatch.setattr(thf, "load_serving_price_history", lambda _d: hist)
+    failures: list[Exception] = []
+
+    out = predict_mod.run_topk_ranker_sleeve(decision, on_failure=failures.append)
+
+    assert out.empty
+    assert len(failures) == 1
+    assert "top_k" in str(failures[0])

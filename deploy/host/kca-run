@@ -195,7 +195,7 @@ fi
 if [[ $seen_admission == 1 ]]; then
   argv+=(-v "${HOME}/.cache/kis:/app/.cache/kis" -e KIS_TOKEN_CACHE_DIR=/app/.cache/kis -e "BROKER_ADMISSION_CLASS=${admission}")
 fi
-argv+=(-v "${HOME}/k-closing-alpha/data:/app/data" -v "${HOME}/k-closing-alpha/artifacts:/app/artifacts")
+argv+=(-v "${HOME}/k-closing-alpha/data:/app/data" -v "${HOME}/k-closing-alpha/artifacts:/app/artifacts" -v "${HOME}/quant-strategy-store:/run/strategy-store:ro" -e KCA_STRATEGY_STORE=/run/strategy-store/current)
 if [[ $seen_role == 1 ]]; then
   argv+=(-e "KIS_DATA_ROLE=${role}")
 fi

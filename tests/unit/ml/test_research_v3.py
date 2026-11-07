@@ -102,11 +102,14 @@ def test_no_feature_after_decision_timestamp():
 
 
 def test_universe_uses_asof_change_not_final_change():
-    """Test Section 69: Universe selection criteria strictly bounded by 2% <= chg < 10%."""
+    """Test Section 69: Universe selection is bounded by the half-open screen band chg_min <= chg < chg_max."""
+    from src.strategy.contract import DEFAULT_UNIVERSE
+
+    lo, hi = DEFAULT_UNIVERSE.chg_min * 100.0, DEFAULT_UNIVERSE.chg_max * 100.0
     data = {
         "date": [pd.Timestamp("2024-01-02")] * 4,
         "symbol": ["000001", "000002", "000003", "000004"],
-        "daily_change_pct": [1.9, 2.5, 9.9, 10.1],
+        "daily_change_pct": [lo - 0.1, lo + 0.5, hi - 0.1, hi + 0.1],
         "trade_value_100m": [200.0, 200.0, 200.0, 200.0],
         "market_cap_100m": [1000.0, 1000.0, 1000.0, 1000.0],
         "close": [10000.0, 10000.0, 10000.0, 10000.0],

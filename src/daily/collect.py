@@ -44,6 +44,7 @@ from src.processing.schema import CLOSE_CONFIRMED_COL, DECISION_CLOSE_COL, PRICE
 from src.strategy.contract import PRODUCTION_STRATEGY, SCREENABLE_CLASS_COL, UniverseSpec, select_universe
 
 from src.utils.cli_logging import configure_cli_logging
+from src.strategy.store import StrategyStoreError, require_production_store
 
 logger = logging.getLogger(__name__)
 
@@ -1102,6 +1103,11 @@ async def main(force: bool = False) -> None:
     # through CaptureStore rather than being awaited inside initial collect.
     from aiohttp.resolver import ThreadedResolver
 
+    try:
+        require_production_store()
+    except StrategyStoreError as exc:
+        logger.error("[SYS] stage=%s status=FAIL reason=%s", "collect", exc)
+        raise SystemExit(1) from exc
     data_kwargs = kis_data_client_kwargs()
     _validate_hts_id(data_kwargs["hts_id"])
     run_now = datetime.now(ZoneInfo("Asia/Seoul"))

@@ -70,7 +70,7 @@ def test_deploy_validates_commit_image_before_moving_latest() -> None:
     workflow = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
 
     pull = "vps_pull_verified ghcr.io/kthyeong/k-closing-alpha $COMMIT_SHA"
-    run = "docker run --rm -v ~/k-closing-alpha/artifacts:/app/artifacts:ro ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA uv run python -m src.tools.deploy_preflight"
+    run = "docker run --rm -v ~/k-closing-alpha/artifacts:/app/artifacts:ro -v ~/quant-strategy-store:/run/strategy-store:ro -e KCA_STRATEGY_STORE=/run/strategy-store/current ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA uv run python -m src.tools.deploy_preflight"
     tag = "vps_promote_latest ghcr.io/kthyeong/k-closing-alpha $COMMIT_SHA"
     reset = "git reset --hard $COMMIT_SHA"
 

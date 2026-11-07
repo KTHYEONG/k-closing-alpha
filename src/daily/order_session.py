@@ -51,6 +51,7 @@ from src.execution.order_contract import (
 )
 from src.execution.order_gateway import BrokerPort, GatewayLimits, OrderGateway, PlannedSkip, ReconcileReport
 from src.execution.order_journal import IntentState, IntentStatus, OpenLot, OrderJournal
+from src.strategy.store import StrategyStoreError, require_production_store
 from src.tools.run_outcome import (
     RUN_OUTCOME_DEGRADED,
     RUN_OUTCOME_OK,
@@ -862,6 +863,15 @@ async def run_order_session(
             record_fn(report.outcome, run_date=date_str, reason=report.reason, metrics=dict(report.metrics))
         logger.info("[EXEC] stage=order_session env=off phase=%s run_id=none outcome=%s reason=%s",
                     phase, report.outcome, report.reason)
+        return report
+    try:
+        require_production_store()
+    except StrategyStoreError:
+        report = OrderSessionReport(phase, date_str, RUN_OUTCOME_DEGRADED, "strategy_store_unavailable", {"env": binding.env})
+        if record_fn is not None:
+            record_fn(report.outcome, run_date=date_str, reason=report.reason, metrics=dict(report.metrics))
+        logger.warning("[RISK] stage=order_session env=%s phase=%s run_id=none outcome=%s reason=%s",
+                       binding.env, phase, report.outcome, report.reason)
         return report
     active_broker: SessionBrokerPort = broker if broker is not None else KisTradingClient(
         binding, http_timeout_seconds=(

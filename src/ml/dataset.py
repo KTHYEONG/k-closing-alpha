@@ -23,6 +23,7 @@ from src.serving.realtime.features import (
     engineer_features,
 )
 from src.strategy.contract import LABEL_BAD_THRESHOLD, LABEL_GOOD_THRESHOLD
+from src.strategy.store import strategy_values
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ _CLOSE_MORNING61_FEATURES: tuple[str, ...] = ("relative_flow_strength",)
 
 _PRODUCTION_CALENDAR_FLOW_FEATURES: tuple[str, ...] = (
     *_WEEKDAY_INDICATOR_FEATURES,
+    *strategy_values().production_calendar_flow_features,
 )
 
 _NUMERIC_COLUMNS: tuple[str, ...] = (

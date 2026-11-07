@@ -3900,3 +3900,15 @@ def test_collect_main_records_rule_v2_and_class_rejections(tmp_path, monkeypatch
     stored = list(Path(tmp_path / "capture" / "decision").rglob("input.parquet"))
     frame = pd.read_parquet(stored[0])
     assert frame["is_screenable"].tolist() == [True]
+
+
+def test_collect_refuses_example_store(monkeypatch) -> None:
+    import asyncio
+
+    from src.daily import collect
+    from src.strategy import store
+
+    monkeypatch.setattr(store, "strategy_values", lambda: store.load_strategy_values(store.EXAMPLE_STORE_ROOT))
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(collect.main())
+    assert exc.value.code == 1

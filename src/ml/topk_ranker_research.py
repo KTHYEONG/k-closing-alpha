@@ -61,6 +61,7 @@ from src.strategy.contract import (
     select_universe,
     training_universe,
 )
+from src.strategy.store import strategy_values
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -72,13 +73,11 @@ CPCV_K_TEST: int = 2
 # purged (ADR-005 one-week embargo); see OD-1.
 HISTORY_SEAM_EMBARGO_DAYS: int = 5
 EXIT_DATE_COL: str = "exit_date"
-# 인증·서빙 공용 단일 설정: 인접 하이퍼파라미터 6점이 모두 동일 성능 고원에 있음을 CPCV로 확인한 값
-RANKER_MODEL_PARAMS: dict[str, Any] = {}  # private strategy store
-# subsample<1 이라 단일 시드 결과가 임의적 → 5시드 평균으로 분산 제거
-RANKER_SEEDS: tuple[int, ...] = ()  # private strategy store
-# top-3 는 매일 투자하므로 날짜 공통 드리프트는 선택과 무관 → 날짜내 차감 라벨
+RANKER_MODEL_PARAMS: dict[str, Any] = dict(strategy_values().ranker_model_params)
+RANKER_SEEDS: tuple[int, ...] = strategy_values().ranker_seeds
+# The date-demeaned label is the only label mode the ranker implements.
 LABEL_MODE: str = "date_demeaned"
-LABEL_CLIP: float = None  # private strategy store
+LABEL_CLIP: float = strategy_values().label_clip
 CERT_REGIME_START: pd.Timestamp = pd.Timestamp(TICK_REFORM_DATE)
 MIN_SCORED_FOLD_FRACTION: float = 0.90
 # 개편전 반증 판정에 필요한 최소 신호일 수 (약 1년).

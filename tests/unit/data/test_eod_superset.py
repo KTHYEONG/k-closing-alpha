@@ -81,14 +81,15 @@ def test_eod_superset_mask_contains_default_universe() -> None:
 
 
 def test_eod_superset_from_profile_rejects_non_superset() -> None:
+    universe = DEFAULT_UNIVERSE
     with pytest.raises(ValueError, match="min_change_ratio"):
-        _screen(COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO=0.03)
+        _screen(COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO=universe.chg_min + 0.01)
     with pytest.raises(ValueError, match="max_change_ratio"):
-        _screen(COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO=0.09)
+        _screen(COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO=universe.chg_max - 0.01)
     with pytest.raises(ValueError, match="min_trade_value_100m"):
-        _screen(COLLECTION_PIT_BACKFILL_MIN_TRADE_VALUE_100M=100.01)
+        _screen(COLLECTION_PIT_BACKFILL_MIN_TRADE_VALUE_100M=universe.min_trade_value_100m + 0.01)
     with pytest.raises(ValueError, match="min_market_cap_100m"):
-        _screen(COLLECTION_PIT_BACKFILL_MIN_MARKET_CAP_100M=500.01)
+        _screen(COLLECTION_PIT_BACKFILL_MIN_MARKET_CAP_100M=universe.min_market_cap_100m + 0.01)
 
 
 def test_eod_superset_mask_names_missing_columns() -> None:

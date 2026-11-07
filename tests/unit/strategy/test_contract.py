@@ -84,11 +84,16 @@ def test_select_universe_applies_half_open_bounds_and_liquidity_floors() -> None
 
     from src.strategy.contract import select_universe
 
+    from src.strategy.contract import DEFAULT_UNIVERSE
+
+    lo, hi = DEFAULT_UNIVERSE.chg_min, DEFAULT_UNIVERSE.chg_max
+    tv, mc = DEFAULT_UNIVERSE.min_trade_value_100m, DEFAULT_UNIVERSE.min_market_cap_100m
+    mid, big = (lo + hi) / 2.0, 2.0 * max(tv, mc)
     df = pd.DataFrame(
         {
-            "chg_ratio": [0.02, 0.0999, 0.10, 0.0199, 0.05, 0.05, 0.05, 0.05, 0.05, np.nan],
-            "tv_clean": [100.0, 500.0, 500.0, 500.0, 99.9, 500.0, 500.0, 500.0, 500.0, 500.0],
-            "mc_clean": [500.0, 800.0, 800.0, 800.0, 800.0, 499.9, 800.0, 800.0, 800.0, 800.0],
+            "chg_ratio": [lo, hi - 0.0001, hi, lo - 0.0001, mid, mid, mid, mid, mid, np.nan],
+            "tv_clean": [tv, big, big, big, tv - 0.1, big, big, big, big, big],
+            "mc_clean": [mc, big, big, big, big, mc - 0.1, big, big, big, big],
             "close": [1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 0.0, 1000.0, 1000.0, 1000.0],
             "volume": [10, 10, 10, 10, 10, 10, 10, 0, 10, 10],
             "is_ceiling": [False, False, False, False, False, False, False, False, True, False],
@@ -403,6 +408,7 @@ def test_cost_aware_strategy_spec_uses_topk_three() -> None:
         DEFAULT_UNIVERSE,
         KCA_TOP3_SHADOW_001,
         KCA_TOPK_COSTAWARE_001,
+        MAX_TICK_COST_BP,
     )
 
     # Then: 신규 스펙 계약
@@ -414,17 +420,14 @@ def test_cost_aware_strategy_spec_uses_topk_three() -> None:
     assert len(KCA_TOPK_COSTAWARE_001.fingerprint()) == 64
     assert KCA_TOPK_COSTAWARE_001.fingerprint() != KCA_TOP3_SHADOW_001.fingerprint()
 
-    # 기존 기본값 불변 (하위호환 회귀 방지)
+    # 기본 스크린은 비용축이 없다 (하위호환 회귀 방지)
     assert DEFAULT_UNIVERSE.max_tick_cost_bp is None
-    assert DEFAULT_UNIVERSE.min_market_cap_100m == 500.0
-    assert DEFAULT_UNIVERSE.chg_min == 0.02
-    assert DEFAULT_UNIVERSE.chg_max == 0.10
     assert KCA_TOP3_SHADOW_001.universe is DEFAULT_UNIVERSE
 
-    # 신규 풀은 레거시 >=10% 가 아니라 2~10% 밴드를 유지하고 비용축만 추가한다
-    assert COST_AWARE_UNIVERSE.chg_min == 0.02
-    assert COST_AWARE_UNIVERSE.chg_max == 0.10
-    assert COST_AWARE_UNIVERSE.min_trade_value_100m == 100.0
+    # 비용인식 풀은 기본 스크린의 밴드·유동성 하한을 그대로 유지하고 비용축만 추가한다
+    for name in ("chg_min", "chg_max", "min_trade_value_100m", "min_market_cap_100m", "exclude_ceiling"):
+        assert getattr(COST_AWARE_UNIVERSE, name) == getattr(DEFAULT_UNIVERSE, name)
+    assert COST_AWARE_UNIVERSE.max_tick_cost_bp == MAX_TICK_COST_BP
     assert COST_AWARE_UNIVERSE.exclude_ceiling is True
 
 
@@ -681,7 +684,8 @@ def test_strategy_specs_derive_top_k_from_min_top_k() -> None:
     assert KCA_TOP3_SHADOW_001.top_k == MIN_TOP_K
     assert KCA_TOPK_COSTAWARE_001.top_k == MIN_TOP_K
     assert KCA_TOPK_CAPFREE_001.top_k == MIN_TOP_K
-    assert KCA_TOPK_COSTAWARE_001.fingerprint() == "5946152fe2df5d60b570635191fb4957595f7d06196134797b6f82d47c42cdb9"
+    # Pinned on the fixture-store spec: guards the fingerprint scheme, not the production values.
+    assert KCA_TOPK_COSTAWARE_001.fingerprint() == "f448888b9efadf841650181b46f7d5d54dc086939fd609b860f8a5e921a55ba9"
 
 
 def test_costaware_002_differs_from_001_only_in_the_class_filter() -> None:

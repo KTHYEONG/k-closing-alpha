@@ -14,6 +14,9 @@ import pandas as pd
 # tick_cost_bp 와 statutory_bp_asof 는 UniverseSpec.max_tick_cost_bp 가 소비하는
 # 비용 컬럼과 PIT 법정비용의 생산자다. 스크린 계약과 함께 쓰이므로 이 모듈에서 재수출한다.
 from src.execution.cost_model import pit_round_trip_cost_bp, statutory_bp_asof, tick_cost_bp
+from src.strategy.store import strategy_values
+
+_STORE = strategy_values()
 
 __all__ = [
     "AA_COST",
@@ -121,10 +124,10 @@ class UniverseSpec:
     and strategy id; field defaults are never flipped.
     """
 
-    chg_min: float = None  # private strategy store
-    chg_max: float = None  # private strategy store
-    min_trade_value_100m: float = 100.0
-    min_market_cap_100m: float = 500.0
+    chg_min: float = _STORE.universe_chg_min
+    chg_max: float = _STORE.universe_chg_max
+    min_trade_value_100m: float = _STORE.universe_min_trade_value_100m
+    min_market_cap_100m: float = _STORE.universe_min_market_cap_100m
     exclude_ceiling: bool = True
     max_tick_cost_bp: float | None = None
     exclude_non_screenable_class: bool = False
@@ -164,10 +167,10 @@ KCA_TOP3_SHADOW_001: StrategySpec = StrategySpec(
 )
 
 COST_AWARE_UNIVERSE: UniverseSpec = UniverseSpec(
-    chg_min=0.02,
-    chg_max=0.10,
-    min_trade_value_100m=100.0,
-    min_market_cap_100m=500.0,
+    chg_min=_STORE.universe_chg_min,
+    chg_max=_STORE.universe_chg_max,
+    min_trade_value_100m=_STORE.universe_min_trade_value_100m,
+    min_market_cap_100m=_STORE.universe_min_market_cap_100m,
     exclude_ceiling=True,
     max_tick_cost_bp=MAX_TICK_COST_BP,
 )
@@ -178,10 +181,10 @@ KCA_TOPK_COSTAWARE_001: StrategySpec = StrategySpec(
 
 # 절대 틱비용 상한은 가격의 계단함수라 레짐마다 다른 가격창을 의미한다. 비용은 net 라벨로만 반영한다.
 CAPFREE_UNIVERSE: UniverseSpec = UniverseSpec(
-    chg_min=0.02,
-    chg_max=0.10,
-    min_trade_value_100m=100.0,
-    min_market_cap_100m=500.0,
+    chg_min=_STORE.universe_chg_min,
+    chg_max=_STORE.universe_chg_max,
+    min_trade_value_100m=_STORE.universe_min_trade_value_100m,
+    min_market_cap_100m=_STORE.universe_min_market_cap_100m,
     exclude_ceiling=True,
     max_tick_cost_bp=None,
 )
@@ -191,10 +194,10 @@ KCA_TOPK_CAPFREE_001: StrategySpec = StrategySpec(
 )
 
 COST_AWARE_SCREENABLE_UNIVERSE: UniverseSpec = UniverseSpec(
-    chg_min=0.02,
-    chg_max=0.10,
-    min_trade_value_100m=100.0,
-    min_market_cap_100m=500.0,
+    chg_min=_STORE.universe_chg_min,
+    chg_max=_STORE.universe_chg_max,
+    min_trade_value_100m=_STORE.universe_min_trade_value_100m,
+    min_market_cap_100m=_STORE.universe_min_market_cap_100m,
     exclude_ceiling=True,
     max_tick_cost_bp=MAX_TICK_COST_BP,
     exclude_non_screenable_class=True,

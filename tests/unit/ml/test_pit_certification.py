@@ -397,7 +397,11 @@ def test_build_pit_feature_frames_native_arm_screens_on_1520_values() -> None:
                 "index_basis": "live_1520", "source": "live_decision", "bars_vendor": "",
                 "n_bars": 0, "first_bar_hms": "", "last_bar_hms": "", "capture_run_id": "t"}
 
-    panel = pd.DataFrame([_panel_row("000001", 0.015), _panel_row("000002", 0.05), _panel_row("000003", 0.06)])
+    band = KCA_TOPK_COSTAWARE_001.universe
+    inside = band.chg_min + 0.4 * (band.chg_max - band.chg_min)
+    panel = pd.DataFrame([
+        _panel_row("000001", band.chg_min - 0.005), _panel_row("000002", inside), _panel_row("000003", inside + 0.01),
+    ])
     panel = panel[list(PIT1520_PANEL_COLUMNS)]
     eod_pool = pd.DataFrame({"date": [day] * 3, "symbol": ["000001", "000002", "000003"]})
     sel_mask = np.array([True, True, True])

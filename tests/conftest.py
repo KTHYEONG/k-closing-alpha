@@ -20,6 +20,20 @@ for _key, _val in (
     os.environ.setdefault(_key, _val)
 
 
+# Hermetic strategy store: a fresh copy of the placeholder fixture, overriding any host-shell value
+# before the first strategy import binds the chosen values.
+import atexit as _atexit
+import shutil as _shutil
+import tempfile as _tempfile
+from pathlib import Path as _Path
+
+_strategy_store_root = _Path(_tempfile.mkdtemp(prefix="kca-strategy-store-"))
+_atexit.register(_shutil.rmtree, _strategy_store_root, ignore_errors=True)
+_shutil.copytree(_Path(__file__).parent / "fixtures" / "strategy_store", _strategy_store_root, dirs_exist_ok=True)
+(_strategy_store_root / "STORE_REVISION").write_text("fixture\n", encoding="utf-8")
+os.environ["KCA_STRATEGY_STORE"] = str(_strategy_store_root)
+
+
 from collections.abc import Generator
 from pathlib import Path
 

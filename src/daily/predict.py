@@ -257,8 +257,9 @@ def run_topk_ranker_sleeve(decision_date: pd.Timestamp, *, on_failure: Callable[
         from src.ml import topk_history_features
         from src.ml.topk_contract import TOPK_RANKER_BUNDLE_DIR, score_topk_candidates, select_topk_equal_weight
         from src.serving.realtime.features import build_topk_ranker_features
-        from src.strategy.contract import MIN_TOP_K
+        from src.strategy.store import require_production_store
 
+        require_production_store()
         inference_started_at = datetime.now(ZoneInfo("Asia/Seoul"))
         wide = restrict_to_rank_pool(load_daily_snapshot(decision_date, available_by=inference_started_at), decision_date)
         bundle = load_model_bundle(import_dir=TOPK_RANKER_BUNDLE_DIR)
@@ -269,9 +270,9 @@ def run_topk_ranker_sleeve(decision_date: pd.Timestamp, *, on_failure: Callable[
             price_history = topk_history_features.load_serving_price_history(decision_date)
         features_df = build_topk_ranker_features(wide, decision_date, price_history=price_history)
         features_df["admitted"] = wide["admitted"].to_numpy()
-        picks = select_topk_equal_weight(
-            features_df, bundle, top_k=int(bundle.get("top_k", MIN_TOP_K))
-        )
+        if "top_k" not in bundle:
+            raise ValueError("bundle is missing the certified top_k")
+        picks = select_topk_equal_weight(features_df, bundle, top_k=int(bundle["top_k"]))
         name_map = dict(
             wide[["종목코드", "종목명"]].itertuples(index=False, name=None)
         )

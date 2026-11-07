@@ -1,0 +1,41 @@
+# Test fixture: placeholder values, not the production store.
+[meta]
+schema = "kca.strategy_values.v1"
+version = "fixture"
+created_at = "1970-01-01T00:00:00Z"
+source = "test fixture"
+validated_by = "test fixture"
+example = false
+
+[universe]
+chg_min = 0.013
+chg_max = 0.083
+min_trade_value_100m = 150.0
+min_market_cap_100m = 700.0
+
+[ranker]
+seeds = [21, 22]
+label_clip = 0.06
+
+[ranker.model_params]
+n_estimators = 123
+learning_rate = 0.045
+num_leaves = 7
+min_child_samples = 55
+subsample = 0.7
+subsample_freq = 2
+colsample_bytree = 0.6
+reg_lambda = 2.5
+
+[champion.model_params]
+n_estimators = 210
+learning_rate = 0.04
+num_leaves = 9
+min_child_samples = 25
+subsample = 0.9
+subsample_freq = 3
+colsample_bytree = 0.7
+reg_lambda = 1.5
+
+[features]
+production_calendar_flow = ["placeholder_flow_a", "placeholder_flow_b", "placeholder_flow_c", "placeholder_flow_d"]

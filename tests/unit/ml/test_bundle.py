@@ -29,8 +29,10 @@ def _panel(n_dates: int = 60, per_day: int = 6) -> pd.DataFrame:
 
 def test_champion_default_model_params_are_regularized() -> None:
     # Regularized relative to bare LightGBM defaults (num_leaves 31, n_estimators 100).
-    assert CHAMPION_DEFAULT_MODEL_PARAMS["num_leaves"] == 15
-    assert CHAMPION_DEFAULT_MODEL_PARAMS["n_estimators"] == 350
+    from src.strategy.store import strategy_values
+
+    assert dict(strategy_values().champion_model_params) == CHAMPION_DEFAULT_MODEL_PARAMS
+    assert CHAMPION_DEFAULT_MODEL_PARAMS["num_leaves"] < 31
     assert CHAMPION_DEFAULT_MODEL_PARAMS["min_child_samples"] >= 20
     assert 0.0 < CHAMPION_DEFAULT_MODEL_PARAMS["subsample"] <= 1.0
 
