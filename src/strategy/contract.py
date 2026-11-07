@@ -70,8 +70,7 @@ MIN_ROUND_TRIP_TICKS: dict[ExecutionMode, float] = {ExecutionMode.AA: 2.0, Execu
 
 CEILING_CHG_THRESHOLD: float = 0.29
 
-# 비용인식 스크린의 1틱 비용 상한 (bp)
-[redacted]
+# 비용인식 스크린의 1틱 비용 상한 (bp): 틱비용이 기대 엣지를 잠식하는 저가 종목을 막는 비용 가드
 MAX_TICK_COST_BP: float = 12.0
 # 실현변동성 폴백 (불확실성 지표가 아닌 시그마 추정용)
 DEFAULT_REALIZED_VOL: float = 0.02

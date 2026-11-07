@@ -41,8 +41,7 @@ from src.ml.topk_ranker_research import build_dual_pool
 from src.strategy.contract import PRODUCTION_STRATEGY, training_universe
 
 RETRAIN_GATE_EVAL_DAYS: int = 20
-[redacted]
-[redacted]
+# 연속 재학습 간 정상 변동(높은 순위상관)과 학습 데이터 오염(뚜렷한 상관 하락)을 가르는 하한
 RETRAIN_MIN_PREDICTION_AGREEMENT: float = 0.95
 # 순위상관은 표본 4개 미만인 날에 의미가 없어 집계에서 제외한다
 MIN_NAMES_PER_EVAL_DAY: int = 4

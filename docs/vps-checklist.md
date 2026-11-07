@@ -926,7 +926,7 @@ Baselines (trailing rule: compare with the prev-5 trading-day median, never with
 | tape sweep | needs 771, recovered 604, unresolved 167, expired 0 (10-30) |
 | backup | 3–13 min; `segments` 2–170 per night (11-01: 2) |
 | runtimes | postclose-snapshot 44 s (15:31:30–15:32:14, 591 entries: 432 TRADE_TICKS + 159 INVESTOR_ESTIMATE), research-roster 10 s, collect 40 s (11-05), predict done 15:21:13, collect 25–95 s, predict ~12 s, finalize 10 s–2.5 min, archive-regular 28–57 min, archive 9–33 min, tape-sweep 24–31 min, daily-audit 1.5–4.5 min (incl. ~80 s chown), extended-backfill ~2.5 min (until 11-04; direction-free superset drain runs to the 06:50 stop) |
-[redacted]
+| paper NAV | 0 open lots after exit (11-02) |
 
 Known conditions:
 | Since | Condition | Expected verdict while open | Re-check / expiry | Close when |

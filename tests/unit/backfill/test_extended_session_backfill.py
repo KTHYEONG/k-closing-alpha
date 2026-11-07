@@ -41,7 +41,7 @@ def _enum(ph: pd.DataFrame, pairs: pd.DataFrame | None = None, **kw) -> list[Ext
     return enumerate_extended_session_tasks(
         as_of=kw.get("as_of", AS_OF),
         retention_days=kw.get("retention_days", 365),
-        [redacted]
+        min_change_ratio=kw.get("min_change_ratio", 0.025),
         price_history=ph,
         candidate_pairs=pairs if pairs is not None else _pairs([]),
     )
@@ -486,7 +486,7 @@ def test_universe_helper_preserves_kis_enumeration() -> None:
     from src.backfill.intraday.extended_session_backfill import _entry_day_universes
 
     ph = _ph([("2026-03-02", "000001", 103.0, 100.0), ("2026-03-03", "000002", 100.0, 100.0)])
-    [redacted]
+    calendar, universes = _entry_day_universes(ph, _pairs([("2026-03-03", "7")]), 0.025)
     assert calendar == ["2026-03-02", "2026-03-03"]
     assert universes == {"2026-03-02": {"000001"}, "2026-03-03": {"000007"}}
     tasks = _by_key(_enum(ph, _pairs([("2026-03-03", "7")])))
@@ -1058,7 +1058,7 @@ def test_unified_order_puts_oldest_regular_first(env) -> None:
 def test_extended_only_task_list_is_unchanged() -> None:
     ph = _ph([("2026-03-02", "000001", 110.0, 100.0)])
     kis_tasks = enumerate_extended_session_tasks(
-        [redacted]
+        as_of=AS_OF, retention_days=365, min_change_ratio=0.025,
         price_history=ph, candidate_pairs=_pairs([]),
     )
     regular_plan = RegularBackfillPlan(
@@ -1639,3 +1639,17 @@ def test_evicted_write_is_terminal_skip(env) -> None:
     assert kis.requested == [] and summary.tasks_done == 1
     assert classify_extended_backfill_outcome(summary)[0] == "OK"
     assert not ledger.terminal_symbols(day, "nxt_aftermarket")
+
+
+def test_backfill_change_threshold_prefers_env_then_private_store() -> None:
+    from src.backfill.intraday.extended_session_backfill import _backfill_min_change_ratio
+    from src.config.collection import CollectionSettings
+    from src.strategy.store import strategy_values
+
+    # Given: one profile with an operator override and one without
+    overridden = CollectionSettings(COLLECTION_BACKFILL_MIN_CHANGE_RATIO=0.045, _env_file=None)
+    unset = CollectionSettings(COLLECTION_BACKFILL_MIN_CHANGE_RATIO=None, _env_file=None)
+
+    # When / Then: the override wins; otherwise the store's training-screen lower bound applies
+    assert _backfill_min_change_ratio(overridden) == pytest.approx(0.045)
+    assert _backfill_min_change_ratio(unset) == strategy_values().universe_chg_min

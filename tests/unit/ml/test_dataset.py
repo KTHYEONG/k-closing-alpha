@@ -194,13 +194,13 @@ def test_create_multi_targets_subtracts_measured_round_trip_cost() -> None:
     )
 
     # When
-    [redacted]
+    out = create_multi_targets(df, clip_lower=-0.12, clip_upper=0.12)
 
     # Then
     net_of_cost = df["net_return"].to_numpy() / 100.0 - ROUND_TRIP_COST_RATIO
     np.testing.assert_allclose(
         out["target_return"].to_numpy(),
-        [redacted]
+        np.clip(net_of_cost, -0.12, 0.12),
         rtol=0.0,
         atol=1e-12,
     )
@@ -226,21 +226,38 @@ def test_retarget_with_clip_matches_create_multi_targets_cost_basis() -> None:
             "net_return": [4.0, -2.0, 1.0, -0.5, 2.5, -3.0],
         }
     )
-    [redacted]
+    base = create_multi_targets(df, clip_lower=-0.12, clip_upper=0.12)
 
     # When: retarget the same frame to a tighter candidate clip
-    [redacted]
-    [redacted]
+    tight = retarget_with_clip(base, -0.03, 0.03)
+    base_again = retarget_with_clip(base, -0.12, 0.12)
 
     # Then: identical cost basis -> identical target_return at identical bounds
     np.testing.assert_allclose(
         base_again["target_return"].to_numpy(), base["target_return"].to_numpy(), rtol=0.0, atol=1e-12
     )
     # tighter clip only ever pulls values inward, never shifts the un-clipped middle
-    [redacted]
+    mid = np.abs(base["target_return"].to_numpy()) < 0.03
     np.testing.assert_allclose(
         tight["target_return"].to_numpy()[mid], base["target_return"].to_numpy()[mid], rtol=0.0, atol=1e-12
     )
+
+
+def test_create_multi_targets_defaults_to_store_label_clip() -> None:
+    import numpy as np
+
+    from src.ml.dataset import create_multi_targets
+    from src.strategy.store import strategy_values
+
+    # Given: a net return far beyond any label clip on either side
+    df = pd.DataFrame({"trade_date": ["2026-03-02", "2026-03-02"], "net_return": [90.0, -90.0]})
+    clip = strategy_values().label_clip
+
+    # When: no clip bounds are passed
+    out = create_multi_targets(df)
+
+    # Then: the symmetric store label clip bounds target_return
+    np.testing.assert_allclose(out["target_return"].to_numpy(), [clip, -clip], rtol=0.0, atol=1e-12)
 
 
 def _raw_trade_log_scenario_auto(n_dates: int = 40, per_day: int = 6) -> pd.DataFrame:

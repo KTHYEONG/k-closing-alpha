@@ -76,7 +76,7 @@ def build_candidate_universe(
     """
     logger.info("Filtering PIT candidate universes U0 and U3...")
 
-    [redacted]
+    # U0_PIT mask: spec change band, liquidity floors, not ceiling, close > 0, vol > 0
     u0_mask = select_universe(ph, spec)
 
     u0_df = ph[u0_mask].copy().sort_values(["date", "symbol"]).reset_index(drop=True)

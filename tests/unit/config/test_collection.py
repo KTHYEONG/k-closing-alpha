@@ -63,6 +63,17 @@ def test_default_repair_budget_covers_measured_worst_case_session(monkeypatch) -
     assert settings.COLLECTION_TICK_REPAIR_MAX_PAGES >= 2 * 390
 
 
+def test_backfill_change_threshold_unset_does_not_load_strategy_store(monkeypatch) -> None:
+    # Given: no operator override of the entry-day reconstruction threshold
+    monkeypatch.delenv("COLLECTION_BACKFILL_MIN_CHANGE_RATIO", raising=False)
+
+    # When
+    settings = CollectionSettings(_env_file=None)
+
+    # Then: collection settings stay independent of the strategy store; the backfill resolves it later
+    assert settings.COLLECTION_BACKFILL_MIN_CHANGE_RATIO is None
+
+
 def test_existing_exports_remain_stable() -> None:
     """Existing exports remain stable."""
     from src import settings as settings_module

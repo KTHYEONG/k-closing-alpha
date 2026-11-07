@@ -406,22 +406,22 @@ def test_fetch_kis_band_ranking_bisects_saturated_bands_and_dedupes() -> None:
             hit = [r for r in self.rows if rate_min_pct - 1e-9 <= float(r["prdy_ctrt"]) <= rate_max_pct + 1e-9]
             return {"rt_cd": "0", "output": hit[:30]}
 
-    [redacted]
+    # Given: 3~9% 밴드에 95종목(30행 상한의 3배 이상), 경계값(4.00%) 포함, ETN Q접두어 포함
     rows = [
-        [redacted]
+        {"stck_shrn_iscd": f"{i:06d}", "hts_kor_isnm": f"N{i}", "stck_prpr": "1000", "prdy_ctrt": f"{3.0 + (i % 60) * 0.1:.2f}"}
         for i in range(1, 95)
     ]
     rows.append({"stck_shrn_iscd": "Q500041", "hts_kor_isnm": "ETN", "stck_prpr": "10000", "prdy_ctrt": "4.00"})
     kis = _BandKis(rows)
 
     # When
-    [redacted]
+    out = asyncio.run(universe_scan.fetch_kis_band_ranking(kis, object(), rate_min_pct=3.0, rate_max_pct=9.0))
 
     # Then
     assert universe_scan.KIS_RANKING_ROW_CAP == 30
     assert sorted(r["stck_shrn_iscd"] for r in out) == sorted(r["stck_shrn_iscd"] for r in rows)
     assert len(kis.calls) > 1
-    [redacted]
+    assert kis.calls[0] == (3.0, 9.0, "J")
     assert {venue for _, _, venue in kis.calls} == {"J"}
 
 
@@ -450,16 +450,16 @@ def test_fetch_kis_band_ranking_fails_closed_on_saturation_budget_and_vendor_err
     # Given/When/Then: 동일 등락률 31종목 -> 더 쪼갤 수 없는 밴드가 상한에 걸림
     same_rate = [{"stck_shrn_iscd": f"{i:06d}", "prdy_ctrt": "5.00"} for i in range(31)]
     with pytest.raises(universe_scan.UniverseScanCoverageError, match="saturated"):
-        [redacted]
+        asyncio.run(universe_scan.fetch_kis_band_ranking(_BandKis(same_rate), object(), rate_min_pct=3.0, rate_max_pct=9.0))
 
     # 콜 예산 소진
-    [redacted]
+    many = [{"stck_shrn_iscd": f"{i:06d}", "prdy_ctrt": f"{3.0 + (i % 60) * 0.1:.2f}"} for i in range(95)]
     with pytest.raises(universe_scan.UniverseScanCoverageError, match="call budget"):
-        [redacted]
+        asyncio.run(universe_scan.fetch_kis_band_ranking(_BandKis(many), object(), rate_min_pct=3.0, rate_max_pct=9.0, max_calls=2))
 
     # 벤더 오류 응답
     with pytest.raises(universe_scan.UniverseScanCoverageError, match="rt_cd=1"):
-        [redacted]
+        asyncio.run(universe_scan.fetch_kis_band_ranking(_BandKis(many, rt_cd="1"), object(), rate_min_pct=3.0, rate_max_pct=9.0))
 
 
 def test_map_ranking_rows_to_stock_list_strips_etn_q_prefix() -> None:

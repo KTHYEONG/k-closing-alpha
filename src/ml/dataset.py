@@ -17,6 +17,7 @@ from src.ml.scenario_panel import (
 from src.ml.scenario_rules import derive_scenario_labels
 from src.processing.schema import RAW_TO_STANDARD_MAP
 from src.serving.realtime.features import (
+    _CALENDAR_FLOW_OUTPUT_FEATURES,
     _ROBUST_Z_COLUMNS,
     _WEEKDAY_INDICATOR_FEATURES,
     _apply_robust_z,
@@ -29,8 +30,6 @@ logger = logging.getLogger(__name__)
 
 RETURN_UNIT = "decimal_net"
 LABEL_THRESHOLDS: dict[str, float] = {"target_good": LABEL_GOOD_THRESHOLD, "target_bad": LABEL_BAD_THRESHOLD}
-[redacted]
-[redacted]
 
 _ALLOWED_FEATURE_SETS: tuple[str, ...] = (
     "base40",
@@ -124,14 +123,7 @@ _EXCLUDED_FROM_X: set[str] = {
     "range_efficiency",
     "flow_turnover",
     "relative_flow_strength",
-    "weekday_is_monday",
-    "weekday_is_tuesday",
-    "weekday_is_wednesday",
-    "weekday_is_thursday",
-    "weekday_is_friday",
-    "flow_consensus",
-    "flow_alignment_direction",
-    "friday_selection_rank_pct",
+    *_CALENDAR_FLOW_OUTPUT_FEATURES,
     "market_cap_100m",
     "trade_value_100m",
     "volume",
@@ -176,10 +168,16 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
 
 def create_multi_targets(
     df: pd.DataFrame,
-    [redacted]
-    [redacted]
+    clip_lower: float | None = None,
+    clip_upper: float | None = None,
 ) -> pd.DataFrame:
-    [redacted]
+    """회귀/랭킹/분류 3종 타깃 변수를 decimal net 기준으로 생성합니다.
+
+    Omitted clip bounds default to the strategy store's symmetric label clip.
+    """
+    label_clip = strategy_values().label_clip
+    clip_lower = -label_clip if clip_lower is None else clip_lower
+    clip_upper = label_clip if clip_upper is None else clip_upper
     if clip_lower >= clip_upper:
         raise ValueError(f"clip_lower {clip_lower} must be < clip_upper {clip_upper}")
     df = df.copy()

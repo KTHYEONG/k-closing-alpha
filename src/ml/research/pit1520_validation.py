@@ -389,7 +389,7 @@ def compute_feature_parity(
 
 def _superset_on(price_history: pd.DataFrame, day: pd.Timestamp, screen: EodSupersetScreen) -> set[str]:
     # Recall is measured against the fetch superset over the whole market on T, not the training pool:
-    [redacted]
+    # a live rank-pool member outside the training change band is still inside the superset by design.
     missing = [c for c in ("date", *_EOD_SUPERSET_COLUMNS) if c not in price_history.columns]
     if missing:
         raise ValueError(f"compute_feature_parity price_history missing superset columns: {missing}")

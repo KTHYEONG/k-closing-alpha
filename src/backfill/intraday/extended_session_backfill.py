@@ -66,6 +66,7 @@ from src.data.intraday_store import (
     write_intraday_partition,
     write_kis_adjusted_partition,
 )
+from src.strategy.store import require_production_store
 from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.data.io_utils import atomic_write_parquet, read_existing_parquet
 from src.data.partition_eviction import is_evicted, stored_symbols
@@ -1358,6 +1359,13 @@ def _coverage_or_none(
         return None
 
 
+def _backfill_min_change_ratio(profile: CollectionSettings) -> float:
+    """Explicit env threshold, else the private store's training-screen lower change bound (fail closed)."""
+    if profile.COLLECTION_BACKFILL_MIN_CHANGE_RATIO is not None:
+        return float(profile.COLLECTION_BACKFILL_MIN_CHANGE_RATIO)
+    return float(require_production_store().universe_chg_min)
+
+
 def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, logic covered via run_extended_session_backfill scenarios
     """Run the nightly extended-session backfill until the stop time (exit 0 on deadline stop)."""
     import re
@@ -1449,7 +1457,7 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
         kis_tasks = enumerate_extended_session_tasks(
             as_of=as_of,
             retention_days=retention,
-            [redacted]
+            min_change_ratio=_backfill_min_change_ratio(profile),
             price_history=price_history,
             candidate_pairs=candidate_pairs,
         )

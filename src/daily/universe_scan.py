@@ -27,7 +27,7 @@ class UniverseScanCoverageError(RuntimeError):
 
 # 실측(2026-09-14): KIS 등락률순위(FHPST01700000)는 INPUT_CNT와 무관하게 요청당 최대 30행이며 연속조회(tr_cont)가 없다.
 KIS_RANKING_ROW_CAP: int = 30
-[redacted]
+# 상승률 밴드 전수 복원에 필요한 호출 수에 급등장 후보 증가와 이분할 오버헤드 여유를 더한 상한(데이터 계좌 리미터 기준 약 11초).
 KIS_RANKING_MAX_CALLS: int = 200
 
 __all__ = [

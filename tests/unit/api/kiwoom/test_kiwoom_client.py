@@ -79,7 +79,7 @@ def test_kiwoom_ranking_observer_sees_prefilter_rows() -> None:
     seen: list[Any] = []
     res = asyncio.run(
         client.get_fluctuation_ranking(
-            [redacted]
+            object(), rate_min_pct=3.0, rate_max_pct=9.0, on_page=lambda *a: seen.append(a)
         ),
     )
     assert res["rt_cd"] == "0"
@@ -170,7 +170,7 @@ def test_kiwoom_observer_failure_is_visible() -> None:
         raise RuntimeError("store down")
 
     with pytest.raises(RawCaptureError, match="store down"):
-        [redacted]
+        asyncio.run(client.get_fluctuation_ranking(object(), rate_min_pct=3.0, rate_max_pct=9.0, on_page=_boom))
 
     client2 = _kiwoom_client()
     fake2, _ = _tick_pages([_tick_page([{"cur_prc": "1", "trde_qty": "1", "cntr_tm": "20260904120000"}], "N", "")])
@@ -189,7 +189,7 @@ def test_kiwoom_observer_failure_is_visible() -> None:
     client3._post_tr = fake_post_tr
     with pytest.raises(RawCaptureError, match="ranking store down"):
         asyncio.run(
-            [redacted]
+            client3.get_fluctuation_ranking(object(), rate_min_pct=3.0, rate_max_pct=9.0, on_page=_raw_ranking_boom)
         )
 
 
@@ -493,7 +493,7 @@ def test_kiwoom_get_fluctuation_ranking_single_page() -> None:
         return ({"return_code": 0, "return_msg": "OK", "pred_pre_flu_rt_upper": rows}, {"cont-yn": "N", "next-key": ""})
 
     client._post_tr = fake_post_tr
-    [redacted]
+    res = asyncio.run(client.get_fluctuation_ranking(object(), rate_min_pct=3.0, rate_max_pct=9.0))
     assert res["rt_cd"] == "0"
     assert res["vendor"] == "kiwoom"
     assert len(res["output"]) == 1
@@ -517,7 +517,7 @@ def test_kiwoom_get_fluctuation_ranking_paginates_via_cont_yn() -> None:
         return ({"return_code": 0, "pred_pre_flu_rt_upper": rows}, {"cont-yn": "N", "next-key": ""})
 
     client._post_tr = fake_post_tr
-    [redacted]
+    res = asyncio.run(client.get_fluctuation_ranking(object(), rate_min_pct=3.0, rate_max_pct=9.0, max_pages=5))
     assert res["rt_cd"] == "0"
     assert calls["n"] == 2
     assert len(res["output"]) == 2
@@ -540,7 +540,7 @@ def test_kiwoom_get_fluctuation_ranking_early_exit_on_rate_floor() -> None:
         return ({"return_code": 0, "pred_pre_flu_rt_upper": rows}, {"cont-yn": "Y", "next-key": "more"})
 
     client._post_tr = fake_post_tr
-    [redacted]
+    res = asyncio.run(client.get_fluctuation_ranking(object(), rate_min_pct=3.0, rate_max_pct=9.0, max_pages=5))
     assert res["rt_cd"] == "0"
     assert calls["n"] == 1
     assert len(res["output"]) == 1
@@ -585,7 +585,7 @@ def test_kiwoom_get_fluctuation_ranking_returns_soft_failure_on_nonzero_return_c
 
     client._post_tr = fake_post_tr
 
-    [redacted]
+    res = asyncio.run(client.get_fluctuation_ranking(object(), rate_min_pct=3.0, rate_max_pct=9.0))
 
     assert res["rt_cd"] == "1"
     assert res["output"] == []
@@ -609,7 +609,7 @@ def test_kiwoom_get_fluctuation_ranking_skips_unparseable_flu_rt() -> None:
 
     client._post_tr = fake_post_tr
 
-    [redacted]
+    res = asyncio.run(client.get_fluctuation_ranking(object(), rate_min_pct=3.0, rate_max_pct=9.0))
 
     assert res["rt_cd"] == "0"
     assert len(res["output"]) == 1
@@ -629,7 +629,7 @@ def test_kiwoom_get_fluctuation_ranking_exception_yields_soft_failure() -> None:
 
     client._post_tr = fake_post_tr
 
-    [redacted]
+    res = asyncio.run(client.get_fluctuation_ranking(object(), rate_min_pct=3.0, rate_max_pct=9.0))
 
     assert res["rt_cd"] == "1"
     assert res["output"] == []
@@ -812,7 +812,7 @@ def test_kiwoom_get_fluctuation_ranking_flags_truncation_when_pages_exhausted() 
     client._post_tr = fake_post_tr
 
     # When: 모든 페이지가 밴드 안이고 다음 페이지가 남은 채 예산 소진
-    [redacted]
+    res = asyncio.run(client.get_fluctuation_ranking(object(), rate_min_pct=3.0, rate_max_pct=9.0, max_pages=3))
 
     # Then: 무경고 성공 금지
     assert calls["n"] == 3

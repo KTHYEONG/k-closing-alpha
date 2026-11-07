@@ -160,13 +160,13 @@ def test_attach_pit_net_label_uses_pit_tick_cost_and_clips_label() -> None:
     })
 
     # When
-    [redacted]
+    out = attach_pit_net_label(cands, cost=AA_COST, label_clip=0.12)
 
     # Then: net_pit = gross - (20 + 2*tick + brokerage)/1e4; NaN tick propagates, never 0
     assert np.isclose(float(out.loc[0, "net_pit"]), 0.02 - (20.0 + 2 * 10.0 + BROKERAGE_FEE_BP) / 1e4)
     assert np.isnan(float(out.loc[2, "net_pit"]))
     # Then: train_label is the clipped net_pit
-    [redacted]
+    assert np.isclose(float(out.loc[1, "train_label"]), 0.12)
     assert np.isclose(float(out.loc[0, "train_label"]), 0.02 - (20.0 + 2 * 10.0 + BROKERAGE_FEE_BP) / 1e4)
     assert np.isnan(float(out.loc[2, "train_label"]))
 
@@ -276,8 +276,8 @@ def test_evaluate_ranker_verdict_gates_coverage_paths_and_control() -> None:
         return RegimeMetrics(
             regime="post_reform", n_calendar_days=879, n_days_with_signal=878,
             n_days_feasible=867, feasible_day_fraction=0.9863, coverage_status=coverage,
-            mean_net_bp=mean, median_net_bp=median, std_net_bp=180.0, win_rate=N,
-            t_stat=t, sharpe=N, ci_low_bp=10.0, ci_high_bp=45.0, dsr=0.9,
+            mean_net_bp=mean, median_net_bp=median, std_net_bp=180.0, win_rate=0.56,
+            t_stat=t, sharpe=2.5, ci_low_bp=10.0, ci_high_bp=45.0, dsr=0.9,
         )
 
     def _arm(name: str, mean: float, median: float, t: float, coverage: str = "OK",
@@ -286,7 +286,7 @@ def test_evaluate_ranker_verdict_gates_coverage_paths_and_control() -> None:
             arm=name, top_k=3, regimes={"post_reform": _rm(mean, median, t, coverage)},
             by_year=[],
             cost_stress=[CostStressPoint(regime="post_reform", round_trip_ticks=3.0, n_days=878,
-                                         mean_net_bp=24.9, median_net_bp=17.4, t_stat=N,
+                                         mean_net_bp=24.9, median_net_bp=17.4, t_stat=3.3,
                                          passes=stress_pass)],
         )
 
@@ -989,7 +989,7 @@ def _synthetic_bundle_and_fixture() -> tuple[dict, "pd.DataFrame"]:  # noqa: UP0
         for s in range(5):
             rows.append({  # noqa: PERF401 - spec skeleton
                 "date": d, "symbol": f"{s:06d}",
-                [redacted]
+                "chg_ratio": float(rng.uniform(0.01, 0.12)),
                 "log_tv": float(rng.normal(6, 1)),
                 "train_label": float(rng.normal(0, 0.01)),
             })
@@ -1301,7 +1301,7 @@ def test_attach_pit_net_label_nets_with_the_point_in_time_statutory_rate() -> No
     )
 
     # When: attaching the PIT net label
-    [redacted]
+    out = attach_pit_net_label(cands, cost=AA_COST, label_clip=0.12)
 
     # Then: the statutory leg is 30bp in 2018 and 15bp in 2025, plus brokerage
     np.testing.assert_allclose(
@@ -1309,7 +1309,7 @@ def test_attach_pit_net_label_nets_with_the_point_in_time_statutory_rate() -> No
         [0.20 - (40.0 + BROKERAGE_FEE_BP) / 1e4, 0.01 - (25.0 + BROKERAGE_FEE_BP) / 1e4],
     )
     # And: the training label is clipped symmetrically
-    [redacted]
+    assert out["train_label"].to_numpy()[0] == pytest.approx(0.12)
 
     # And: every required column is guarded by name
     for missing in ("tick_cost_bp", "gross_return", "date"):
@@ -1332,9 +1332,9 @@ def test_evaluate_falsification_refutes_a_profitable_pre_reform_regime() -> None
             mean_net_bp=mean_bp,
             median_net_bp=mean_bp,
             std_net_bp=100.0,
-            win_rate=N,
+            win_rate=0.55,
             t_stat=t_stat,
-            sharpe=N,
+            sharpe=1.0,
             ci_low_bp=mean_bp - 5.0,
             ci_high_bp=mean_bp + 5.0,
             dsr=0.5,
@@ -1346,25 +1346,25 @@ def test_evaluate_falsification_refutes_a_profitable_pre_reform_regime() -> None
             top_k=3,
             regimes={
                 "pre_reform": pre,
-                [redacted]
-                [redacted]
+                "post_reform": _regime("post_reform", n_signal=700, mean_bp=20.0, t_stat=3.3),
+                "full_history": _regime("full_history", n_signal=2300, mean_bp=5.0, t_stat=1.0),
             },
             by_year=[],
             cost_stress=[],
         )
 
-    [redacted]
+    # Given: a 1,400-day pre-reform sample that certifies profit under PIT cost
     status, reasons = evaluate_falsification(
-        [redacted]
+        _arm(_regime("pre_reform", n_signal=1400, mean_bp=9.0, t_stat=2.9))
     )
 
     # Then: the 46bp-cost regime cannot be profitable, so the run is refuted
     assert status == "REFUTED"
     assert any("pre_reform" in r for r in reasons)
 
-    [redacted]
+    # When: a synthetic negative pre-reform result is reported instead
     status_ok, reasons_ok = evaluate_falsification(
-        [redacted]
+        _arm(_regime("pre_reform", n_signal=1400, mean_bp=-6.0, t_stat=-1.8))
     )
 
     # Then: the cost model and the label are consistent
@@ -1373,7 +1373,7 @@ def test_evaluate_falsification_refutes_a_profitable_pre_reform_regime() -> None
 
     # When: the pre-reform sample is too short to judge
     status_thin, reasons_thin = evaluate_falsification(
-        _arm(_regime("pre_reform", n_signal=100, mean_bp=12.0, t_stat=N))
+        _arm(_regime("pre_reform", n_signal=100, mean_bp=12.0, t_stat=3.1))
     )
 
     # Then: it reports insufficiency rather than passing or refuting silently
@@ -1396,9 +1396,9 @@ def test_evaluate_ranker_verdict_short_circuits_on_a_refuted_falsification() -> 
             mean_net_bp=mean_bp,
             median_net_bp=mean_bp,
             std_net_bp=100.0,
-            win_rate=N,
+            win_rate=0.55,
             t_stat=t_stat,
-            sharpe=N,
+            sharpe=1.8,
             ci_low_bp=mean_bp - 5.0,
             ci_high_bp=mean_bp + 5.0,
             dsr=0.6,
@@ -1417,7 +1417,7 @@ def test_evaluate_ranker_verdict_short_circuits_on_a_refuted_falsification() -> 
                     n_days=880,
                     mean_net_bp=mean_bp - 5.0,
                     median_net_bp=mean_bp - 5.0,
-                    t_stat=N,
+                    t_stat=2.4,
                     passes=True,
                 )
             ],
@@ -1647,13 +1647,13 @@ def test_demean_label_by_date_centres_net_within_date_and_clips() -> None:
     })
 
     # When
-    [redacted]
+    out = demean_label_by_date(labeled, label_clip=0.12)
 
     # Then: label = clip(net - finite date mean); NaN stays NaN; evaluation column and input untouched
     assert out["train_label"].iloc[0] == pytest.approx(-0.01)
     assert out["train_label"].iloc[1] == pytest.approx(0.01)
     assert np.isnan(out["train_label"].iloc[2])
-    [redacted]
+    assert out["train_label"].iloc[3:].tolist() == pytest.approx([0.12, -0.12, -0.12])
     assert out["net_pit"].equals(labeled["net_pit"])
     assert labeled["train_label"].eq(9.0).all()
     with pytest.raises(ValueError, match="net_pit"):

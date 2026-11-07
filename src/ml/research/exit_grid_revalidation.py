@@ -1,4 +1,4 @@
-[redacted]
+"""청산레버 그리드 locked-OOS/CPCV(8,2) 재검증 -- 인증 리랭커와 동일 파이프라인 재사용.
 
 exit_policy.evaluate_exit_grid는 이미 cv=CombinatorialPurgedCV를 지원하므로 별도
 "현행 표준"에 맞춘 개조가 필요 없다(topk_ranker_research.CPCV_N_GROUPS/CPCV_K_TEST=8/2와

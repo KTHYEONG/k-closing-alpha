@@ -267,7 +267,7 @@ def test_get_fluctuation_ranking_requires_explicit_market_div_code() -> None:
 
     async def _runner() -> None:
         with pytest.raises(ValueError, match="market_div_code"):
-            [redacted]
+            await client.get_fluctuation_ranking(_FakeSession(), rate_min_pct=3.0, rate_max_pct=9.0)
 
     asyncio.run(_runner())
 
@@ -279,7 +279,7 @@ def test_get_fluctuation_ranking_sends_confirmed_tr_params() -> None:
     async def _runner():
         with patch.object(client, "_handle_request", handle_request):
             return await client.get_fluctuation_ranking(
-                [redacted]
+                _FakeSession(), rate_min_pct=3.0, rate_max_pct=9.0, market_div_code="J",
             )
 
     asyncio.run(_runner())
@@ -289,8 +289,8 @@ def test_get_fluctuation_ranking_sends_confirmed_tr_params() -> None:
     params = call.kwargs.get("params", {})
     assert params["FID_COND_MRKT_DIV_CODE"] == "J"
     assert params["FID_COND_SCR_DIV_CODE"] == "20170"
-    [redacted]
-    [redacted]
+    assert params["FID_RSFL_RATE1"] == "3"
+    assert params["FID_RSFL_RATE2"] == "9"
     headers = call.kwargs.get("headers", {})
     assert headers.get("tr_id") == "FHPST01700000"
 
@@ -302,12 +302,12 @@ def test_get_fluctuation_ranking_returns_raw_rows_with_output_or_output2_fallbac
     async def _runner_output():
         handle_request = AsyncMock(return_value={"rt_cd": "0", "output": rows})
         with patch.object(client, "_handle_request", handle_request):
-            [redacted]
+            return await client.get_fluctuation_ranking(_FakeSession(), rate_min_pct=3.0, rate_max_pct=9.0, market_div_code="J")
 
     async def _runner_output2():
         handle_request = AsyncMock(return_value={"rt_cd": "0", "output2": rows})
         with patch.object(client, "_handle_request", handle_request):
-            [redacted]
+            return await client.get_fluctuation_ranking(_FakeSession(), rate_min_pct=3.0, rate_max_pct=9.0, market_div_code="J")
 
     res1 = asyncio.run(_runner_output())
     res2 = asyncio.run(_runner_output2())
@@ -321,7 +321,7 @@ def test_get_fluctuation_ranking_propagates_error_response_unchanged() -> None:
 
     async def _runner():
         with patch.object(client, "_handle_request", handle_request):
-            [redacted]
+            return await client.get_fluctuation_ranking(_FakeSession(), rate_min_pct=3.0, rate_max_pct=9.0, market_div_code="J")
 
     res = asyncio.run(_runner())
     assert res == {"rt_cd": "1", "msg1": "조회 실패"}

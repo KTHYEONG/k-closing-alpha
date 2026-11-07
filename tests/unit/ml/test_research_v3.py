@@ -379,11 +379,11 @@ def test_v3_universe_matches_strategy_contract_selection() -> None:
     import pandas as pd
 
     from src.ml.research.v3_engine import build_candidate_universe
-    from src.strategy.contract import select_universe
+    from src.strategy.contract import DEFAULT_UNIVERSE, select_universe
 
     ph = pd.DataFrame(
         {
-            [redacted]
+            "chg_ratio": [0.03, 0.05, 0.12, 0.005, 0.30, 0.07],
             "tv_clean": [200.0, 200.0, 200.0, 200.0, 200.0, 50.0],
             "mc_clean": [1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0],
             "close": [1000.0, 1000.0, 1000.0, 1000.0, 1300.0, 1000.0],
@@ -405,7 +405,7 @@ def test_v3_universe_matches_strategy_contract_selection() -> None:
     expected = ph[select_universe(ph)]["symbol"].tolist()
     assert u0_df["symbol"].tolist() == expected
     assert expected == ["000001", "000002"]
-    [redacted]
+    assert np.all(u0_df["chg_ratio"].to_numpy() < DEFAULT_UNIVERSE.chg_max)
 
 
 def test_v3_build_candidate_universe_applies_cost_aware_spec() -> None:

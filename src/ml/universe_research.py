@@ -31,7 +31,7 @@ from src.ml.oof import purged_oof_predict
 from src.ml.robust_eval import CombinatorialPurgedCV
 from src.ml.universe import COST_AWARE_SCREEN, ScreenConfig, build_universe_panel, screen_baseline_stats
 from src.ml.validation import cpcv_path_evidence
-[redacted]
+from src.strategy.contract import DEFAULT_UNIVERSE, MIN_PATH_WIN_RATE
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,7 @@ DEFAULT_RESEARCH_SCREENS: dict[str, ScreenConfig] = {
     "operator_legacy": ScreenConfig(0.10, None, 100.0, 500.0),
     "liq_only_wide": ScreenConfig(-1.0, None, 100.0, 500.0),
     "liq_only_tight": ScreenConfig(-1.0, None, 300.0, 1000.0),
-    [redacted]
+    "modest_up": ScreenConfig(DEFAULT_UNIVERSE.chg_min, DEFAULT_UNIVERSE.chg_max, 100.0, 500.0),
     "strong_up_capped": ScreenConfig(0.08, 0.20, 100.0, 500.0),
     "index_up_liq": ScreenConfig(-1.0, None, 100.0, 500.0, exclude_ceiling=True, require_index_up=True),
     "cost_aware": COST_AWARE_SCREEN,

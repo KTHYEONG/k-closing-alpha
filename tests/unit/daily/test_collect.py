@@ -247,7 +247,7 @@ def test_resolve_daily_candidates_returns_empty_list_when_scan_yields_nothing(mo
 
     import src.daily.collect as collect_mod
 
-    [redacted]
+    # Given: the ranking scan finds nothing inside the change band today
     async def _empty_scan(client_arg, session_arg, **kwargs):
         rows: list[dict] = []
         return rows

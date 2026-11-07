@@ -51,7 +51,7 @@ _PCT_RANK_COLUMNS: dict[str, str] = {
     "turnover": "turnover_pct_rank",
 }
 
-[redacted]
+# 요일 one-hot 지표 (engineer_features 내에서 생성).
 _WEEKDAY_INDICATOR_FEATURES: tuple[str, ...] = (
     "weekday_is_monday",
     "weekday_is_tuesday",
@@ -61,11 +61,20 @@ _WEEKDAY_INDICATOR_FEATURES: tuple[str, ...] = (
 )
 
 # flow_consensus / flow_alignment_direction 의 원천이 되는 단일 소스 밀도 컬럼.
-[redacted]
+_FLOW_SOURCE_COLUMNS: tuple[str, ...] = (
     "inst_density",
     "foreign_density",
     "prog_dominance",
 )
+
+# engineer_features 의 캘린더/수급 흐름 블록이 만드는 전체 출력 컬럼.
+_CALENDAR_FLOW_OUTPUT_FEATURES: tuple[str, ...] = (
+    *_WEEKDAY_INDICATOR_FEATURES,
+    "flow_consensus",
+    "flow_alignment_direction",
+    "friday_selection_rank_pct",
+)
+
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """로그 스케일링, 상대 비율, 횡단면 백분위/robust-z 피처를 생성합니다."""
@@ -164,7 +173,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
             df["major_density_pct_rank"] * df["change_rate_pct_rank"]
         ).clip(0, 1)
 
-    [redacted]
+    # 캘린더/수급 흐름 파생 피처.
     # 모두 스냅샷 결정 시점 값의 벡터 연산이며, 행 단위 apply / 미래 행 보간은
     # 허용되지 않습니다. 이용 불가능한 수급은 0 으로 간주해 시그널을 만들지 않습니다.
     trade_date = pd.to_datetime(df["trade_date"])
@@ -177,7 +186,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
             df[name].fillna(0).to_numpy()
             if name in df.columns
             else np.zeros(len(df))
-            [redacted]
+            for name in _FLOW_SOURCE_COLUMNS
         ]
     )
     df["flow_consensus"] = np.sign(flow_matrix).sum(axis=1).astype("float64")

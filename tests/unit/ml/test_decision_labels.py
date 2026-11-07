@@ -41,9 +41,9 @@ def test_build_decision_labels_flat_journaled_matches_retarget_with_clip() -> No
         "close_price": [1500.0, 30000.0, 1500.0],
     })
 
-    [redacted]
+    legacy = retarget_with_clip(df, -0.12, 0.12)
     out, prov = build_decision_labels(
-        [redacted]
+        df, None, label_mode="journaled", cost_mode="flat", clip_lower=-0.12, clip_upper=0.12
     )
 
     # Then the legacy training label is reproduced exactly
@@ -72,15 +72,15 @@ def test_build_decision_labels_mechanical_requires_price_history() -> None:
 
     with pytest.raises(ValueError, match="price_history"):
         build_decision_labels(
-            [redacted]
+            df, None, label_mode="mechanical", cost_mode="per_row", clip_lower=-0.12, clip_upper=0.12
         )
     with pytest.raises(ValueError, match="label_mode"):
         build_decision_labels(
-            [redacted]
+            df, None, label_mode="operator", cost_mode="flat", clip_lower=-0.12, clip_upper=0.12
         )
     with pytest.raises(ValueError, match="cost_mode"):
         build_decision_labels(
-            [redacted]
+            df, None, label_mode="journaled", cost_mode="guess", clip_lower=-0.12, clip_upper=0.12
         )
 
 def test_build_decision_labels_mechanical_prices_next_open_over_entry_close() -> None:
@@ -113,7 +113,7 @@ def test_build_decision_labels_mechanical_prices_next_open_over_entry_close() ->
 
     out, prov = build_decision_labels(
         df, price_history, label_mode="mechanical", cost_mode="per_row",
-        [redacted]
+        clip_lower=-0.12, clip_upper=0.12,
     )
 
     # 1,000원 -> tick 1원 -> 20bp spread + 18bp statutory(2024년 PIT 세율, STATUTORY_BP_SCHEDULE)
@@ -156,7 +156,7 @@ def test_build_decision_labels_mechanical_drops_rows_without_next_day_price() ->
 
     out, prov = build_decision_labels(
         df, price_history, label_mode="mechanical", cost_mode="per_row",
-        [redacted]
+        clip_lower=-0.12, clip_upper=0.12,
     )
 
     assert len(out) == 1
@@ -253,7 +253,7 @@ def test_build_decision_labels_per_row_cost_is_point_in_time() -> None:
     # When
     out, prov = build_decision_labels(
         processed, None, label_mode="journaled", cost_mode="per_row",
-        [redacted]
+        clip_lower=-0.12, clip_upper=0.12,
     )
 
     # Then: the pre-reform 50원 tick is used, not the post-reform 10원 tick

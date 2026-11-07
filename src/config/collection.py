@@ -49,7 +49,8 @@ class CollectionSettings(EnvSettings):
         COLLECTION_VERIFIED_CHART_ROUTES: Vendor chart-to-venue mapping,
             default market_session.VERIFIED_CHART_ROUTES; an env value replaces it wholesale.
         COLLECTION_BACKFILL_SLOTS: Explicit backfill key slots, default empty.
-        [redacted]
+        COLLECTION_BACKFILL_MIN_CHANGE_RATIO: Entry-day reconstruction threshold; unset resolves to the
+            private strategy store's universe chg_min at the backfill call site, so collection services never load the store.
         COLLECTION_KIS_MINUTE_RETENTION_DAYS: KIS minute history window, default 365.
         HISTORY_EVICTION_ENABLED: Evict offsite-verified history partitions behind tombstones, default True.
         HISTORY_EVICTION_BARS_RETENTION_DAYS: Local retention of intraday/1m and 1m_kis_adjusted partitions, default 400.
@@ -147,7 +148,7 @@ class CollectionSettings(EnvSettings):
     COLLECTION_ALTDATA_LOOKBACK_DAYS: int = Field(default=30, gt=0)
     COLLECTION_VERIFIED_CHART_ROUTES: dict[str, str] = Field(default_factory=lambda: dict(VERIFIED_CHART_ROUTES))
     COLLECTION_BACKFILL_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
-    [redacted]
+    COLLECTION_BACKFILL_MIN_CHANGE_RATIO: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     COLLECTION_KIS_MINUTE_RETENTION_DAYS: int = Field(default=365, gt=0)
     HISTORY_EVICTION_ENABLED: bool = Field(default=True)
     HISTORY_EVICTION_BARS_RETENTION_DAYS: int = Field(default=400, gt=0)
