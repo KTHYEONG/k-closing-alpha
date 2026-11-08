@@ -50,6 +50,18 @@ TRAIN_PIT_EOD_AUG: str = "pit_eod_aug"
 TRAIN_EOD_ALL: str = "eod_all"
 TRAIN_SOURCES: tuple[str, ...] = (TRAIN_PIT_ONLY, TRAIN_PIT_EOD_AUG, TRAIN_EOD_ALL)
 
+OBJECTIVE_HUBER: str = "huber"
+OBJECTIVE_LAMBDARANK: str = "lambdarank"
+OBJECTIVES: tuple[str, ...] = (OBJECTIVE_HUBER, OBJECTIVE_LAMBDARANK)
+LAMBDARANK_GRADES: int = 5
+SAMPLE_WEIGHT_COL: str = "_sample_weight"
+_MODEL_EXTENSION_DEFAULTS: dict[str, Any] = {
+    "extra_features": (),
+    "objective": "huber",
+    "train_window_days": None,
+    "decay_half_life_days": None,
+}
+
 WEIGHT_EQUAL: str = "equal"
 WEIGHT_INV_TICK: str = "inv_tick"
 WEIGHTINGS: tuple[str, ...] = (WEIGHT_EQUAL, WEIGHT_INV_TICK)
@@ -90,6 +102,11 @@ class ModelConfig:
         model_params: LightGBM parameters (None = the strategy store ranker parameters).
         seeds: Seed ensemble (None = the strategy store seeds).
         huber_delta: Huber alpha.
+        extra_features: Dataset columns appended to the feature set (e.g. intraday path features).
+        objective: OBJECTIVES member; huber regresses the demeaned label, lambdarank ranks within each date on
+            per-date label quantile grades.
+        train_window_days: Rolling window in trading days before the block start (None = expanding).
+        decay_half_life_days: Exponential sample-weight half-life in trading days of age (None = uniform).
     """
 
     feature_set: str = FEATURE_SET_BASE
@@ -100,8 +117,18 @@ class ModelConfig:
     model_params: tuple[tuple[str, Any], ...] | None = None
     seeds: tuple[int, ...] | None = None
     huber_delta: float = 0.9
+    extra_features: tuple[str, ...] = ()
+    objective: str = OBJECTIVE_HUBER
+    train_window_days: int | None = None
+    decay_half_life_days: float | None = None
 
     def __post_init__(self) -> None:
+        if self.objective not in OBJECTIVES:
+            raise ValueError(f"objective must be one of {OBJECTIVES}, got {self.objective!r}")
+        if self.train_window_days is not None and self.train_window_days < 1:
+            raise ValueError(f"train_window_days must be >= 1 when set, got {self.train_window_days}")
+        if self.decay_half_life_days is not None and not self.decay_half_life_days > 0:
+            raise ValueError(f"decay_half_life_days must be positive when set, got {self.decay_half_life_days}")
         if self.feature_set not in FEATURE_SETS:
             raise ValueError(f"feature_set must be one of {FEATURE_SETS}, got {self.feature_set!r}")
         if self.train_source not in TRAIN_SOURCES:
@@ -109,8 +136,20 @@ class ModelConfig:
         if self.retrain_every_days < 1 or self.embargo_days < 0 or self.min_train_days < 1:
             raise ValueError("retrain_every_days >= 1, embargo_days >= 0 and min_train_days >= 1 are required")
 
+    def identity(self) -> dict[str, Any]:
+        """Registry identity; extension fields at their defaults are omitted so earlier ids stay stable."""
+        out = dataclasses.asdict(self)
+        for name, default in _MODEL_EXTENSION_DEFAULTS.items():
+            if out[name] == default:
+                del out[name]
+        return out
+
     def key(self) -> str:
-        return _digest(dataclasses.asdict(self))
+        return _digest(self.identity())
+
+    def features(self) -> list[str]:
+        base = feature_columns(self.feature_set)
+        return [*base, *(c for c in self.extra_features if c not in base)]
 
 
 @dataclass(frozen=True)
@@ -205,6 +244,16 @@ def index_table_from_price_history(ph: pd.DataFrame) -> pd.DataFrame:
     return work.groupby("date", sort=True)[list(INDEX_FEATURE_COLS)].median().reset_index()
 
 
+def train_tier_mask(tiers: pd.Series, train_source: str) -> np.ndarray:
+    """Rows a train source may fit on: 15:20 tiers (pit_only), every row of the view (pit_eod_aug), EOD (eod_all)."""
+    values = tiers.astype(str).to_numpy()
+    if train_source == TRAIN_PIT_ONLY:
+        return np.isin(values, PIT_TIERS)
+    if train_source == TRAIN_PIT_EOD_AUG:
+        return np.ones(len(values), dtype=bool)
+    return np.asarray(values == TIER_EOD, dtype=bool)
+
+
 def training_rows(
     dataset: pd.DataFrame, *, calendar: np.ndarray, block_start: pd.Timestamp, config: ModelConfig
 ) -> pd.DataFrame:
@@ -224,14 +273,11 @@ def training_rows(
     boundary = days[max(0, pos - int(config.embargo_days))]
     exits = pd.to_datetime(dataset["exit_date"]).to_numpy(dtype="datetime64[ns]")
     resolved = ~np.isnat(exits) & (exits < boundary)
+    if config.train_window_days is not None:
+        window_start = days[max(0, pos - int(config.train_window_days))]
+        resolved &= pd.to_datetime(dataset["date"]).to_numpy(dtype="datetime64[ns]") >= window_start
     labels = dataset["train_label"].to_numpy(dtype=np.float64)
-    tiers = dataset["tier"].astype(str).to_numpy()
-    if config.train_source == TRAIN_PIT_ONLY:
-        tier_ok = np.isin(tiers, PIT_TIERS)
-    elif config.train_source == TRAIN_PIT_EOD_AUG:
-        tier_ok = np.ones(len(dataset), dtype=bool)
-    else:
-        tier_ok = tiers == TIER_EOD
+    tier_ok = train_tier_mask(dataset["tier"], config.train_source)
     return dataset[resolved & np.isfinite(labels) & tier_ok]
 
 
@@ -378,7 +424,7 @@ def _fit_and_score(
     fit_fn: Callable[[pd.DataFrame, list[str]], Any],
     progress: bool = True,
 ) -> pd.DataFrame:
-    feats = feature_columns(config.feature_set)
+    feats = config.features()
     missing = [c for c in feats if c not in dataset.columns]
     if missing:
         raise ValueError(f"dataset missing feature columns: {missing}")
@@ -400,6 +446,17 @@ def _fit_and_score(
                 n_train_days,
             )
             continue
+        if config.decay_half_life_days is not None:
+            train = train.assign(
+                **{
+                    SAMPLE_WEIGHT_COL: sample_age_weights(
+                        train["date"],
+                        calendar=calendar,
+                        block_start=start,
+                        half_life_days=float(config.decay_half_life_days),
+                    )
+                }
+            )
         model = fit_fn(train, feats)
         test = pit[pit["date"].isin(block)].copy()
         test["pred"] = np.asarray(model.predict(test[feats]), dtype=np.float64)
@@ -420,9 +477,31 @@ def _fit_and_score(
     return pd.concat(scored_parts, ignore_index=True)
 
 
+def sample_age_weights(
+    dates: pd.Series, *, calendar: np.ndarray, block_start: pd.Timestamp, half_life_days: float
+) -> np.ndarray:
+    """Exponential weights 0.5 ** (age / half_life) with age in trading days before block_start."""
+    days = pd.to_datetime(pd.Series(calendar)).dt.normalize().to_numpy(dtype="datetime64[ns]")
+    pos_start = int(np.searchsorted(days, np.datetime64(pd.Timestamp(block_start).normalize())))
+    pos = np.searchsorted(days, pd.to_datetime(dates).dt.normalize().to_numpy(dtype="datetime64[ns]"))
+    age = np.maximum(pos_start - pos, 0).astype(np.float64)
+    return np.asarray(np.power(0.5, age / float(half_life_days)), dtype=np.float64)
+
+
+def lambdarank_grades(train: pd.DataFrame, n_grades: int = LAMBDARANK_GRADES) -> np.ndarray:
+    """Per-date quantile grades 0..n_grades-1 of train_label (higher = better), for the ranking objective."""
+    by_date = train.groupby("date")["train_label"]
+    pos = by_date.rank(method="first").to_numpy(dtype=np.float64) - 1.0
+    size = by_date.transform("size").to_numpy(dtype=np.float64)
+    return np.asarray(np.minimum((pos / size * n_grades).astype(np.int64), n_grades - 1), dtype=np.int64)
+
+
 def default_fit_fn(config: ModelConfig) -> Callable[[pd.DataFrame, list[str]], Any]:
-    """Seed-ensemble Huber LightGBM exactly as the production bundle trains its return model."""
-    from src.ml.bundle import fit_seed_ensemble
+    """Seed-ensemble LightGBM: Huber regression as the production bundle, or a per-date LambdaRank ranker."""
+    from lightgbm import LGBMRanker
+
+    from src.ml.bundle import SeedEnsembleModel, fit_seed_ensemble
+    from src.ml.oof import _finite_nan
     from src.strategy.store import strategy_values
 
     values = strategy_values()
@@ -430,7 +509,22 @@ def default_fit_fn(config: ModelConfig) -> Callable[[pd.DataFrame, list[str]], A
     seeds = tuple(config.seeds) if config.seeds is not None else tuple(values.ranker_seeds)
 
     def _fit(train: pd.DataFrame, feats: list[str]) -> Any:
-        return fit_seed_ensemble(train, feats, "train_label", seeds, params, float(config.huber_delta))
+        weights = train[SAMPLE_WEIGHT_COL].to_numpy(dtype=np.float64) if SAMPLE_WEIGHT_COL in train else None
+        if config.objective == OBJECTIVE_HUBER:
+            return fit_seed_ensemble(
+                train, feats, "train_label", seeds, params, float(config.huber_delta), sample_weight=weights
+            )
+        ordered = train.sort_values("date", kind="stable")
+        group_sizes = ordered.groupby("date", sort=True).size().to_numpy()
+        grades = lambdarank_grades(ordered)
+        x = _finite_nan(ordered, feats)[feats]
+        w = ordered[SAMPLE_WEIGHT_COL].to_numpy(dtype=np.float64) if SAMPLE_WEIGHT_COL in ordered else None
+        models = []
+        for seed in seeds:
+            ranker = LGBMRanker(objective="lambdarank", random_state=seed, verbosity=-1, **params)
+            ranker.fit(x, grades, group=group_sizes, sample_weight=w)
+            models.append(ranker)
+        return SeedEnsembleModel(models, seeds)
 
     return _fit
 
@@ -455,6 +549,76 @@ def run_model(
         calendar = np.array(sorted(pd.to_datetime(dataset["date"]).dt.normalize().unique()))
     fit = fit_fn if fit_fn is not None else default_fit_fn(config)
     return _fit_and_score(dataset, eval_days=eval_days, calendar=calendar, config=config, fit_fn=fit)
+
+
+def run_cpcv(
+    dataset: pd.DataFrame,
+    *,
+    start: str,
+    end: str,
+    config: ModelConfig,
+    n_groups: int = 8,
+    k_test: int = 2,
+    embargo_groups: int = 1,
+    fit_fn: Callable[[pd.DataFrame, list[str]], Any] | None = None,
+) -> pd.DataFrame:
+    """Combinatorial purged CV over the 15:20 days in [start, end], the certified methodology on PIT rows.
+
+    Days are split into n_groups contiguous groups; every k_test-subset is a test fold. Training excludes the
+    test groups, `embargo_groups` neighbours on each side, rows dated after `end`, and rows whose label resolves
+    inside a test group. A day's prediction is the mean over the folds that test it.
+
+    Returns:
+        Scored 15:20 rows like run_model (pred averaged across folds) plus n_folds.
+
+    Raises:
+        ValueError: Fewer days than groups or invalid k_test.
+    """
+    from itertools import combinations
+
+    if not 1 <= int(k_test) < int(n_groups):
+        raise ValueError(f"k_test must satisfy 1 <= k_test < n_groups, got {k_test}")
+    feats = config.features()
+    fit = fit_fn if fit_fn is not None else default_fit_fn(config)
+    dates = pd.to_datetime(dataset["date"]).dt.normalize()
+    is_pit = dataset["tier"].isin(PIT_TIERS).to_numpy()
+    lo, hi = pd.Timestamp(start), pd.Timestamp(end)
+    days = np.array(sorted(d for d in dates[is_pit].unique() if lo <= d <= hi))
+    if len(days) < int(n_groups):
+        raise ValueError(f"run_cpcv needs at least n_groups days, got {len(days)}")
+    groups = np.array_split(days, int(n_groups))
+    spans = [(g[0], g[-1]) for g in groups]
+    group_of = pd.Series(np.concatenate([np.full(len(g), i) for i, g in enumerate(groups)]), index=days)
+    row_group = dates.map(group_of)
+    exits = pd.to_datetime(dataset["exit_date"])
+    labels = dataset["train_label"].to_numpy(dtype=np.float64)
+    tier_ok = train_tier_mask(dataset["tier"], config.train_source)
+    base_ok = tier_ok & np.isfinite(labels) & (dates <= hi).to_numpy() & exits.notna().to_numpy()
+    parts: list[pd.DataFrame] = []
+    for fold, test_ids in enumerate(combinations(range(int(n_groups)), int(k_test)), start=1):
+        banned = {j for i in test_ids for j in range(i - int(embargo_groups), i + int(embargo_groups) + 1)}
+        in_banned = row_group.isin(banned).to_numpy()
+        purge = np.zeros(len(dataset), dtype=bool)
+        for i in test_ids:
+            purge |= ((exits >= spans[i][0]) & (dates <= spans[i][1])).to_numpy()
+        train = dataset[base_ok & ~in_banned & ~purge]
+        model = fit(train, feats)
+        test = dataset[is_pit & row_group.isin(set(test_ids)).to_numpy()].copy()
+        test["pred"] = np.asarray(model.predict(test[feats]), dtype=np.float64)
+        test["fold"] = fold
+        parts.append(test)
+        logger.info(
+            "[ALGO] stage=cpcv fold=%d test_groups=%s train_rows=%d test_rows=%d", fold, test_ids, len(train), len(test)
+        )
+    scored = pd.concat(parts, ignore_index=True)
+    keep = [c for c in scored.columns if c not in ("pred", "fold")]
+    agg = (
+        scored.groupby(["date", "symbol"], sort=True)
+        .agg(pred=("pred", "mean"), n_folds=("fold", "nunique"))
+        .reset_index()
+    )
+    first = scored.drop_duplicates(["date", "symbol"])[keep]
+    return first.merge(agg, on=["date", "symbol"], how="inner", validate="one_to_one")
 
 
 def breakdown(daily: pd.DataFrame, scored: pd.DataFrame) -> dict[str, Any]:
@@ -500,7 +664,7 @@ class TrialRegistry:
 
 
 def trial_id(model: ModelConfig, portfolio: PortfolioConfig) -> str:
-    return _digest({"model": dataclasses.asdict(model), "portfolio": portfolio.identity()})
+    return _digest({"model": model.identity(), "portfolio": portfolio.identity()})
 
 
 def deflated_sharpe(returns: np.ndarray, n_trials: int) -> float:

@@ -344,3 +344,89 @@ def test_default_fit_fn_trains_a_seed_ensemble_that_ranks_the_signal() -> None:
 
 def test_newey_west_t_is_nan_for_zero_variance() -> None:
     assert np.isnan(wf.newey_west_t(np.full(10, 0.01)))
+
+
+def test_run_cpcv_never_trains_on_test_or_embargoed_groups(monkeypatch: pytest.MonkeyPatch) -> None:
+    days = _calendar(40)
+    ds = _dataset(days, n_names=4)
+    monkeypatch.setattr(wf, "feature_columns", lambda _fs: ["x"])
+    seen: list[set] = []
+
+    def fit(train: pd.DataFrame, _f: list[str]) -> _LinearFit:
+        seen.append(set(pd.to_datetime(train["date"])))
+        return _LinearFit(train)
+
+    cfg = wf.ModelConfig(train_source=wf.TRAIN_PIT_ONLY)
+    out = wf.run_cpcv(
+        ds,
+        start=str(pd.Timestamp(days[0]).date()),
+        end=str(pd.Timestamp(days[38]).date()),
+        config=cfg,
+        n_groups=4,
+        k_test=1,
+        embargo_groups=1,
+        fit_fn=fit,
+    )
+    groups = np.array_split(np.array(days[:39]), 4)
+    assert len(seen) == 4
+    for i, train_days in enumerate(seen):
+        banned = set(np.concatenate([groups[j] for j in range(max(0, i - 1), min(4, i + 2))]))
+        assert not train_days & {pd.Timestamp(d) for d in banned}
+    assert (out["n_folds"] == 1).all() and out["date"].nunique() == 39
+    with pytest.raises(ValueError, match="at least n_groups"):
+        wf.run_cpcv(ds, start="2024-01-01", end="2024-01-02", config=cfg, n_groups=4, k_test=1, fit_fn=fit)
+    with pytest.raises(ValueError, match="k_test"):
+        wf.run_cpcv(ds, start="2024-01-01", end="2024-03-01", config=cfg, n_groups=4, k_test=4, fit_fn=fit)
+
+
+def test_rolling_window_and_decay_weights_restrict_and_downweight_old_rows() -> None:
+    days = _calendar(30)
+    ds = _dataset(days)
+    cfg = wf.ModelConfig(train_source=wf.TRAIN_PIT_ONLY, train_window_days=10, embargo_days=1)
+    train = wf.training_rows(ds, calendar=days, block_start=pd.Timestamp(days[25]), config=cfg)
+    assert pd.to_datetime(train["date"]).min() >= pd.Timestamp(days[15])
+    w = wf.sample_age_weights(
+        pd.Series([days[20], days[15]]), calendar=days, block_start=pd.Timestamp(days[25]), half_life_days=5
+    )
+    assert w == pytest.approx([0.5, 0.25])
+    grades = wf.lambdarank_grades(pd.DataFrame({"date": [days[0]] * 5, "train_label": [0.1, 0.2, 0.3, 0.4, 0.5]}))
+    assert grades.tolist() == [0, 1, 2, 3, 4]
+    assert "objective" not in wf.ModelConfig().identity()
+    assert wf.ModelConfig(extra_features=("x_rv_late",)).features()[-1] == "x_rv_late"
+    for bad in ({"objective": "nope"}, {"train_window_days": 0}, {"decay_half_life_days": 0.0}):
+        with pytest.raises(ValueError, match="must"):
+            wf.ModelConfig(**bad)
+
+
+def test_decay_config_passes_age_weights_to_the_fit(monkeypatch: pytest.MonkeyPatch) -> None:
+    days = _calendar(30)
+    ds = _dataset(days)
+    monkeypatch.setattr(wf, "feature_columns", lambda _fs: ["x"])
+    captured: list[np.ndarray] = []
+
+    def fit(train: pd.DataFrame, _f: list[str]) -> _LinearFit:
+        captured.append(train[wf.SAMPLE_WEIGHT_COL].to_numpy())
+        return _LinearFit(train)
+
+    cfg = wf.ModelConfig(
+        train_source=wf.TRAIN_PIT_ONLY, retrain_every_days=10, min_train_days=5, decay_half_life_days=5.0
+    )
+    period = wf.Period("t", str(pd.Timestamp(days[20]).date()), str(pd.Timestamp(days[29]).date()))
+    wf.run_model(ds, period=period, config=cfg, calendar=days, fit_fn=fit)
+    assert captured and captured[0].max() <= 1.0 and captured[0].min() < captured[0].max()
+
+
+def test_default_fit_fn_lambdarank_orders_by_the_signal() -> None:
+    rng = np.random.default_rng(1)
+    dates = np.repeat(pd.bdate_range("2024-01-01", periods=40), 10)
+    x = rng.normal(size=len(dates))
+    train = pd.DataFrame({"date": dates, "x": x, "train_label": 0.01 * x + rng.normal(0, 1e-3, size=len(dates))})
+    train[wf.SAMPLE_WEIGHT_COL] = 1.0
+    cfg = wf.ModelConfig(
+        objective=wf.OBJECTIVE_LAMBDARANK,
+        model_params=(("n_estimators", 30), ("learning_rate", 0.1), ("num_leaves", 4), ("min_child_samples", 5)),
+        seeds=(1,),
+    )
+    model = wf.default_fit_fn(cfg)(train, ["x"])
+    pred = model.predict(pd.DataFrame({"x": [-2.0, 0.0, 2.0]}))
+    assert pred[0] < pred[1] < pred[2]
