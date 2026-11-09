@@ -83,6 +83,15 @@ def kis_key_id(app_key: str) -> str:
     return hashlib.sha256(app_key.encode("utf-8")).hexdigest()[:12]
 
 
+_KIS_MSG_CD_RE = re.compile(r"EGW\d+")
+
+
+def kis_msg_cd(exc: BaseException) -> str:
+    """Return the first KIS ``EGW`` vendor code in ``exc``'s text, or ``""``."""
+    match = _KIS_MSG_CD_RE.search(str(exc))
+    return match.group(0) if match is not None else ""
+
+
 def token_cache_path(app_key: str, cache_dir: Path) -> Path:
     return Path(cache_dir) / f"token_{kis_key_id(app_key)}.json"
 
@@ -344,16 +353,25 @@ async def prewarm_healthy_clients(
         raise ValueError("clients and credentials must align")
     healthy: list[Any] = []
     failed: list[str] = []
+    details: list[str] = []
     for client, cred in zip(clients, credentials, strict=True):
         try:
             await client.ensure_token(broker_session)
         except Exception as exc:
             failed.append(cred.slot)
+            key_id = kis_key_id(cred.app_key)
+            exc_name = type(exc).__name__
+            msg_cd = kis_msg_cd(exc)
+            details.append(f"{cred.slot}:{key_id}:{exc_name}" + (f":{msg_cd}" if msg_cd else ""))
             logger.error(
-                "[SYS] stage=token_prewarm status=SLOT_FAILED slot=%s error=%s", cred.slot, type(exc).__name__
+                "[SYS] stage=token_prewarm status=SLOT_FAILED slot=%s key_id=%s error=%s msg_cd=%s",
+                cred.slot,
+                key_id,
+                exc_name,
+                msg_cd or "-",
             )
         else:
             healthy.append(client)
     if not healthy:
-        raise RuntimeError(f"No usable KIS token slot: failed={failed}")
+        raise RuntimeError(f"No usable KIS token slot: failed={failed} details={details}")
     return healthy, tuple(failed)

@@ -32,6 +32,7 @@ from src.api.kis.key_pool import (
 )
 from src.api.kis.rate_limit import get_host_rate_limiter, resolve_admission_dir
 from src.api.shared_token import TokenStoreLockTimeout
+from src.tools.alerts import redact_for_egress
 
 if TYPE_CHECKING:
     from src.data.capture_contracts import BrokerPayload, PageObserver
@@ -309,6 +310,10 @@ class KisApiClient:
             if data.get("msg_cd") == "EGW00133" or data.get("error_code") == "EGW00133":
                 fallback = self._read_cached_token(min_remaining_minutes=0)
                 if fallback is not None:
+                    logger.warning(
+                        "[SYS] stage=kis_token status=ISSUE_THROTTLED_CACHE_FALLBACK key_id=%s",
+                        kis_key_id(self.app_key or ""),
+                    )
                     self.token = fallback
                     return False
             raise RuntimeError(f"토큰 발급 실패: {data}")
@@ -439,6 +444,10 @@ class KisApiClient:
         session = getattr(session_method, "__self__", None)
         headers_arg = kwargs.get("headers")
         tr_id = str(headers_arg.get("tr_id", "")) if isinstance(headers_arg, dict) else ""
+        tr_label = tr_id or "-"
+        key_id = kis_key_id(self.app_key or "")
+        http_429 = tps_limit = auth_rejected = 0
+        last_msg_cd = ""
         for attempt in range(5):
             await self.rate_limiter.acquire()
             try:
@@ -457,6 +466,7 @@ class KisApiClient:
                             evidence = None
                         received = _now_kst()
                         self._emit_page(evidence if isinstance(evidence, dict) else None, {"tr_id": tr_id, "error_type": "rate_limited", "http_status": "429"}, started, received, attempt)
+                        http_429 += 1
                         await asyncio.sleep(0.5 * (attempt + 1))
                         continue
 
@@ -476,6 +486,7 @@ class KisApiClient:
                         and session
                         and attempt < 2
                     ):
+                        auth_rejected += 1
                         logger.warning(
                             "[SYS] stage=kis_token status=AUTH_REJECTED key_id=%s msg_cd=%s attempt=%d",
                             kis_key_id(self.app_key or ""),
@@ -488,6 +499,8 @@ class KisApiClient:
 
                     # KIS 특유의 TPS 초과 메시지 처리
                     if data.get("rt_cd") != "0" and "초당 거래건수" in msg1:
+                        tps_limit += 1
+                        last_msg_cd = str(msg_cd)
                         await asyncio.sleep(0.5 * (attempt + 1))
                         continue
                     return cast(dict[str, Any], data)
@@ -499,7 +512,9 @@ class KisApiClient:
                 if attempt < 4:  # 마지막 시도가 아니면
                     wait_time = 0.5 * (2 ** attempt)  # 0.5초, 1초, 2초, 4초
                     logger.warning(
-                        "네트워크 에러 (%s), %.1f초 후 재시도... (%d/5)",
+                        "[EXEC] stage=kis_request status=NETWORK_RETRY tr_id=%s key_id=%s error=%s wait_s=%.1f attempt=%d/5",
+                        tr_label,
+                        key_id,
                         type(e).__name__,
                         wait_time,
                         attempt + 1,
@@ -508,7 +523,22 @@ class KisApiClient:
                     continue
                 else:
                     # 마지막 시도에서도 실패하면 에러 반환
+                    logger.warning(
+                        "[EXEC] stage=kis_request status=NETWORK_FAILED tr_id=%s key_id=%s error=%s attempts=5",
+                        tr_label,
+                        key_id,
+                        type(e).__name__,
+                    )
                     return {"rt_cd": "9", "msg1": f"네트워크 연결 실패: {str(e)[:100]}"}
+        logger.warning(
+            "[EXEC] stage=kis_request status=RETRY_EXHAUSTED tr_id=%s key_id=%s attempts=5 http_429=%d tps_limit=%d auth_rejected=%d last_msg_cd=%s",
+            tr_label,
+            key_id,
+            http_429,
+            tps_limit,
+            auth_rejected,
+            redact_for_egress(last_msg_cd or "-"),
+        )
         return {"rt_cd": "9", "msg1": "최대 재시도 횟수 초과 (TPS 제한)"}
 
     def _emit_page(

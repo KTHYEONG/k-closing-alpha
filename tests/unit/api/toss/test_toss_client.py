@@ -829,3 +829,81 @@ def test_toss_get_unknown_group_raises_before_send(tmp_path, monkeypatch) -> Non
         asyncio.run(client._get(session, "/api/v1/candles", "NOT_A_GROUP"))
 
     assert session.requests == []
+
+
+def _toss_issue_failure_text(app_key: str, body: object, status: int = 401) -> str:
+    import asyncio
+
+    import pytest
+
+    from src.api.toss.client import TossApiClient
+    from tests.broker_fakes import FakeBrokerResponse, scripted_session
+
+    client = TossApiClient(app_key=app_key, app_secret="secret-xyz")
+    session = scripted_session([], token_bodies=[FakeBrokerResponse(body=body, status=status)])
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(client.ensure_token(session))
+    return str(excinfo.value)
+
+
+def test_toss_issue_failure_reports_status_code_and_key_id() -> None:
+    from src.api.host_broker_contract import credential_digest
+
+    body = {"error": {"code": "invalid-client", "message": "bad credentials"}}
+
+    text = _toss_issue_failure_text("app-key-xyz", body)
+
+    assert f"status=401 code=invalid-client key_id={credential_digest('app-key-xyz')}" in text
+    for forbidden in ("bad credentials", "app-key-xyz", "secret-xyz"):
+        assert forbidden not in text
+
+
+def test_toss_issue_failure_string_error_and_unknown_shapes() -> None:
+    assert "code=invalid_client" in _toss_issue_failure_text("k", {"error": "invalid_client"})
+    assert "code=none" in _toss_issue_failure_text("k", {"foo": 1})
+
+
+def test_toss_oauth_error_tag_is_sanitized_and_bounded() -> None:
+    import re
+
+    hostile = "a" * 100 + " bad $/code;" + "b" * 100
+    text = _toss_issue_failure_text("k", {"error": {"code": hostile, "message": "m"}})
+
+    match = re.search(r"code=(\S+) key_id=", text)
+    assert match is not None
+    assert re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", match.group(1))
+
+
+def test_toss_issue_failure_with_empty_app_key(monkeypatch) -> None:
+    import asyncio
+
+    import pytest
+
+    from src.api.toss.client import TossApiClient
+    from src.config import settings
+    from tests.broker_fakes import FakeBrokerResponse, scripted_session
+
+    monkeypatch.setattr(settings, "TOSS_APP_KEY", "")
+    client = TossApiClient(app_key="", app_secret="secret-xyz")
+    session = scripted_session(
+        [], token_bodies=[FakeBrokerResponse(body={"error": {"code": "invalid-client"}}, status=401)]
+    )
+
+    with pytest.raises(RuntimeError, match="key_id=none") as excinfo:
+        asyncio.run(client._issue_token(session))
+    assert "status=401 code=invalid-client" in str(excinfo.value)
+
+
+def test_toss_oauth_error_tag_redacts_secret_straddling_truncation(caplog) -> None:
+    import logging
+
+    secret_code = "c" * 32 + " Bearer abc.def.ghi appkey=SECRET123"
+
+    with caplog.at_level(logging.DEBUG):
+        text = _toss_issue_failure_text("k", {"error": {"code": secret_code, "message": "m"}})
+
+    assert "code=" in text
+    for forbidden in ("SECRET123", "abc.def.ghi"):
+        assert forbidden not in text
+        assert forbidden not in caplog.text

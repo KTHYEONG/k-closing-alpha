@@ -9,6 +9,7 @@ docs/architecture/broker_toss.md 1.4 레이트리밋 매트릭스를 그대로 �
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
@@ -17,10 +18,11 @@ from src.api._common import parse_expires_in
 from src.api._token_client import SharedTokenClientMixin
 from src.api._transport import RetryPolicy, send_with_auth_retry
 from src.api.auth_rejection import AUTH_REJECTION_CODES
-from src.api.host_broker_contract import DEFAULT_RATES, TokenIssueThrottled
+from src.api.host_broker_contract import DEFAULT_RATES, TokenIssueThrottled, credential_digest
 from src.api.kis.rate_limit import HostPacedRateLimiter, vendor_limiter
 from src.api.shared_token import IssuedToken
 from src.config import settings
+from src.tools.alerts import redact_for_egress
 
 if TYPE_CHECKING:
     import aiohttp
@@ -40,6 +42,24 @@ so an unbounded vendor hint could stall the decision snapshot."""
 TOSS_RATE_LIMIT_GROUPS: Mapping[str, float] = MappingProxyType(
     {scope: rate for (vendor, scope), rate in DEFAULT_RATES.items() if vendor == "toss" and scope is not None}
 )
+
+_OAUTH_TAG_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _oauth_error_tag(body: Mapping[str, Any]) -> str:
+    """Return a bounded, charset-safe OAuth error code; never the vendor message text.
+
+    Redaction runs before sanitizing and truncating so a secret cannot be split past the redactor's patterns.
+    """
+    error = body.get("error")
+    if isinstance(error, dict):
+        text = str(error.get("code") or "")
+    elif isinstance(error, str):
+        text = error
+    else:
+        text = ""
+    tag = _OAUTH_TAG_UNSAFE_RE.sub("-", redact_for_egress(text)).strip("-")[:64]
+    return tag or "none"
 
 
 class TossApiClient(SharedTokenClientMixin):
@@ -75,10 +95,13 @@ class TossApiClient(SharedTokenClientMixin):
             "client_secret": self.app_secret,
         }
         async with session.post(f"{self.base_url}{_OAUTH_PATH}", data=payload) as resp:
+            status = int(getattr(resp, "status", 0) or 0)
             body = await resp.json()
         token = str(body.get("access_token", ""))
         if not token:
-            raise RuntimeError("Toss token issuance failed")
+            code = _oauth_error_tag(body)
+            key_id = credential_digest(self.app_key) if self.app_key else "none"
+            raise RuntimeError(f"Toss token issuance failed: status={status} code={code} key_id={key_id}")
         expires_in = parse_expires_in(body.get("expires_in"))
         return IssuedToken(access_token=token, expires_in_seconds=expires_in)
 

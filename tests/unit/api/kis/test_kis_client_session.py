@@ -409,3 +409,44 @@ def test_kis_token_cache_bytes_unchanged(tmp_path) -> None:
         "issued_at": "2026-10-01T00:00:00+09:00",
     })
     assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+
+
+def test_kis_issue_token_logs_once_on_cache_fallback(tmp_path, caplog) -> None:
+    import json
+    import logging
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    from src.api.kis.key_pool import kis_key_id
+
+    token_file = tmp_path / "kis_token.json"
+    near_expiry = (datetime.now(ZoneInfo("Asia/Seoul")) + timedelta(minutes=3)).isoformat(timespec="seconds")
+    token_file.write_text(
+        json.dumps({"access_token": "CACHED", "expired_at": near_expiry, "app_key": "k"}),
+        encoding="utf-8",
+    )
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+
+    class _Resp:
+        async def json(self):
+            return {"msg_cd": "EGW00133", "msg1": "접근토큰 발급 잠시 후 다시 시도하세요"}
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _Resp()
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _Session:
+        def post(self, _url, **_kw):
+            return _Ctx()
+
+    with caplog.at_level(logging.WARNING, logger="src.api.kis.client"):
+        issued = asyncio.run(client._issue_token(_Session()))
+
+    assert issued is False
+    assert client.token == "CACHED"
+    records = [r.getMessage() for r in caplog.records if "ISSUE_THROTTLED_CACHE_FALLBACK" in r.getMessage()]
+    assert len(records) == 1
+    assert f"key_id={kis_key_id('k')}" in records[0]

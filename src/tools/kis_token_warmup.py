@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from pathlib import Path
@@ -21,6 +20,7 @@ from src import settings
 from src.api.kis.client import KisApiClient
 from src.api.kis.key_pool import (
     kis_key_id,
+    kis_msg_cd,
     load_kis_env,
     read_token_issued_date,
     resolve_host_issued_credentials,
@@ -38,14 +38,11 @@ from src.utils.cli_logging import CLI_LOG_FORMAT_TIMESTAMPED, configure_cli_logg
 
 logger = logging.getLogger(__name__)
 
-_MSG_CD_RE = re.compile(r"EGW\d+")
-
-
 def _warmup_failure_reason(exc: BaseException) -> str:
     """Summarize a slot failure without credentials (exception type + vendor msg_cd)."""
     name = type(exc).__name__
-    match = _MSG_CD_RE.search(str(exc))
-    return f"{name}:{match.group(0)}" if match is not None else name
+    code = kis_msg_cd(exc)
+    return f"{name}:{code}" if code else name
 
 
 def should_skip_warmup(today: date, *, session_day_fn: Callable[[date], SessionDay] | None = None) -> bool:

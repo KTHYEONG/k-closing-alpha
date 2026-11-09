@@ -694,3 +694,78 @@ def test_prewarm_healthy_clients_fails_closed_when_no_slot_usable() -> None:
 
     with pytest.raises(RuntimeError, match="DATA_1"):
         _prewarm([_TokenClient(True)], creds)
+
+
+class _CodeClient:
+    def __init__(self, exc: BaseException | None) -> None:
+        self.exc = exc
+
+    async def ensure_token(self, session: object) -> None:
+        if self.exc is not None:
+            raise self.exc
+
+
+def test_prewarm_failure_log_has_slot_key_id_and_msg_cd(caplog) -> None:
+    import logging
+
+    from src.api.kis.key_pool import KisCredential, kis_key_id
+
+    creds = [KisCredential(slot="DATA_1", app_key="k1", app_secret="s1", hts_id="")]
+    caplog.set_level(logging.ERROR, logger="src.api.kis.key_pool")
+    with pytest.raises(RuntimeError):
+        _prewarm([_CodeClient(RuntimeError("토큰 발급 실패: {'error_code': 'EGW00133'}"))], creds)
+
+    records = [r.getMessage() for r in caplog.records if "SLOT_FAILED" in r.getMessage()]
+    assert len(records) == 1
+    assert "slot=DATA_1" in records[0]
+    assert f"key_id={kis_key_id('k1')}" in records[0]
+    assert "error=RuntimeError" in records[0]
+    assert "msg_cd=EGW00133" in records[0]
+
+
+def test_prewarm_failure_log_never_contains_message_or_keys(caplog) -> None:
+    import logging
+
+    from src.api.kis.key_pool import KisCredential
+
+    creds = [KisCredential(slot="DATA_1", app_key="k1", app_secret="s1", hts_id="")]
+    caplog.set_level(logging.DEBUG, logger="src.api.kis.key_pool")
+    with pytest.raises(RuntimeError) as excinfo:
+        _prewarm([_CodeClient(RuntimeError("secret-bearing detail"))], creds)
+
+    log_text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "msg_cd=-" in log_text
+    for forbidden in ("secret-bearing detail", "s1"):
+        assert forbidden not in log_text
+        assert forbidden not in str(excinfo.value)
+
+
+def test_no_usable_slot_message_lists_details() -> None:
+    from src.api.kis.key_pool import KisCredential, kis_key_id
+
+    creds = [KisCredential(slot="DATA_1", app_key="k1", app_secret="s1", hts_id="")]
+
+    with pytest.raises(RuntimeError, match="DATA_1") as excinfo:
+        _prewarm([_CodeClient(RuntimeError("EGW00133 detail"))], creds)
+
+    assert f"DATA_1:{kis_key_id('k1')}:RuntimeError" in str(excinfo.value)
+
+
+def test_prewarm_return_contract_unchanged_with_one_failing_slot() -> None:
+    from src.api.kis.key_pool import KisCredential
+
+    good, bad = _CodeClient(None), _CodeClient(RuntimeError("boom"))
+    creds = [KisCredential(slot="DATA_1", app_key="k1", app_secret="s1", hts_id=""),
+             KisCredential(slot="DATA_2", app_key="k2", app_secret="s2", hts_id="")]
+
+    healthy, failed = _prewarm([bad, good], creds)
+
+    assert healthy == [good]
+    assert failed == ("DATA_1",)
+
+
+def test_kis_msg_cd_extracts_only_the_code() -> None:
+    from src.api.kis.key_pool import kis_msg_cd
+
+    assert kis_msg_cd(RuntimeError("x EGW00133 secret y")) == "EGW00133"
+    assert kis_msg_cd(ValueError("none")) == ""
