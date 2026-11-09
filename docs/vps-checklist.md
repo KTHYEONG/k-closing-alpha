@@ -493,15 +493,18 @@ def b_offsite(d):
             status=lr["status"], started=started.strftime("%m-%d_%T"), start_delay_min=round(late, 1), steps_bad=steps_bad or "-", segments=seal.get("segments_committed"), deferred=seal.get("deferred_dates"), missing_sealed=seal.get("missing_sealed_members"), in_progress=inprog, core_issues=lr["steps"].get("core_panels", {}).get("issues"))
     @check("B02")
     def _():
+        import gzip
         started = datetime.fromisoformat(lr["started_at"]).timestamp()
         res, bad = {}, []
         for tier in ("raw", "normalized", "manifests"):
             lp = CAP / f"offsite/ledger/{tier}/{d}.jsonl"
+            lgz = lp.with_name(lp.name + ".gz")
             local = CAP / tier / str(d)
             if not local.exists():
                 res[tier] = "no_local"
                 continue
-            segs = [json.loads(l) for l in lp.read_text().splitlines() if l.strip()] if lp.exists() else []
+            text = lp.read_text() if lp.exists() else gzip.open(lgz, "rt").read() if lgz.exists() else ""
+            segs = [json.loads(l) for l in text.splitlines() if l.strip()]
             members = {m["path"] for s in segs for m in s["members"]}
             unsealed = 0
             for r, _, fs in os.walk(local):
@@ -910,7 +913,7 @@ def _():
 - `H04`: `ssh or-vps 'for f in ~/.config/systemd/user/kca-*.service; do l=$(grep -m1 "^ExecStart=%h/.local/lib/kca/kca-run " "$f") || continue; eval "~/.local/lib/kca/kca-run --print-argv ${l#ExecStart=%h/.local/lib/kca/kca-run }" >/dev/null 2>&1; echo "$(basename $f) rc=$?"; done | grep -v "rc=0$"'` (empty = PASS; a `USAGE_ERROR` means the unit cannot start). Fixture SHAs: `git merge-base --is-ancestor <sha> origin/main`.
 - `R06`: `ssh or-vps 'systemctl --user is-active kca-aftermarket-book.service; docker ps --filter name=kca-aftermarket-book --format "{{.Status}}"'`.
 - `C-manifest <D> <prefix>`: `ssh or-vps 'cd ~/k-closing-alpha/data/history/capture/manifests/<D> && for d in <prefix>*; do echo "$d $(ls $d | tr "\n" " ")"; done'`. For PARTIAL entries: `python3 -c` reading `manifest-partial.json` `entries[].{symbol,status,reason}` with a Counter.
-- `B-parity <D> <tier>`: `~/.local/bin/rclone lsf gdrive:quant-lake/live/k-closing-alpha/capture_sealed/<tier>/<YYYY-MM>/<D>/` vs `python3 -c` listing `segment_name` from `capture/offsite/ledger/<tier>/<D>.jsonl`.
+- `B-parity <D> <tier>`: `~/.local/bin/rclone lsf gdrive:quant-lake/live/k-closing-alpha/capture_sealed/<tier>/<YYYY-MM>/<D>/` vs `python3 -c` listing `segment_name` from `capture/offsite/ledger/<tier>/<D>.jsonl` (or `<D>.jsonl.gz` via `gzip.open(..., "rt")` when only the compacted copy exists).
 - `B03` (W only, outside 22:15–00:15): `cd ~/k-closing-alpha && nice -n 19 timeout 600 ~/.local/bin/rclone check data gdrive:quant-lake/live/k-closing-alpha/data --one-way --size-only --exclude "/history/capture/**" --combined - 2>/dev/null | awk '$1=="+"||$1=="*"' | tail -20`.
 - `P-ledger`: `uv run --no-sync python -c` using `PaperLedger(root=Path("data/paper")).load_open_positions()` and `nav.parquet` tail 5 (`as_of_date nav cash open_market_value cumulative_cost`).
 - `Q-spot <D> <sym>`: archive row (`종가 결정_종가 종가_확정`), last 1m bar, `price_history.close_raw` (next day), paper fill `fill_price` for the symbol.
@@ -984,6 +987,7 @@ Known conditions:
 | 2026-10-29 | History rewrite of the README commit (`1681172` → `88d3452`): `deploy.yml` run 40891357295 test job failed, so `latest` stays on `sha-1681172` (code-identical tree). Fixture SHA fix committed locally in `e18a930` (not pushed) | H02 WARN `code_identical=True`; H04 FAIL | 2026-11-09 | the fixture fix is committed and deploy is green |
 | 2026-11-02 | Offsite churn reduction `ed5c912`/`a2523e6` (pending deploy): `price_history` goes offsite as base+patch form `data/history/price_history_offsite/` (monolith excluded from the loose copy; first successful run moves the remote monolith to `_deleted/data/<day>/`); seal ledgers upload append-only without `_deleted` versions (`capture/offsite/ledger_upload_state.json`); snapshots store the base as shared blobs `snapshots/_blobs/price_history/` | B01: `steps.price_history_form` ok (`rebased` ≈ monthly) and `steps.offsite_ledger` ok with `rewritten=0` (else FAIL `ledger_not_append_only`); B03 lists remote `data/history/price_history.parquet` missing after the first run (expected); kca-backup peak RSS +2–3 GiB for ~15 s | 2026-11-16 | 3 clean nightly runs after deploy |
 | 2026-11-02 | Dashboard kca card `kca.api_actions` WARN | A04 WARN | 2026-11-09 | mapped to an API notice/action finding, or cleared |
+| 2026-11-10 | Seal ledger compaction: `<D>.jsonl` older than 14 days becomes `<D>.jsonl.gz` after the remote copy is proven identical (`backup_prune` step `ledger_compact`); append rehydrates first; B02 and B-parity read the gz fallback | B02 `segs>0` for compacted dates (no false FAIL); backup_prune log `ledger_compacted`/`ledger_bytes_saved` | after deploy: 3 clean nightly runs | NOT VERIFIED on VPS until the next M window |
 | 2026-10-30 | `auction_path` DEGRADED / manifest PARTIAL (DB증권 research capture) | R03 WARN, C06 WARN | 2026-11-16 | 3 consecutive COMPLETE days |
 | 2026-10-30 | 종가 vs 결정_종가 gap p99 3.09 % (normal ≲ 3 %) | Q01 WARN when p99 > 0.03 | 2026-11-16 | recalibrate the threshold if it is seen ≥ 3 of 10 days |
 | 2026-10-30 | Extended backfill `pending_manifest_conflict` fixed and deployed (`pending_conflicts=0` 2026-10-30..11-01) | R02/R03 PASS; any recurrence from the 23:05 run is a regression (P2) | 2026-11-30 | — |

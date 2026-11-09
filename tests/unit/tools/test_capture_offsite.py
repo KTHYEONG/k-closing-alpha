@@ -2680,3 +2680,372 @@ def test_prune_missing_capture_root_creates_nothing(tmp_path: Path, monkeypatch)
 
     assert report.skipped_reason == "capture_root_missing"
     assert not root.exists()
+
+
+_OLD_DAY = "2026-08-01"
+_LEDGER_TODAY = date(2026, 9, 24)
+
+
+def _ledger_entry(tier: str, day: str, index: int):
+    from src.tools.capture_offsite import LedgerEntry, SegmentMember
+
+    seg = f"seg-{index}"
+    return LedgerEntry(
+        tier=tier,
+        trading_date=day,
+        segment_name=seg,
+        remote_path=f"gdrive:test/{tier}/{day[:7]}/{day}/{seg}.tar.zst",
+        members=(SegmentMember(path=f"{tier}/{day}/run-{index}/a.json", size=3, sha256="0" * 64),),
+        archive_bytes=10,
+        archive_md5="d41d8cd98f00b204e9800998ecf8427e",
+        committed_at="2026-08-02T00:00:00+00:00",
+    )
+
+
+def _compaction_ledger(root: Path, tier: str, day: str, entries: int = 6) -> None:
+    from src.tools.capture_offsite import _append_ledger_entry, _ledger_path
+
+    for index in range(entries):
+        _append_ledger_entry(_ledger_path(root, tier, day), _ledger_entry(tier, day, index))
+
+
+def _plain_proof(root: Path, tier: str, day: str) -> list:
+    from src.tools.capture_offsite import _ledger_path
+
+    plain = _ledger_path(root, tier, day)
+    return [plain.stat().st_size, hashlib.sha256(plain.read_bytes()).hexdigest()]
+
+
+def _write_upload_state(root: Path, tier: str, day: str, proof: list) -> None:
+    import json
+
+    state_path = root / "offsite" / "ledger_upload_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    state[f"{tier}/{day}.jsonl"] = proof
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+
+
+def test_compact_old_ledger_roundtrips(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import _ledger_gz_path, _ledger_path, compact_old_ledgers, read_ledger
+
+    _compaction_ledger(tmp_path, "raw", _OLD_DAY)
+    _write_upload_state(tmp_path, "raw", _OLD_DAY, _plain_proof(tmp_path, "raw", _OLD_DAY))
+    before = read_ledger(tmp_path, "raw", _OLD_DAY)
+    plain_bytes = _ledger_path(tmp_path, "raw", _OLD_DAY).stat().st_size
+
+    report = compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config())
+
+    assert report.compacted == ("raw/2026-08-01",)
+    assert report.kept == ()
+    assert not _ledger_path(tmp_path, "raw", _OLD_DAY).exists()
+    assert _ledger_gz_path(tmp_path, "raw", _OLD_DAY).exists()
+    assert read_ledger(tmp_path, "raw", _OLD_DAY) == before
+    assert report.bytes_before == plain_bytes
+    assert 0 < report.bytes_after < report.bytes_before
+
+
+def test_not_uploaded_ledger_is_kept(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import _ledger_gz_path, _ledger_path, compact_old_ledgers
+
+    _compaction_ledger(tmp_path, "raw", _OLD_DAY)
+    plain = _ledger_path(tmp_path, "raw", _OLD_DAY)
+    before = plain.read_bytes()
+    proof = _plain_proof(tmp_path, "raw", _OLD_DAY)
+
+    report = compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config())
+    assert report.kept == (("raw/2026-08-01", "not_uploaded"),)
+
+    for mismatched in ([proof[0] + 1, proof[1]], [proof[0], "0" * 64]):
+        _write_upload_state(tmp_path, "raw", _OLD_DAY, mismatched)
+        report = compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config())
+        assert report.compacted == ()
+        assert report.kept == (("raw/2026-08-01", "not_uploaded"),)
+    assert plain.read_bytes() == before
+    assert not _ledger_gz_path(tmp_path, "raw", _OLD_DAY).exists()
+
+
+def test_recent_ledger_never_compacted(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import _ledger_path, compact_old_ledgers
+
+    recent_dates = ("2026-09-10", "2026-09-21")  # exactly min_age_days (14) and recent_window_days (3) before today
+    for day in recent_dates:
+        _compaction_ledger(tmp_path, "raw", day)
+        _write_upload_state(tmp_path, "raw", day, _plain_proof(tmp_path, "raw", day))
+
+    report = compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config())
+
+    assert report.compacted == ()
+    assert report.kept == ()
+    assert all(_ledger_path(tmp_path, "raw", day).exists() for day in recent_dates)
+
+
+def test_hash_mismatch_aborts_and_cleans_tmp(tmp_path: Path, monkeypatch) -> None:
+    import src.tools.capture_offsite as module
+
+    _compaction_ledger(tmp_path, "raw", _OLD_DAY)
+    _write_upload_state(tmp_path, "raw", _OLD_DAY, _plain_proof(tmp_path, "raw", _OLD_DAY))
+    monkeypatch.setattr(module, "_gzip_sha256", lambda path: "0" * 64)
+
+    report = module.compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config())
+
+    assert report.kept == (("raw/2026-08-01", "verify_failed"),)
+    assert (module._ledger_path(tmp_path, "raw", _OLD_DAY)).exists()
+    assert not module._ledger_gz_path(tmp_path, "raw", _OLD_DAY).exists()
+    assert list(tmp_path.rglob("*.tmp")) == []
+
+
+def test_crash_between_replace_and_unlink_is_recovered(tmp_path: Path) -> None:
+    import gzip
+
+    from src.tools.capture_offsite import _ledger_gz_path, _ledger_path, compact_old_ledgers, read_ledger
+
+    _compaction_ledger(tmp_path, "raw", _OLD_DAY)
+    _write_upload_state(tmp_path, "raw", _OLD_DAY, _plain_proof(tmp_path, "raw", _OLD_DAY))
+    before = read_ledger(tmp_path, "raw", _OLD_DAY)
+    plain = _ledger_path(tmp_path, "raw", _OLD_DAY)
+    _ledger_gz_path(tmp_path, "raw", _OLD_DAY).write_bytes(gzip.compress(plain.read_bytes(), mtime=0))
+    assert read_ledger(tmp_path, "raw", _OLD_DAY) == before
+
+    report = compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config())
+
+    assert report.compacted == ("raw/2026-08-01",)
+    assert not plain.exists()
+    assert read_ledger(tmp_path, "raw", _OLD_DAY) == before
+
+
+def test_invalid_ledger_is_kept(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import _ledger_path, compact_old_ledgers
+
+    _compaction_ledger(tmp_path, "raw", _OLD_DAY)
+    plain = _ledger_path(tmp_path, "raw", _OLD_DAY)
+    plain.write_text(plain.read_text(encoding="utf-8") + "{not json\n", encoding="utf-8")
+    before = plain.read_bytes()
+    _write_upload_state(tmp_path, "raw", _OLD_DAY, _plain_proof(tmp_path, "raw", _OLD_DAY))
+
+    report = compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config())
+
+    assert report.kept == (("raw/2026-08-01", "ledger_invalid"),)
+    assert plain.read_bytes() == before
+
+
+def test_dry_run_changes_nothing(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import _ledger_gz_path, _ledger_path, compact_old_ledgers
+
+    _compaction_ledger(tmp_path, "raw", _OLD_DAY)
+    _write_upload_state(tmp_path, "raw", _OLD_DAY, _plain_proof(tmp_path, "raw", _OLD_DAY))
+    plain = _ledger_path(tmp_path, "raw", _OLD_DAY)
+    before = plain.read_bytes()
+
+    report = compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config(), dry_run=True)
+
+    assert report.compacted == ("raw/2026-08-01",)
+    assert report.bytes_after == report.bytes_before
+    assert plain.read_bytes() == before
+    assert not _ledger_gz_path(tmp_path, "raw", _OLD_DAY).exists()
+
+
+def test_ledger_dates_merges_suffixes(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import ledger_dates
+
+    raw = tmp_path / "offsite" / "ledger" / "raw"
+    raw.mkdir(parents=True)
+    for name in (
+        "2026-08-01.jsonl",
+        "2026-08-02.jsonl.gz",
+        "2026-08-03.jsonl",
+        "2026-08-03.jsonl.gz",
+        "notes.jsonl",
+        "2026-13-01.jsonl",
+        "2026-08-04.jsonl.gz.tmp",
+        "readme.txt",
+    ):
+        (raw / name).write_bytes(b"")
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (target / "2026-08-05.jsonl").write_bytes(b"")
+    (tmp_path / "offsite" / "ledger" / "normalized").symlink_to(target, target_is_directory=True)
+
+    assert ledger_dates(tmp_path, "raw") == ["2026-08-01", "2026-08-02", "2026-08-03"]
+    assert ledger_dates(tmp_path, "normalized") == []
+    assert ledger_dates(tmp_path, "missing") == []
+
+
+def test_verify_pass_and_drill_pick_see_compacted_dates(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import compact_old_ledgers, select_drill_dates, verify_remote_segments
+
+    _patch_rclone(monkeypatch)
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    _compaction_ledger(tmp_path, "raw", _OLD_DAY, entries=2)
+    _write_upload_state(tmp_path, "raw", _OLD_DAY, _plain_proof(tmp_path, "raw", _OLD_DAY))
+    assert compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config()).compacted == ("raw/2026-08-01",)
+    calls: list = []
+    listing = {("raw", "2026-08"): [(md5, f"{_OLD_DAY}/seg-{i}.tar.zst") for i in range(2)]}
+
+    report = verify_remote_segments(tmp_path, run_fn=_verify_run_fn(listing, calls), config=_config())
+
+    assert report.checked == 2
+    assert report.missing == () and report.mismatched == ()
+    assert select_drill_dates(tmp_path, today=_LEDGER_TODAY, config=_config()) == {"raw": _OLD_DAY}
+
+
+def test_append_to_compacted_date_rehydrates_first(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import (
+        _append_ledger_entry,
+        _ledger_path,
+        compact_old_ledgers,
+        read_ledger,
+    )
+    from src.tools.offsite_backup import classify_ledger_files
+
+    _compaction_ledger(tmp_path, "raw", _OLD_DAY)
+    _write_upload_state(tmp_path, "raw", _OLD_DAY, _plain_proof(tmp_path, "raw", _OLD_DAY))
+    old = read_ledger(tmp_path, "raw", _OLD_DAY)
+    compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config())
+    plain = _ledger_path(tmp_path, "raw", _OLD_DAY)
+    assert not plain.exists()
+    new_entry = _ledger_entry("raw", _OLD_DAY, 99)
+
+    _append_ledger_entry(plain, new_entry)
+
+    assert read_ledger(tmp_path, "raw", _OLD_DAY) == [*old, new_entry]
+    appended, unproven, rewritten, _ = classify_ledger_files(tmp_path)
+    assert "raw/2026-08-01.jsonl" in appended
+    assert "raw/2026-08-01.jsonl" not in unproven and "raw/2026-08-01.jsonl" not in rewritten
+
+
+def test_rehydrate_failure_appends_nothing(tmp_path: Path) -> None:
+    import gzip
+
+    import pytest
+
+    from src.tools.capture_offsite import _append_ledger_entry, _ledger_gz_path, _ledger_path
+
+    gz = _ledger_gz_path(tmp_path, "raw", _OLD_DAY)
+    gz.parent.mkdir(parents=True)
+    gz.write_bytes(b"not gzip at all")
+
+    with pytest.raises(gzip.BadGzipFile):
+        _append_ledger_entry(_ledger_path(tmp_path, "raw", _OLD_DAY), _ledger_entry("raw", _OLD_DAY, 0))
+
+    assert not _ledger_path(tmp_path, "raw", _OLD_DAY).exists()
+    assert list(tmp_path.rglob("*.tmp")) == []
+
+
+def test_stale_gz_with_grown_jsonl_is_recompacted(tmp_path: Path) -> None:
+    import gzip
+
+    from src.tools.capture_offsite import (
+        _append_ledger_entry,
+        _ledger_gz_path,
+        _ledger_path,
+        compact_old_ledgers,
+        read_ledger,
+    )
+
+    _compaction_ledger(tmp_path, "raw", _OLD_DAY)
+    stale_proof = _plain_proof(tmp_path, "raw", _OLD_DAY)  # proof of the pre-growth bytes
+    _write_upload_state(tmp_path, "raw", _OLD_DAY, stale_proof)
+    compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config())
+    plain = _ledger_path(tmp_path, "raw", _OLD_DAY)
+    gz = _ledger_gz_path(tmp_path, "raw", _OLD_DAY)
+    _append_ledger_entry(plain, _ledger_entry("raw", _OLD_DAY, 99))
+    grown = plain.read_bytes()
+    expected = read_ledger(tmp_path, "raw", _OLD_DAY)
+    assert gz.exists()
+
+    _write_upload_state(tmp_path, "raw", _OLD_DAY, stale_proof)
+    report = compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config())
+    assert report.kept == (("raw/2026-08-01", "not_uploaded"),)
+    assert plain.exists() and gz.exists()
+    assert read_ledger(tmp_path, "raw", _OLD_DAY) == expected
+
+    _write_upload_state(tmp_path, "raw", _OLD_DAY, _plain_proof(tmp_path, "raw", _OLD_DAY))
+    report = compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config())
+    assert report.compacted == ("raw/2026-08-01",)
+    assert not plain.exists()
+    assert gzip.decompress(gz.read_bytes()) == grown
+    assert read_ledger(tmp_path, "raw", _OLD_DAY) == expected
+
+
+def test_seal_lock_held_skips(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import LedgerCompactionReport, _hold_seal_lock, _ledger_path, compact_old_ledgers
+
+    _compaction_ledger(tmp_path, "raw", _OLD_DAY)
+    _write_upload_state(tmp_path, "raw", _OLD_DAY, _plain_proof(tmp_path, "raw", _OLD_DAY))
+    plain = _ledger_path(tmp_path, "raw", _OLD_DAY)
+    before = plain.read_bytes()
+
+    with _hold_seal_lock(tmp_path):
+        report = compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config())
+
+    assert report == LedgerCompactionReport(compacted=(), kept=(), bytes_before=0, bytes_after=0)
+    assert plain.read_bytes() == before
+
+
+def test_compact_rejects_min_age_shorter_than_append_window(tmp_path: Path) -> None:
+    import pytest
+
+    from src.tools.capture_offsite import compact_old_ledgers
+
+    with pytest.raises(ValueError, match="min_age_days=9"):
+        compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, min_age_days=9, config=_config())
+
+
+def test_ledger_upload_state_relpath_mirrors_offsite_backup() -> None:
+    from src.tools.capture_offsite import _LEDGER_UPLOAD_STATE_RELPATH
+    from src.tools.offsite_backup import LEDGER_UPLOAD_STATE_RELPATH
+
+    assert _LEDGER_UPLOAD_STATE_RELPATH == LEDGER_UPLOAD_STATE_RELPATH
+
+
+def test_compaction_skips_missing_root_and_already_compacted_dates(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import LedgerCompactionReport, compact_old_ledgers
+
+    empty = LedgerCompactionReport(compacted=(), kept=(), bytes_before=0, bytes_after=0)
+    missing = tmp_path / "absent"
+    assert compact_old_ledgers(missing, today=_LEDGER_TODAY, config=_config()) == empty
+    assert not missing.exists()
+
+    _compaction_ledger(tmp_path, "raw", _OLD_DAY)
+    _write_upload_state(tmp_path, "raw", _OLD_DAY, _plain_proof(tmp_path, "raw", _OLD_DAY))
+    assert compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config()).compacted == ("raw/2026-08-01",)
+    assert compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config()) == empty
+
+
+def test_compaction_keeps_symlinked_ledger(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import _ledger_path, compact_old_ledgers
+
+    day = "2026-08-02"
+    _compaction_ledger(tmp_path, "raw", day)
+    plain = _ledger_path(tmp_path, "raw", day)
+    real = tmp_path / "real.jsonl"
+    real.write_bytes(plain.read_bytes())
+    plain.unlink()
+    plain.symlink_to(real)
+    _write_upload_state(tmp_path, "raw", day, _plain_proof(tmp_path, "raw", day))
+
+    report = compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config())
+
+    assert ("raw/2026-08-02", "symlink") in report.kept
+    assert "raw/2026-08-02" not in report.compacted
+    assert real.exists()
+
+
+def test_compaction_io_failure_keeps_original(tmp_path: Path, monkeypatch) -> None:
+    import src.tools.capture_offsite as module
+
+    _compaction_ledger(tmp_path, "raw", _OLD_DAY)
+    _write_upload_state(tmp_path, "raw", _OLD_DAY, _plain_proof(tmp_path, "raw", _OLD_DAY))
+    plain = module._ledger_path(tmp_path, "raw", _OLD_DAY)
+    before = plain.read_bytes()
+
+    def _disk_full(path: Path) -> str:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(module, "_gzip_sha256", _disk_full)
+    report = module.compact_old_ledgers(tmp_path, today=_LEDGER_TODAY, config=_config())
+
+    assert report.kept == (("raw/2026-08-01", "verify_failed"),)
+    assert plain.read_bytes() == before
+    assert list(tmp_path.rglob("*.tmp")) == []

@@ -28,7 +28,12 @@ from src.data.partition_eviction import (
     eviction_families,
     validate_retention,
 )
-from src.tools.capture_offsite import LocalRetentionReport, prune_local_sealed_capture
+from src.tools.capture_offsite import (
+    LedgerCompactionReport,
+    LocalRetentionReport,
+    compact_old_ledgers,
+    prune_local_sealed_capture,
+)
 from src.tools.offsite_common import DATED_DIR_RE, OFFSITE_REMOTE_BASE, resolve_rclone_bin
 from src.utils.cli_logging import configure_cli_logging
 
@@ -195,6 +200,7 @@ def main(argv: list[str] | None = None) -> None:
     local_purged: list[str] = []
     sealed_report = LocalRetentionReport(removed=(), kept=(), bytes_removed=0)
     history_report = EvictionReport(evicted=(), kept=(), bytes_freed=0, stopped_by_deadline=False, capped=False)
+    ledger_report = LedgerCompactionReport(compacted=(), kept=(), bytes_before=0, bytes_after=0)
     steps: list[tuple[str, Callable[[], None]]] = []
 
     def _run_remote() -> None:
@@ -213,6 +219,10 @@ def main(argv: list[str] | None = None) -> None:
             dry_run=args.dry_run,
             deadline=datetime.now(_KST) + SEALED_PRUNE_BUDGET,
         )
+
+    def _run_ledger_compact() -> None:
+        nonlocal ledger_report
+        ledger_report = compact_old_ledgers(_capture_root(), today=today.date(), dry_run=args.dry_run)
 
     def _run_history() -> None:
         nonlocal history_report
@@ -235,6 +245,7 @@ def main(argv: list[str] | None = None) -> None:
         ("remote", _run_remote),
         ("local_intraday", _run_local),
         ("local_sealed", _run_sealed),
+        ("ledger_compact", _run_ledger_compact),
         ("local_history", _run_history),
     ]
     for name, fn in steps:
@@ -244,10 +255,11 @@ def main(argv: list[str] | None = None) -> None:
             logger.exception("[SYS] stage=backup_prune step=%s status=failed", name)
             failures.append(name)
     logger.info(
-        "[SYS] stage=backup_prune dry_run=%s purged=%d targets=%s local_purged=%d local_targets=%s sealed_removed=%d sealed_bytes=%d sealed_kept=%d sealed_skipped=%s history_evicted=%d history_bytes=%d history_kept=%d",
+        "[SYS] stage=backup_prune dry_run=%s purged=%d targets=%s local_purged=%d local_targets=%s sealed_removed=%d sealed_bytes=%d sealed_kept=%d sealed_skipped=%s history_evicted=%d history_bytes=%d history_kept=%d ledger_compacted=%d ledger_bytes_saved=%d",
         args.dry_run, len(purged), purged, len(local_purged), local_purged,
         len(sealed_report.removed), sealed_report.bytes_removed, len(sealed_report.kept), sealed_report.skipped_reason,
         len(history_report.evicted), history_report.bytes_freed, len(history_report.kept),
+        len(ledger_report.compacted), ledger_report.bytes_before - ledger_report.bytes_after,
     )
     logger.debug("[SYS] stage=backup_prune sealed_kept=%s", sealed_report.kept)
     if failures:

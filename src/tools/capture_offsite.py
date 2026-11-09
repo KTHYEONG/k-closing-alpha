@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import gzip
 import hashlib
 import json
 import logging
@@ -18,11 +19,13 @@ import shutil
 import subprocess
 import tarfile
 import uuid
+import zlib
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Final
 
 import pyarrow as pa
 
@@ -49,6 +52,11 @@ logger = logging.getLogger(__name__)
 RUN_DIR_DEPTH: Mapping[str, int] = {"raw": 5, "normalized": 2, "manifests": 2}
 
 _CHUNK = 1024 * 1024
+
+LEDGER_COMPACT_MIN_AGE_DAYS: Final[int] = 14
+# Mirrors offsite_backup.LEDGER_UPLOAD_STATE_RELPATH; offsite_backup imports this module, so it cannot be imported here.
+_LEDGER_UPLOAD_STATE_RELPATH: Final[str] = "offsite/ledger_upload_state.json"
+_LEDGER_GZIP_LEVEL: Final[int] = 6
 
 
 @dataclass(frozen=True)
@@ -149,6 +157,24 @@ def _ledger_path(capture_root: Path, tier: str, trading_date: str) -> Path:
     return capture_root / "offsite" / "ledger" / tier / f"{trading_date}.jsonl"
 
 
+def _ledger_gz_path(capture_root: Path, tier: str, trading_date: str) -> Path:
+    return capture_root / "offsite" / "ledger" / tier / f"{trading_date}.jsonl.gz"
+
+
+def ledger_dates(capture_root: Path, tier: str) -> list[str]:
+    """List ledgered trading dates for one tier, counting plain and compacted ledger files.
+
+    Returns:
+        Sorted unique valid YYYY-MM-DD dates; empty when the tier ledger dir is missing or a symlink.
+    """
+    ledger_dir = Path(capture_root) / "offsite" / "ledger" / tier
+    if not ledger_dir.is_dir() or ledger_dir.is_symlink():
+        return []
+    stems = {path.stem for path in ledger_dir.glob("*.jsonl")}
+    stems.update(path.name.removesuffix(".jsonl.gz") for path in ledger_dir.glob("*.jsonl.gz"))
+    return sorted(stem for stem in stems if _is_valid_date(stem))
+
+
 def _entry_to_dict(entry: LedgerEntry) -> dict[str, object]:
     return {
         "tier": entry.tier,
@@ -210,12 +236,24 @@ def _entry_from_dict(raw: object) -> LedgerEntry:
     )
 
 
+def _read_ledger_text(capture_root: Path, tier: str, trading_date: str) -> str | None:
+    try:
+        return _ledger_path(capture_root, tier, trading_date).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        pass
+    try:
+        with gzip.open(_ledger_gz_path(capture_root, tier, trading_date), "rt", encoding="utf-8") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
+
+
 def read_ledger(capture_root: Path, tier: str, trading_date: str) -> list[LedgerEntry]:
     """Load committed segments for one (tier, trading_date).
 
     The ledger lives at <capture_root>/offsite/ledger/<tier>/<YYYY-MM-DD>.jsonl
-    and is itself carried offsite by the loose-copy tier, so it doubles as the
-    restore index.
+    (or .jsonl.gz once compacted) and is itself carried offsite by the loose-copy
+    tier, so it doubles as the restore index. A plain file wins when both exist.
 
     Returns:
         Entries in commit order; empty when no ledger file exists.
@@ -223,12 +261,12 @@ def read_ledger(capture_root: Path, tier: str, trading_date: str) -> list[Ledger
     Raises:
         ValueError: Malformed line or duplicate member path across entries.
     """
-    path = _ledger_path(capture_root, tier, trading_date)
-    if not path.exists():
+    text = _read_ledger_text(capture_root, tier, trading_date)
+    if text is None:
         return []
     entries: list[LedgerEntry] = []
     seen: set[str] = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         if not line.strip():
             continue
         try:
@@ -661,8 +699,37 @@ def _seal_group(
     )
 
 
+def _fsync_dir(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _rehydrate_ledger(ledger_path: Path) -> None:
+    """Restore a compacted ledger to plain JSONL so an append continues the full history."""
+    if ledger_path.exists():
+        return
+    gz_path = ledger_path.with_name(ledger_path.name + ".gz")
+    if not gz_path.exists():
+        return
+    tmp = ledger_path.with_name(ledger_path.name + ".tmp")
+    try:
+        with gzip.open(gz_path, "rb") as src, open(tmp, "wb") as dst:
+            shutil.copyfileobj(src, dst, _CHUNK)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(tmp, ledger_path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    _fsync_dir(ledger_path.parent)
+
+
 def _append_ledger_entry(ledger_path: Path, entry: LedgerEntry) -> None:
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    _rehydrate_ledger(ledger_path)
     with open(ledger_path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(_entry_to_dict(entry), sort_keys=True) + "\n")
         handle.flush()
@@ -1159,6 +1226,147 @@ def prune_local_sealed_capture(
         return LocalRetentionReport(removed=(), kept=(), bytes_removed=0, skipped_reason="seal_lock_held")
 
 
+@dataclass(frozen=True)
+class LedgerCompactionReport:
+    """Outcome of one compaction pass over old seal ledgers.
+
+    Attributes:
+        compacted: ``<tier>/<date>`` labels whose plain ledger became ``.jsonl.gz`` (candidates in dry run).
+        kept: ``(label, reason)`` for old ledgers left untouched.
+        bytes_before: Plain ledger bytes of the compacted set.
+        bytes_after: Compressed bytes of the compacted set; equals bytes_before in dry run.
+    """
+
+    compacted: tuple[str, ...]
+    kept: tuple[tuple[str, str], ...]
+    bytes_before: int
+    bytes_after: int
+
+
+def _load_ledger_upload_state(capture_root: Path) -> Mapping[str, object]:
+    try:
+        raw: object = json.loads((capture_root / _LEDGER_UPLOAD_STATE_RELPATH).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _gzip_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with gzip.open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(_CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _compact_one(plain: Path, gz: Path, source_sha256: str) -> int | None:
+    """Replace one plain ledger with its verified gzip copy; None keeps the original untouched."""
+    tmp = gz.with_name(gz.name + ".tmp")
+    try:
+        with open(plain, "rb") as src, open(tmp, "wb") as raw_out:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw_out, mtime=0, compresslevel=_LEDGER_GZIP_LEVEL) as packed:
+                shutil.copyfileobj(src, packed, _CHUNK)
+            raw_out.flush()
+            os.fsync(raw_out.fileno())
+        if _gzip_sha256(tmp) != source_sha256:
+            tmp.unlink(missing_ok=True)
+            return None
+        os.replace(tmp, gz)
+        _fsync_dir(gz.parent)
+        plain.unlink()
+    except (OSError, EOFError, zlib.error):
+        tmp.unlink(missing_ok=True)
+        return None
+    return gz.stat().st_size
+
+
+def compact_old_ledgers(
+    capture_root: Path,
+    *,
+    today: date,
+    min_age_days: int = LEDGER_COMPACT_MIN_AGE_DAYS,
+    config: OffsiteConfig = OffsiteConfig(),  # noqa: B008
+    dry_run: bool = False,
+) -> LedgerCompactionReport:
+    """Losslessly gzip seal ledgers older than min_age_days once the remote copy is proven identical.
+
+    The upload state must record the plain ledger's exact size and sha256, so only bytes the remote
+    already holds are removed locally. Holds the seal lock for the whole pass.
+
+    Raises:
+        ValueError: min_age_days is shorter than the append window plus a 7-day margin.
+    """
+    if min_age_days < config.recent_window_days + 7:
+        raise ValueError(
+            f"min_age_days={min_age_days} shorter than append window (recent_window_days={config.recent_window_days}) + 7"
+        )
+    empty = LedgerCompactionReport(compacted=(), kept=(), bytes_before=0, bytes_after=0)
+    capture_root = Path(capture_root)
+    if not capture_root.is_dir():
+        logger.warning("[SYS] stage=ledger_compact status=SKIPPED reason=capture_root_missing")
+        return empty
+    cutoff = today - timedelta(days=min_age_days)
+    try:
+        with _hold_seal_lock(capture_root):
+            return _compact_locked(capture_root, cutoff=cutoff, config=config, dry_run=dry_run)
+    except SealLockHeldError:
+        logger.info("[SYS] stage=ledger_compact status=SKIPPED reason=seal_lock_held")
+        return empty
+
+
+def _compact_locked(capture_root: Path, *, cutoff: date, config: OffsiteConfig, dry_run: bool) -> LedgerCompactionReport:
+    state = _load_ledger_upload_state(capture_root)
+    compacted: list[str] = []
+    kept: list[tuple[str, str]] = []
+    bytes_before = 0
+    bytes_after = 0
+    for tier in config.tiers:
+        for trading_date in ledger_dates(capture_root, tier):
+            if date.fromisoformat(trading_date) >= cutoff:
+                continue
+            label = f"{tier}/{trading_date}"
+            plain = _ledger_path(capture_root, tier, trading_date)
+            gz = _ledger_gz_path(capture_root, tier, trading_date)
+            if plain.is_symlink() or gz.is_symlink():
+                kept.append((label, "symlink"))
+                continue
+            if not plain.exists():
+                continue
+            try:
+                read_ledger(capture_root, tier, trading_date)
+            except ValueError:
+                kept.append((label, "ledger_invalid"))
+                continue
+            size = plain.stat().st_size
+            digest = _sha256_file(plain)
+            if state.get(f"{tier}/{trading_date}.jsonl") != [size, digest]:
+                kept.append((label, "not_uploaded"))
+                continue
+            if dry_run:
+                compacted.append(label)
+                bytes_before += size
+                bytes_after += size
+                continue
+            packed_size = _compact_one(plain, gz, digest)
+            if packed_size is None:
+                kept.append((label, "verify_failed"))
+                continue
+            compacted.append(label)
+            bytes_before += size
+            bytes_after += packed_size
+    logger.info(
+        "[SYS] stage=ledger_compact dry_run=%s compacted=%d kept=%d bytes_before=%d bytes_after=%d",
+        dry_run,
+        len(compacted),
+        len(kept),
+        bytes_before,
+        bytes_after,
+    )
+    return LedgerCompactionReport(
+        compacted=tuple(compacted), kept=tuple(kept), bytes_before=bytes_before, bytes_after=bytes_after
+    )
+
+
 def restore_date(
     capture_root: Path,
     tier: str,
@@ -1298,14 +1506,9 @@ def verify_remote_segments(
     rclone = _resolve_rclone_bin()
     grouped: dict[tuple[str, str], list[LedgerEntry]] = {}
     for tier in config.tiers:
-        ledger_dir = capture_root / "offsite" / "ledger" / tier
-        if not ledger_dir.is_dir() or ledger_dir.is_symlink():
-            continue
-        for ledger_path in sorted(ledger_dir.glob("*.jsonl")):
-            if not _is_valid_date(ledger_path.stem):
-                continue
-            for entry in read_ledger(capture_root, tier, ledger_path.stem):
-                grouped.setdefault((tier, ledger_path.stem[:7]), []).append(entry)
+        for trading_date in ledger_dates(capture_root, tier):
+            for entry in read_ledger(capture_root, tier, trading_date):
+                grouped.setdefault((tier, trading_date[:7]), []).append(entry)
     checked = 0
     missing: list[str] = []
     mismatched: list[str] = []
@@ -1367,14 +1570,7 @@ def select_drill_dates(
     cutoff = today - timedelta(days=config.recent_window_days)
     picks: dict[str, str] = {}
     for tier in config.tiers:
-        ledger_dir = capture_root / "offsite" / "ledger" / tier
-        if not ledger_dir.is_dir() or ledger_dir.is_symlink():
-            continue
-        candidates = sorted(
-            ledger_path.stem
-            for ledger_path in ledger_dir.glob("*.jsonl")
-            if _is_valid_date(ledger_path.stem) and date.fromisoformat(ledger_path.stem) < cutoff
-        )
+        candidates = [trading_date for trading_date in ledger_dates(capture_root, tier) if date.fromisoformat(trading_date) < cutoff]
         if not candidates:
             continue
         picks[tier] = candidates[today.isocalendar().week % len(candidates)]

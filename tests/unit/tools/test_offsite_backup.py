@@ -1554,3 +1554,22 @@ def test_ledger_step_error_is_isolated(tmp_path: Path, monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="offsite_ledger"):
         run_offsite_backup(tmp_path, tmp_path / "capture", now=_now_kst("2026-11-02"), run_fn=_run, seal_fn=_seal)
     assert copies == ["data", "artifacts"]  # later steps still run
+
+
+def test_classify_ledger_files_ignores_gz_and_no_false_rewrite(tmp_path) -> None:
+    import gzip
+    import json
+
+    from src.tools.offsite_backup import LEDGER_UPLOAD_STATE_RELPATH, classify_ledger_files
+
+    raw = tmp_path / "offsite" / "ledger" / "raw"
+    raw.mkdir(parents=True)
+    (raw / "2026-10-30.jsonl.gz").write_bytes(gzip.compress(b'{"segment_name": "a"}\n', mtime=0))
+    state_path = tmp_path / LEDGER_UPLOAD_STATE_RELPATH
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps({"raw/2026-10-30.jsonl": [22, "0" * 64]}), encoding="utf-8")
+
+    appended, unproven, rewritten, next_state = classify_ledger_files(tmp_path)
+
+    assert appended == [] and unproven == [] and rewritten == []
+    assert next_state == {}

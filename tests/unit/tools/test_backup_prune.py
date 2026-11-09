@@ -1,3 +1,18 @@
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _stub_ledger_compact(monkeypatch) -> None:
+    from src.tools import backup_prune
+    from src.tools.capture_offsite import LedgerCompactionReport
+
+    monkeypatch.setattr(
+        backup_prune,
+        "compact_old_ledgers",
+        lambda *a, **kw: LedgerCompactionReport(compacted=(), kept=(), bytes_before=0, bytes_after=0),
+    )
+
+
 def test_expired_snapshot_dirs_uses_directory_date_not_file_age() -> None:
     import pandas as pd
 
@@ -441,3 +456,31 @@ def test_prune_history_step_failure_isolated(monkeypatch) -> None:
         backup_prune.main([])
 
     assert excinfo.value.code == 1 and ran == ["remote"]
+
+
+def test_ledger_compact_runs_after_sealed_and_reports_savings(monkeypatch, caplog) -> None:
+    import logging
+
+    from src.tools import backup_prune
+    from src.tools.capture_offsite import LedgerCompactionReport, LocalRetentionReport
+
+    calls: list[str] = []
+    _stub_other_steps(monkeypatch)
+    monkeypatch.setenv("HISTORY_EVICTION_ENABLED", "false")
+    monkeypatch.setattr(
+        backup_prune,
+        "prune_local_sealed_capture",
+        lambda *a, **kw: calls.append("sealed") or LocalRetentionReport(removed=(), kept=(), bytes_removed=0),
+    )
+    monkeypatch.setattr(
+        backup_prune,
+        "compact_old_ledgers",
+        lambda *a, **kw: calls.append("ledger")
+        or LedgerCompactionReport(compacted=("raw/2026-08-01",), kept=(), bytes_before=100, bytes_after=40),
+    )
+
+    with caplog.at_level(logging.INFO, logger=backup_prune.logger.name):
+        backup_prune.main([])
+
+    assert calls == ["sealed", "ledger"]
+    assert any("ledger_compacted=1 ledger_bytes_saved=60" in rec.message for rec in caplog.records)
