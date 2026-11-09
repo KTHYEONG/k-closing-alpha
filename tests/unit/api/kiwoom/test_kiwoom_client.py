@@ -2088,3 +2088,77 @@ def test_ka10059_exception_passthrough() -> None:
     client._post_tr = fake_post_tr  # type: ignore[method-assign]
     with pytest.raises(aiohttp.ClientError):
         asyncio.run(client.get_investor_institution_daily(object(), "005930", "20260910"))
+
+
+def _scripted_post_tr(responses: list[tuple[dict, dict]]) -> tuple[Any, list[tuple[str, str]]]:
+    sent: list[tuple[str, str]] = []
+
+    async def fake_post_tr(session: Any, api_id: str, path: str, body: dict, cont_yn: str = "N", next_key: str = "", max_retries: int = 3) -> tuple[dict, dict]:
+        sent.append((cont_yn, next_key))
+        return responses[len(sent) - 1]
+
+    return fake_post_tr, sent
+
+
+def _tick_row(index: int) -> dict[str, str]:
+    return {"cur_prc": "270000", "trde_qty": "1", "cntr_tm": f"20260904{143000 - index:06d}"}
+
+
+def test_kiwoom_tick_mid_walk_failure_keeps_rows_and_cursor() -> None:
+    from src.api.kiwoom.client import TickCursor
+
+    client = _kiwoom_client()
+    good = [
+        ({"return_code": 0, "return_msg": "OK", "stk_tic_chart_qry": [_tick_row(i * 2), _tick_row(i * 2 + 1)]}, {"cont-yn": "Y", "next-key": f"k{i + 1}"})
+        for i in range(3)
+    ]
+    failure = ({"return_code": 7, "return_msg": "서비스를 처리하는 중에 오류가 발생했습니다 [1631]"}, {"cont-yn": "N"})
+    fake, sent = _scripted_post_tr([*good, failure])
+    client._post_tr = fake
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04"))
+    assert sent[-1] == ("Y", "k3")
+    assert res["rt_cd"] == "1"
+    assert res["termination_reason"] == "vendor_failure"
+    assert res["vendor_return_code"] == 7
+    assert res["rows_received"] == 6
+    assert res["output2"] == [row for i in range(6) for row in [_tick_row(i)]]
+    assert res["cursor"] == TickCursor(next_key="k3", rows_received=6, total_ticks=None)
+
+
+def test_kiwoom_tick_first_page_failure_has_no_cursor() -> None:
+    client = _kiwoom_client()
+    fake, _ = _scripted_post_tr([({"return_code": 3, "return_msg": "bad code"}, {"cont-yn": "N"})])
+    client._post_tr = fake
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04"))
+    assert res["cursor"] is None
+    assert res["output2"] == []
+    assert res["vendor_return_code"] == 3
+
+
+def test_kiwoom_tick_resume_pass_failure_returns_resume_key() -> None:
+    from src.api.kiwoom.client import TickCursor
+
+    client = _kiwoom_client()
+    fake, sent = _scripted_post_tr([({"return_code": 7, "return_msg": "busy"}, {"cont-yn": "N"})])
+    client._post_tr = fake
+    res = asyncio.run(
+        client.get_tick_chart(object(), "005930", "2026-09-04", resume=TickCursor(next_key="K0", rows_received=900, total_ticks=2700))
+    )
+    assert sent == [("Y", "K0")]
+    assert res["cursor"] is not None
+    assert res["cursor"].next_key == "K0"
+    assert res["cursor"].rows_received == 900
+    assert res["output2"] == []
+
+
+def test_kiwoom_tick_exception_path_has_no_vendor_return_code() -> None:
+    client = _kiwoom_client()
+
+    async def boom(session: Any, api_id: str, path: str, body: dict, cont_yn: str = "N", next_key: str = "", max_retries: int = 3) -> tuple[dict, dict]:
+        raise RuntimeError("socket reset")
+
+    client._post_tr = boom
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04"))
+    assert res["rt_cd"] == "1"
+    assert "vendor_return_code" not in res
+    assert res["output2"] == []

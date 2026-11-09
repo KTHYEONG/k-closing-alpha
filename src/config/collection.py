@@ -80,6 +80,9 @@ class CollectionSettings(EnvSettings):
         COLLECTION_AFTERMARKET_BOOK_FLUSH_ROUNDS: Rounds buffered before a normalized flush, default 15.
         COLLECTION_TRANSPORT_RETRIES: Extra tries after a transient transport error, default 2.
         COLLECTION_TRANSPORT_BACKOFF_SECONDS: Delay before the first retry, doubled per retry, default 3.0.
+        COLLECTION_TICK_VENDOR_RETRIES: Extra passes after a transient Kiwoom tick body failure, default 3; 0 disables.
+        COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES: Kiwoom body return codes treated as transient, default (7,);
+            empty disables the retry.
         COLLECTION_TAPE_FLUSH_ROWS: Tape publisher row bound before a partition flush, default 2000000.
         COLLECTION_TAPE_MIN_FREE_GIB: Free-disk floor (GiB) below which tape jobs stop starting walks, default 25.
         COLLECTION_TAPE_LOOKBACK_DAYS: Daily sweep re-check window in days, default 25 (below KIWOOM_TAPE_DEPTH_DAYS).
@@ -175,6 +178,8 @@ class CollectionSettings(EnvSettings):
     COLLECTION_AFTERMARKET_BOOK_FLUSH_ROUNDS: int = Field(default=15, gt=0)
     COLLECTION_TRANSPORT_RETRIES: int = Field(default=2, ge=0)
     COLLECTION_TRANSPORT_BACKOFF_SECONDS: float = Field(default=3.0, ge=0, allow_inf_nan=False)
+    COLLECTION_TICK_VENDOR_RETRIES: int = Field(default=3, ge=0)
+    COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES: Annotated[tuple[int, ...], NoDecode] = Field(default=(7,))
     COLLECTION_TOSS_BACKFILL_CONCURRENCY: int = Field(default=8, gt=0)
     COLLECTION_TOSS_BASIS_VOLUME_RATIO_MIN: float = Field(default=0.90, gt=0, lt=1, allow_inf_nan=False)
     COLLECTION_TOSS_BASIS_VOLUME_TOLERANCE: float = Field(default=1e-9, ge=0, allow_inf_nan=False)
@@ -249,6 +254,23 @@ class CollectionSettings(EnvSettings):
     @classmethod
     def _check_blackout_windows(cls, v: tuple[str, ...]) -> tuple[str, ...]:
         parse_blackout_windows(v)
+        return v
+
+    @field_validator("COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES", mode="before")
+    @classmethod
+    def _parse_transient_codes_env(cls, v: Any) -> Any:
+        """Accept the comma spelling shared by every env loader, like the slot lists."""
+        if not isinstance(v, str):
+            return v
+        text = v.strip()
+        items = json.loads(text) if text.startswith("[") else text.split(",")
+        return tuple(int(str(item).strip()) for item in items if str(item).strip())
+
+    @field_validator("COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES", mode="after")
+    @classmethod
+    def _check_transient_codes(cls, v: tuple[int, ...]) -> tuple[int, ...]:
+        if any(code <= 0 for code in v):
+            raise ValueError("kiwoom transient return codes must be positive")
         return v
 
     @field_validator("COLLECTION_EXTENDED_EXHAUSTED_AUDIT_CUTOFF_HHMMSS", mode="after")

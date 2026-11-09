@@ -583,6 +583,8 @@ class KiwoomApiClient:
         truncated = False
         pages_fetched = 0
         failure_msg = ""
+        failure_code: int | None = None
+        failure_request_key: str | None = None
         prev_identity: tuple[Any, ...] | None = None
         stalls = 0
         in_observer = False
@@ -623,6 +625,9 @@ class KiwoomApiClient:
                     termination = "vendor_failure"
                     truncated = True
                     failure_msg = str(data.get("return_msg", ""))
+                    raw_code = data.get("return_code")
+                    failure_code = raw_code if isinstance(raw_code, int) else None
+                    failure_request_key = next_key if cont_yn == "Y" and next_key else None
                     break
                 rows = data.get("stk_tic_chart_qry") or []
                 dict_rows = [dict(r) for r in rows if isinstance(r, dict)]
@@ -701,19 +706,26 @@ class KiwoomApiClient:
                 "complete_by_total": False,
             }
         if termination == "vendor_failure":
+            failed_filtered = [dict(r) for r in all_rows if str(r.get("cntr_tm", "")).startswith(ymd)]
+            failed_cursor: TickCursor | None = None
+            if failure_request_key:
+                failed_cursor = TickCursor(
+                    next_key=failure_request_key, rows_received=rows_received, total_ticks=vendor_total
+                )
             return {
                 "rt_cd": "1",
                 "msg1": failure_msg,
-                "output2": [],
+                "output2": failed_filtered,
                 "vendor": "kiwoom",
                 "truncated": True,
                 "termination_reason": termination,
                 "pages_fetched": pages_fetched,
                 "continuation": metadata,
-                "cursor": None,
+                "cursor": failed_cursor,
                 "vendor_total_ticks": vendor_total,
                 "rows_received": rows_received,
                 "complete_by_total": False,
+                "vendor_return_code": failure_code,
             }
         filtered = [dict(r) for r in all_rows if str(r.get("cntr_tm", "")).startswith(ymd)]
         complete_by_total = termination == "exhausted" and vendor_total is not None

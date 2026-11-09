@@ -3126,3 +3126,207 @@ def test_price_helpers_edge_cases() -> None:
     assert _has_nonpositive_tick_price(pd.DataFrame([{"volume": 10}]))
 
 
+
+
+def _vendor_profile(tmp_path, **overrides):
+    from src.config.collection import CollectionSettings
+
+    values = {
+        "COLLECTION_ROOT": tmp_path / "capture",
+        "COLLECTION_VERIFIED_CHART_ROUTES": {"kiwoom:ka10079": "KRX", "kiwoom:ka10079-nx": "NXT"},
+        "COLLECTION_TRANSPORT_BACKOFF_SECONDS": 0.0,
+    }
+    values.update(overrides)
+    return CollectionSettings(_env_file=None, **values)
+
+
+class _VendorRetryKiwoom:
+    """Scripted Kiwoom stub: ("ok", rows), ("fail", failure spec) or ("raw", payload) per call."""
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.calls = []
+
+    async def get_tick_chart(self, session, code, snapshot_date, max_pages=None, budget=None, on_page=None, resume=None, **kwargs):
+        self.calls.append({"budget": budget, "resume": resume})
+        kind, payload = self._script.pop(0)
+        if kind == "raw":
+            return payload
+        if on_page is not None:
+            start, received = _aware_page_clocks()
+            on_page({"stk_tic_chart_qry": payload["rows"]}, {"cont-yn": "N"}, start, received, 0, 0)
+        if kind == "fail":
+            return {
+                "rt_cd": "1", "msg1": payload["msg"], "output2": payload["rows"], "vendor": "kiwoom",
+                "truncated": True, "termination_reason": "vendor_failure", "pages_fetched": 1,
+                "continuation": {}, "cursor": payload["cursor"], "vendor_total_ticks": payload.get("total"),
+                "rows_received": payload["received"], "complete_by_total": False,
+                "vendor_return_code": payload["code"],
+            }
+        total = payload.get("total")
+        return {
+            "rt_cd": "0", "output2": payload["rows"], "vendor": "kiwoom", "truncated": False,
+            "termination_reason": "exhausted", "pages_fetched": 1, "continuation": {}, "cursor": None,
+            "vendor_total_ticks": total, "rows_received": payload.get("received", len(payload["rows"])),
+            "complete_by_total": total is not None,
+        }
+
+
+_RC7_MSG = "서비스를 처리하는 중에 오류가 발생했습니다 [1631]"
+
+
+def _run_vendor_aftermarket_ticks(tmp_path, kiwoom, run_id, profile):
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_aftermarket_trade_ticks
+
+    today, _ = _today()
+    delivered = {}
+    asyncio.run(
+        collect_aftermarket_trade_ticks(
+            kiwoom, None, ["005930"], today, venue="KRX",
+            profile=profile, capture_store=_capture_store(tmp_path), run_id=run_id,
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    return delivered["005930"]
+
+
+def test_tick_vendor_mid_walk_transient_resumes_and_completes(tmp_path) -> None:
+    from src.api.kiwoom.client import TickCursor
+
+    _, ymd = _today()
+    cursor = TickCursor(next_key="K", rows_received=2, total_ticks=4)
+    kiwoom = _VendorRetryKiwoom([
+        ("fail", {"code": 7, "msg": _RC7_MSG, "rows": [_kw_tick_row(f"{ymd}190000"), _kw_tick_row(f"{ymd}180000")],
+                  "cursor": cursor, "total": 4, "received": 2}),
+        ("ok", {"rows": [_kw_tick_row(f"{ymd}170000"), _kw_tick_row(f"{ymd}160000")], "total": 4, "received": 4}),
+    ])
+    frame, entry = _run_vendor_aftermarket_ticks(tmp_path, kiwoom, "run-vendor-midwalk", _vendor_profile(tmp_path))
+
+    assert entry.status.value == "COMPLETE"
+    assert len(kiwoom.calls) == 2
+    assert kiwoom.calls[1]["resume"] == cursor
+    assert _ref_attempt_slots(entry) == {0, 1}
+    assert sorted(frame["ts_hms"].tolist()) == [160000, 170000, 180000, 190000]
+
+
+def test_tick_vendor_first_page_transient_restarts_with_same_request(tmp_path) -> None:
+    _, ymd = _today()
+    kiwoom = _VendorRetryKiwoom([
+        ("fail", {"code": 7, "msg": _RC7_MSG, "rows": [], "cursor": None, "total": None, "received": 0}),
+        ("ok", {"rows": [_kw_tick_row(f"{ymd}170000")]}),
+    ])
+    frame, entry = _run_vendor_aftermarket_ticks(tmp_path, kiwoom, "run-vendor-restart", _vendor_profile(tmp_path))
+
+    assert entry.status.value == "COMPLETE"
+    assert len(kiwoom.calls) == 2
+    assert kiwoom.calls[1]["resume"] is None
+    assert frame["ts_hms"].tolist() == [170000]
+
+
+def test_tick_vendor_retries_exhausted_reports_classified_reason(tmp_path, caplog) -> None:
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="src.backfill.intraday.collector")
+    failure = {"code": 7, "msg": _RC7_MSG, "rows": [], "cursor": None, "total": None, "received": 0}
+    kiwoom = _VendorRetryKiwoom([("fail", failure)] * 4)
+    frame, entry = _run_vendor_aftermarket_ticks(
+        tmp_path, kiwoom, "run-vendor-exhausted", _vendor_profile(tmp_path, COLLECTION_TICK_VENDOR_RETRIES=3),
+    )
+
+    assert len(kiwoom.calls) == 4
+    assert entry.status.value == "FAILED"
+    assert entry.reason == "vendor_failure:transient:rc7-1631"
+    assert frame.empty
+    retry_logs = [r for r in caplog.records if "status=VENDOR_RETRY" in r.getMessage()]
+    assert len(retry_logs) == 3
+
+
+def test_tick_vendor_non_transient_code_not_retried(tmp_path) -> None:
+    kiwoom = _VendorRetryKiwoom([
+        ("fail", {"code": 3, "msg": "bad code", "rows": [], "cursor": None, "total": None, "received": 0}),
+    ])
+    frame, entry = _run_vendor_aftermarket_ticks(tmp_path, kiwoom, "run-vendor-rc3", _vendor_profile(tmp_path))
+
+    assert len(kiwoom.calls) == 1
+    assert entry.status.value == "FAILED"
+    assert entry.reason == "vendor_failure:rc3"
+    assert frame.empty
+
+
+def test_tick_vendor_retries_zero_restores_old_behavior(tmp_path) -> None:
+    kiwoom = _VendorRetryKiwoom([
+        ("fail", {"code": 7, "msg": _RC7_MSG, "rows": [], "cursor": None, "total": None, "received": 0}),
+    ])
+    _, entry = _run_vendor_aftermarket_ticks(
+        tmp_path, kiwoom, "run-vendor-zero", _vendor_profile(tmp_path, COLLECTION_TICK_VENDOR_RETRIES=0),
+    )
+
+    assert len(kiwoom.calls) == 1
+    assert entry.status.value == "FAILED"
+
+
+def test_tick_vendor_stitch_mismatch_is_partial_not_complete(tmp_path) -> None:
+    from src.api.kiwoom.client import TickCursor
+
+    _, ymd = _today()
+    cursor = TickCursor(next_key="K", rows_received=2, total_ticks=4)
+    kiwoom = _VendorRetryKiwoom([
+        ("fail", {"code": 7, "msg": _RC7_MSG, "rows": [_kw_tick_row(f"{ymd}190000"), _kw_tick_row(f"{ymd}180000")],
+                  "cursor": cursor, "total": 4, "received": 2}),
+        ("ok", {"rows": [_kw_tick_row(f"{ymd}170000")], "total": 4, "received": 3}),
+    ])
+    _, entry = _run_vendor_aftermarket_ticks(tmp_path, kiwoom, "run-vendor-mismatch", _vendor_profile(tmp_path))
+
+    assert entry.status.value == "PARTIAL"
+    assert entry.reason.startswith("total_mismatch")
+
+
+def test_tick_vendor_backoff_uses_transport_backoff_doubling(monkeypatch) -> None:
+    from src.backfill.intraday.collector import _fetch_with_vendor_retry
+    from src.config.collection import CollectionSettings
+
+    sleeps: list[float] = []
+
+    async def _recorder(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", _recorder)
+    failure = {"rt_cd": "1", "termination_reason": "vendor_failure", "vendor_return_code": 7, "output2": [], "cursor": None}
+    responses = [failure, failure, failure, {"rt_cd": "0", "output2": [], "termination_reason": "exhausted"}]
+
+    async def _fetch(slot, budget, cursor):
+        return responses.pop(0)
+
+    profile = CollectionSettings(
+        _env_file=None, COLLECTION_TICK_VENDOR_RETRIES=3, COLLECTION_TRANSPORT_BACKOFF_SECONDS=3.0,
+    )
+    payload, next_slot = asyncio.run(
+        _fetch_with_vendor_retry(_fetch, first_attempt=0, budget=None, cursor=None, profile=profile, code="005930")
+    )
+
+    assert payload["rt_cd"] == "0"
+    assert next_slot == 4
+    assert sleeps == [3.0, 6.0, 12.0]
+
+
+def test_tick_vendor_legacy_failure_without_return_code_unchanged(tmp_path) -> None:
+    kiwoom = _VendorRetryKiwoom([("raw", {"rt_cd": "1", "msg1": "busy", "output2": []})])
+    frame, entry = _run_vendor_aftermarket_ticks(tmp_path, kiwoom, "run-vendor-legacy", _vendor_profile(tmp_path))
+
+    assert len(kiwoom.calls) == 1
+    assert entry.status.value == "FAILED"
+    assert entry.reason == "vendor_failure"
+
+
+def test_tick_vendor_aftermarket_first_page_failure_recovers(tmp_path) -> None:
+    _, ymd = _today()
+    kiwoom = _VendorRetryKiwoom([
+        ("fail", {"code": 7, "msg": _RC7_MSG, "rows": [], "cursor": None, "total": None, "received": 0}),
+        ("ok", {"rows": [_kw_tick_row(f"{ymd}180000")]}),
+    ])
+    frame, entry = _run_vendor_aftermarket_ticks(tmp_path, kiwoom, "run-vendor-default", _vendor_profile(tmp_path))
+
+    assert entry.status.value == "COMPLETE"
+    assert frame["ts_hms"].tolist() == [180000]

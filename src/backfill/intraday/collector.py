@@ -6,7 +6,7 @@ import asyncio
 import logging
 import re
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Final, Literal
@@ -62,6 +62,7 @@ logger = logging.getLogger(__name__)
 _EXHAUSTED_TERMINALS = frozenset({"exhausted", "crossed_target_date", "crossed_time_floor"})
 _NONCERTIFIED = frozenset({CaptureStatus.PARTIAL, CaptureStatus.FAILED, CaptureStatus.UNKNOWN})
 _ERROR_RE = re.compile(r"[^A-Za-z0-9_]+")
+_KIWOOM_MSG_CODE_RE = re.compile(r"\[(\d+)\]")
 
 VENDOR_FAILURE_TRANSIENT_PREFIX: Final[str] = "vendor_failure:transient:"
 VENDOR_FAILURE_REJECTED_PREFIX: Final[str] = "vendor_failure:rejected:"
@@ -80,6 +81,17 @@ def _classify_kis_vendor_failure(payload: object) -> str:
     if str(payload.get("rt_cd", "")) == "9" and not str(payload.get("msg_cd", "") or ""):
         return f"{VENDOR_FAILURE_TRANSIENT_PREFIX}{tag}"
     return f"{VENDOR_FAILURE_REJECTED_PREFIX}{tag}"
+
+
+def _classify_kiwoom_vendor_failure(payload: Mapping[str, Any], transient_codes: Collection[int]) -> str:
+    """Return the FAILED reason for a Kiwoom body failure, keeping its return code and vendor message tag."""
+    code = payload["vendor_return_code"]
+    found = _KIWOOM_MSG_CODE_RE.search(str(payload.get("msg1", "") or ""))
+    raw_tag = f"rc{code}-{found.group(1)}" if found else f"rc{code}"
+    tag = _ERROR_RE.sub("-", raw_tag).strip("-")
+    if code in transient_codes:
+        return f"{VENDOR_FAILURE_TRANSIENT_PREFIX}{tag}"
+    return f"vendor_failure:{tag}"
 
 
 def _canonical_kis_bars(rows: list[dict[str, Any]], snapshot_date: str, code: str) -> pd.DataFrame:
@@ -542,6 +554,89 @@ def _vendor_remaining(payload: Any) -> int | None:
     return None
 
 
+async def _run_kiwoom_pass(
+    fetch: Callable[[int, ChartBudget | None, Any | None], Awaitable[Any]],
+    *,
+    first_attempt: int,
+    budget: ChartBudget | None,
+    cursor: Any | None,
+    profile: CollectionSettings,
+    code: str,
+) -> tuple[Any, int]:
+    return await _call_with_transport_retry(
+        lambda s: fetch(s, budget, cursor), first_attempt=first_attempt, profile=profile, code=code,
+    )
+
+
+def _is_recoverable_vendor_failure(payload: Any, transient_codes: frozenset[int]) -> bool:
+    return (
+        isinstance(payload, dict)
+        and payload.get("rt_cd") == "1"
+        and payload.get("termination_reason") == "vendor_failure"
+        and payload.get("vendor_return_code") in transient_codes
+    )
+
+
+async def _fetch_with_vendor_retry(
+    fetch: Callable[[int, ChartBudget | None, Any | None], Awaitable[Any]],
+    *,
+    first_attempt: int,
+    budget: ChartBudget | None,
+    cursor: Any | None,
+    profile: CollectionSettings,
+    code: str,
+) -> tuple[Any, int]:
+    """Run one Kiwoom tick pass, resuming from the failed page when the vendor reports a transient body error.
+
+    A transient failure keeps the rows already served and its continuation key, so the next pass re-requests
+    only the failed page onward; the returned payload carries every row of the stitched pass. Without a
+    continuation key the pass restarts from the original request and the carried rows are discarded.
+
+    Args:
+        fetch: Awaitable factory called with (attempt slot, budget, cursor), as in `_acquire_kiwoom_ticks`.
+        first_attempt: Attempt slot for the first try.
+        budget: Budget of the first try, or None for the normal pass.
+        cursor: Resume cursor of the first try, or None.
+        profile: Supplies the retry cap, transient return codes and backoff.
+        code: Symbol for log correlation.
+
+    Returns:
+        (payload, next_free_attempt) where the payload is the last pass's result with carried rows prefixed.
+    """
+    transient_codes = frozenset(int(c) for c in profile.COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES)
+    max_retries = int(profile.COLLECTION_TICK_VENDOR_RETRIES)
+    base_backoff = float(profile.COLLECTION_TRANSPORT_BACKOFF_SECONDS)
+    carried: list[Any] = []
+    slot = int(first_attempt)
+    pass_budget, pass_cursor = budget, cursor
+    retries = 0
+    while True:
+        payload, slot = await _run_kiwoom_pass(
+            fetch, first_attempt=slot, budget=pass_budget, cursor=pass_cursor, profile=profile, code=code,
+        )
+        if not _is_recoverable_vendor_failure(payload, transient_codes) or retries >= max_retries:
+            if carried and isinstance(payload, dict):
+                payload = {**payload, "output2": [*carried, *(payload.get("output2") or [])]}
+            return payload, slot
+        retries += 1
+        logger.warning(
+            "[DATA] stage=ticks symbol=%s status=VENDOR_RETRY rc=%s page=%d rows=%d retry=%d/%d",
+            code, payload.get("vendor_return_code"), int(payload.get("pages_fetched", 0) or 0),
+            int(payload.get("rows_received", 0) or 0), retries, max_retries,
+        )
+        delay = base_backoff * (2 ** (retries - 1))
+        if delay > 0:
+            await asyncio.sleep(delay)
+        failed_rows = [dict(r) for r in (payload.get("output2") or []) if isinstance(r, dict)]
+        if payload.get("cursor") is None:
+            carried = []
+            pass_budget, pass_cursor = budget, None
+        else:
+            carried = [*carried, *failed_rows]
+            pass_budget = _resume_budget(_vendor_remaining(payload), profile)
+            pass_cursor = payload.get("cursor")
+
+
 @dataclass(frozen=True)
 class _KiwoomTickResult:
     """Outcome of one symbol's Kiwoom tick acquisition.
@@ -609,8 +704,8 @@ async def _acquire_kiwoom_ticks(
         "allow_no_trades": allow_no_trades, "crossed_date_no_trades": crossed_date_no_trades,
     }
     try:
-        payload, slot = await _call_with_transport_retry(
-            lambda s: fetch(s, None, None), first_attempt=0, profile=profile, code=code,
+        payload, slot = await _fetch_with_vendor_retry(
+            fetch, first_attempt=0, budget=None, cursor=None, profile=profile, code=code,
         )
     except Exception as e:
         logger.warning("[DATA] stage=ticks symbol=%s status=FAILED reason=transport:%s", code, _redacted_error(e))
@@ -623,8 +718,8 @@ async def _acquire_kiwoom_ticks(
     remaining = _vendor_remaining(payload)
     budget = _resume_budget(remaining, profile) if cursor is not None else _repair_budget(profile)
     try:
-        repaired, slot = await _call_with_transport_retry(
-            lambda s: fetch(s, budget, cursor), first_attempt=slot, profile=profile, code=code,
+        repaired, slot = await _fetch_with_vendor_retry(
+            fetch, first_attempt=slot, budget=budget, cursor=cursor, profile=profile, code=code,
         )
     except Exception as e:
         logger.warning("[DATA] stage=ticks symbol=%s status=FAILED reason=repair:%s", code, _redacted_error(e))
@@ -1100,9 +1195,12 @@ async def _tick_source_attempt(
     dataset = CaptureDataset.TRADE_TICKS
     venue = _venue_for(vendor=vendor, endpoint=endpoint, market_div_code=market_div_code, profile=profile)
     if not isinstance(payload, dict) or payload.get("rt_cd") != "0":
+        reason = "vendor_failure"
+        if isinstance(payload, dict) and isinstance(payload.get("vendor_return_code"), int):
+            reason = _classify_kiwoom_vendor_failure(payload, profile.COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES)
         return _empty_tick_frame(snapshot_date), _terminal_entry(
             symbol=code, dataset=dataset, venue=venue, session=session_tag,
-            status=CaptureStatus.FAILED, rows=0, reason="vendor_failure", refs=refs,
+            status=CaptureStatus.FAILED, rows=0, reason=reason, refs=refs,
         )
     terminal = str(payload.get("termination_reason", "") or "exhausted")
     truncated = bool(payload.get("truncated", False))

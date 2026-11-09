@@ -84,3 +84,28 @@ def test_extended_exhausted_audit_env_override(monkeypatch: pytest.MonkeyPatch) 
     """Env override replaces the daily-max threshold."""
     monkeypatch.setenv("COLLECTION_EXTENDED_EXHAUSTED_DAILY_MAX", "5")
     assert CollectionSettings(_env_file=None).COLLECTION_EXTENDED_EXHAUSTED_DAILY_MAX == 5
+
+
+def test_tick_vendor_retry_defaults() -> None:
+    """Transient Kiwoom body codes default to rc7 with three extra passes."""
+    profile = CollectionSettings(_env_file=None)
+    assert profile.COLLECTION_TICK_VENDOR_RETRIES == 3
+    assert profile.COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES == (7,)
+
+
+def test_tick_vendor_retry_rejects_invalid_values() -> None:
+    """Negative retry counts and non-positive transient codes fail validation."""
+    with pytest.raises(ValueError, match="greater than or equal to 0"):
+        CollectionSettings(COLLECTION_TICK_VENDOR_RETRIES=-1, _env_file=None)
+    with pytest.raises(ValueError, match="positive"):
+        CollectionSettings(COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES=(0,), _env_file=None)
+    with pytest.raises(ValueError, match="positive"):
+        CollectionSettings(COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES=(-7,), _env_file=None)
+
+
+def test_transient_return_codes_parse_comma_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The transient code list reads the comma spelling shared by env loaders; empty disables it."""
+    monkeypatch.setenv("COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES", "7, 9")
+    assert CollectionSettings(_env_file=None).COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES == (7, 9)
+    monkeypatch.setenv("COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES", "")
+    assert CollectionSettings(_env_file=None).COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES == ()
