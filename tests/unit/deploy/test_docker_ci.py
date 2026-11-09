@@ -122,7 +122,7 @@ def test_watchdog_workflow_schedule_and_probe() -> None:
 
     workflow = Path(".github/workflows/watchdog.yml").read_text(encoding="utf-8")
 
-    assert 'cron: "40 22 * * 1-5"' in workflow
+    assert 'cron: "40 22 * * *"' in workflow
     # The ops key is forced through krx-alpha deploy/host/ci-ops-gate.sh, which maps this name to
     # `uv run --no-sync python -m src.tools.watchdog_probe` in ~/k-closing-alpha.
     assert 'ssh $SSH_OPTS "$REMOTE_USER@$HOST" kca-watchdog-probe' in workflow
@@ -132,6 +132,49 @@ def test_watchdog_workflow_schedule_and_probe() -> None:
     assert Path("src/tools/watchdog_probe.py").is_file()
     assert "tailscale/github-action" in workflow
     assert "timeout-minutes:" in workflow
+
+
+def _kst_fire_slots_of_cron(expr: str) -> set[tuple[int, str]]:
+    """(KST weekday with Monday=0, KST HH:MM) of every UTC fire of a cron with integer minute and hour."""
+    from datetime import UTC, date, datetime, time, timedelta, timezone
+
+    minute, hour, _dom, _month, dow = expr.split()
+    assert minute.isdigit() and hour.isdigit()
+    cron_days: set[int] = set()
+    for part in dow.split(","):
+        if part == "*":
+            cron_days.update(range(7))
+        elif "-" in part:
+            low, high = (int(bound) for bound in part.split("-"))
+            cron_days.update(range(low, high + 1))
+        else:
+            cron_days.add(int(part))
+    monday_utc = date(2026, 11, 2)
+    kst = timezone(timedelta(hours=9))
+    slots: set[tuple[int, str]] = set()
+    for cron_day in cron_days:
+        # Cron 0 and 7 are Sunday; monday_utc anchors the UTC weekday of each cron day.
+        utc_day = monday_utc + timedelta(days=(cron_day - 1) % 7)
+        fire = datetime.combine(utc_day, time(int(hour), int(minute)), tzinfo=UTC)
+        local = fire.astimezone(kst)
+        slots.add((local.weekday(), local.strftime("%H:%M")))
+    return slots
+
+
+def test_watchdog_cron_covers_every_kst_weekday() -> None:
+    import re
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/watchdog.yml").read_text(encoding="utf-8")
+    expr = re.search(r'cron:\s*"([^"]+)"', workflow).group(1)
+    slots = _kst_fire_slots_of_cron(expr)
+
+    assert {weekday for weekday, _ in slots} == set(range(7))
+    assert {clock for _, clock in slots} == {"07:40"}
+
+
+def test_watchdog_cron_expansion_detects_old_weekday_gap() -> None:
+    assert {weekday for weekday, _ in _kst_fire_slots_of_cron("40 22 * * 1-5")} == {1, 2, 3, 4, 5}
 
 
 def test_watchdog_checks_ghcr_pat_expiry() -> None:

@@ -313,3 +313,47 @@ def test_p5_missing_timestamps_inside_window_is_unreadable(tmp_path) -> None:
         failed_units=(), inactive_timers=(),
     )
     assert verdict.problems.count("heartbeat_unreadable") == 1
+
+
+def test_sunday_and_monday_runs_healthy_after_friday_audit(tmp_path) -> None:
+    from src.tools.watchdog_probe import evaluate_watchdog
+
+    outbox = tmp_path / "outbox"
+    outbox.mkdir()
+    heartbeat = tmp_path / "daily_audit.json"
+    for day, clock, reconciled in (
+        ("2026-11-08", "07:40:00", "2026-11-08T07:35:00+09:00"),
+        ("2026-11-09", "07:40:00", "2026-11-09T07:35:00+09:00"),
+        ("2026-11-09", "10:10:00", "2026-11-09T10:05:00+09:00"),
+    ):
+        _write_heartbeat(heartbeat, "2026-11-06", reconciled_at=reconciled)
+        verdict = evaluate_watchdog(
+            _probe_time(day, clock),
+            heartbeat_path=heartbeat,
+            outbox_dir=outbox,
+            failed_units=(),
+            inactive_timers=(),
+        )
+
+        assert verdict.problems == ()
+        assert verdict.expected_snapshot_date == "2026-11-06"
+
+
+def test_sunday_run_flags_a_missed_friday_audit(tmp_path) -> None:
+    outbox = tmp_path / "outbox"
+    outbox.mkdir()
+    heartbeat = _write_heartbeat(tmp_path / "daily_audit.json", "2026-11-05", reconciled_at="2026-11-08T07:35:00+09:00")
+
+    verdict = _evaluate("2026-11-08", heartbeat, outbox)
+
+    assert "heartbeat_stale:2026-11-05" in verdict.problems
+
+
+def test_day_after_weekday_holiday_run_is_healthy(tmp_path) -> None:
+    outbox = tmp_path / "outbox"
+    outbox.mkdir()
+    heartbeat = _write_heartbeat(
+        tmp_path / "daily_audit.json", "2026-11-09", day_kind="holiday", reconciled_at="2026-11-10T07:35:00+09:00"
+    )
+
+    assert _evaluate("2026-11-10", heartbeat, outbox).problems == ()
