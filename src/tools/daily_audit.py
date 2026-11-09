@@ -25,6 +25,7 @@ from src import settings
 from src.api.kis.key_pool import load_kis_env, read_token_issued_date, resolve_host_issued_credentials, token_cache_path
 from src.config.base import TOPK_DECISIONS_PARQUET_NAME
 from src.config.collection import CollectionSettings
+from src.config.credential_expiry import CredentialRegistryError
 from src.config.market_session import (
     DECISION_WINDOW_END_HHMMSS,
     DECISION_WINDOW_START_HHMMSS,
@@ -81,7 +82,13 @@ from src.data.trading_calendar import (
 from src.execution.paper_broker import PaperLedger
 from src.processing.schema import CLOSE_CONFIRMED_COL
 from src.tools.alerts import drain_alert_outbox, record_digest
-from src.tools.expiry_notices import CALENDAR_EXPIRY_NAME, CALENDAR_RENEW_HINT, evaluate_expiries
+from src.tools.expiry_notices import (
+    CALENDAR_EXPIRY_NAME,
+    CALENDAR_RENEW_HINT,
+    REGISTRY_UNREADABLE_TAG,
+    ExpiryReport,
+    evaluate_expiries,
+)
 from src.tools.incident_pager import IncidentPager, page_issue_keys
 from src.tools.issue_registry import (
     ADVISORY_ESCALATION_AUDITS,
@@ -2336,7 +2343,15 @@ def run_daily_audit(
     except Exception as exc:
         logger.warning("[DATA] stage=daily_audit alert_drain=FAILED reason=%s", type(exc).__name__)
         undelivered_alerts = 0
-    report = evaluate_expiries(trading_date)
+    try:
+        report = evaluate_expiries(trading_date)
+    except CredentialRegistryError as exc:
+        logger.warning("[SYS] stage=daily_audit credential_registry=FAILED reason=%s", type(exc).__name__)
+        fallback = evaluate_expiries(trading_date, credentials=())
+        report = ExpiryReport(
+            notices=fallback.notices,
+            warnings=(*fallback.warnings, REGISTRY_UNREADABLE_TAG),
+        )
     if ops_issues_fn is None:
         from src.tools.ops_sentinel import measure_ops as _default_measure_ops
 

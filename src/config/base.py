@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import computed_field
+from pydantic import Field, computed_field
 
 from src.config._env import PROJECT_ROOT, EnvSettings
 
@@ -21,6 +21,10 @@ class PathSettings(EnvSettings):
     # ---------------------------------------------------------
     BASE_DIR: Path = PROJECT_ROOT
     DATA_DIR: Path = PROJECT_ROOT / "data"
+    CREDENTIAL_REGISTRY_PATH: Path = Field(
+        default=Path.home() / "quant-secrets" / "credential-registry.toml",
+        validation_alias="KCA_CREDENTIAL_REGISTRY",
+    )
 
     # ---------------------------------------------------------
     # [파생 경로]

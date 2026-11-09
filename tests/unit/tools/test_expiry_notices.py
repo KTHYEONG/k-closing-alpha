@@ -109,3 +109,49 @@ def test_empty_registry_only_calendar() -> None:
     report = evaluate_expiries(date(2026, 9, 29), credentials=(), calendar=_calendar(date(2027, 9, 29)))
 
     assert report.notices == () and report.warnings == ()
+
+
+def test_default_credentials_come_from_registry_path(monkeypatch, tmp_path) -> None:
+    from src import settings
+    from src.tools.expiry_notices import evaluate_expiries
+
+    registry = tmp_path / "credential-registry.toml"
+    registry.write_text(
+        'schema = "credential-registry.v1"\n\n'
+        "[[credential]]\n"
+        'name = "KIS_DATA_1"\n'
+        'status = "active"\n'
+        'consumers = ["kca"]\n'
+        "expires_on = 2026-10-19\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(settings, "CREDENTIAL_REGISTRY_PATH", registry)
+
+    report = evaluate_expiries(date(2026, 9, 29), calendar=_calendar(date(2027, 9, 29)))
+
+    assert report.notices == ("KIS_DATA_1:d20:2026-10-19",)
+    assert report.warnings == ()
+
+
+def test_default_credentials_raise_when_registry_missing(monkeypatch, tmp_path) -> None:
+    import pytest
+
+    from src import settings
+    from src.config.credential_expiry import CredentialRegistryError
+    from src.tools.expiry_notices import evaluate_expiries
+
+    monkeypatch.setattr(settings, "CREDENTIAL_REGISTRY_PATH", tmp_path / "absent.toml")
+
+    with pytest.raises(CredentialRegistryError):
+        evaluate_expiries(date(2026, 9, 29), calendar=_calendar(date(2027, 9, 29)))
+
+
+def test_explicit_credentials_bypass_registry(monkeypatch, tmp_path) -> None:
+    from src import settings
+    from src.tools.expiry_notices import evaluate_expiries
+
+    monkeypatch.setattr(settings, "CREDENTIAL_REGISTRY_PATH", tmp_path / "absent.toml")
+
+    report = evaluate_expiries(date(2026, 9, 29), credentials=(), calendar=_calendar(date(2027, 9, 29)))
+
+    assert report.notices == () and report.warnings == ()

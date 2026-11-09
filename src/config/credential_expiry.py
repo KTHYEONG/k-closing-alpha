@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import tomllib
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Final
 
 EXPIRY_NOTICE_DAYS: int = 30
 EXPIRY_WARNING_DAYS: int = 7
+
+REGISTRY_SCHEMA: Final[str] = "credential-registry.v1"
+REGISTRY_CONSUMER: Final[str] = "kca"
+_REGISTRY_STATUSES: Final[frozenset[str]] = frozenset({"active", "retiring", "no_expiry"})
 
 
 @dataclass(frozen=True)
@@ -26,6 +33,10 @@ class CredentialExpiry:
     name: str
     expires_on: date
     renew_hint: str = ""
+
+
+class CredentialRegistryError(ValueError):
+    """The shared credential registry is missing, unreadable, or malformed."""
 
 
 def validate_credential_expiries(entries: Sequence[CredentialExpiry]) -> None:
@@ -50,22 +61,59 @@ def validate_credential_expiries(entries: Sequence[CredentialExpiry]) -> None:
         )
 
 
-# 갱신할 때마다 이 목록을 업데이트한다. 날짜는 발급기관이 통보한 마지막 유효일이다.
-# KIS 앱키는 전부 발급일 기준 1년 유효(사용자 확인 2026-09-27).
-_KIS_RENEW_HINT = "KIS Developers 서비스 연장"
-CREDENTIAL_EXPIRIES: tuple[CredentialExpiry, ...] = (
-    CredentialExpiry(name="KIS_APP_KEY", expires_on=date(2027, 3, 11), renew_hint=_KIS_RENEW_HINT),
-    CredentialExpiry(name="KIS_DATA_1", expires_on=date(2026, 12, 4), renew_hint=_KIS_RENEW_HINT),
-    CredentialExpiry(name="KIS_DATA_2", expires_on=date(2027, 9, 15), renew_hint=_KIS_RENEW_HINT),
-    CredentialExpiry(name="KIS_DATA_3", expires_on=date(2027, 9, 15), renew_hint=_KIS_RENEW_HINT),
-    CredentialExpiry(name="KIS_DATA_4", expires_on=date(2027, 9, 15), renew_hint=_KIS_RENEW_HINT),
-    CredentialExpiry(name="KIS_DATA_5", expires_on=date(2027, 9, 15), renew_hint=_KIS_RENEW_HINT),
-    CredentialExpiry(name="KRX_OPENAPI_KEY", expires_on=date(2027, 1, 18), renew_hint="공공데이터포털 KRX Open API 활용신청 연장"),
-    # 발급일을 확인하지 못해 첫 사용 커밋일(LS 2026-09-05, DB 2026-10-15) 기준 1년 뒤보다 하루 앞당겨 보수적으로 둔다. 포털에서 확인되면 정정한다.
-    CredentialExpiry(name="LS_APP_KEY", expires_on=date(2027, 9, 4), renew_hint="LS증권 OpenAPI 서비스 연장 (포털 확인 후 정정)"),
-    CredentialExpiry(name="DB_APP_KEY", expires_on=date(2027, 10, 14), renew_hint="DB금융투자 OpenAPI 서비스 연장 (포털 확인 후 정정)"),
-    CredentialExpiry(name="KIWOOM_APP_KEY", expires_on=date(2027, 9, 7), renew_hint="키움증권 OpenAPI 서비스 연장 (선택 경로: 종가스캔 후보 보조 소스)"),
-    CredentialExpiry(name="TOSS_APP_KEY", expires_on=date(2027, 9, 11), renew_hint="토스증권 OpenAPI 서비스 연장 (선택 경로: 종가스캔 후보 보조 소스)"),
-)
+def load_credential_expiries(path: Path) -> tuple[CredentialExpiry, ...]:
+    """Read the dated credentials kca must watch from the shared registry.
 
-validate_credential_expiries(CREDENTIAL_EXPIRIES)
+    Keeps only active entries that list kca as a consumer and carry an expiry date.
+
+    Args:
+        path: Registry TOML written by the api-manager credential tooling.
+
+    Returns:
+        Validated entries in registry order.
+
+    Raises:
+        CredentialRegistryError: The file is unreadable, not TOML, has a foreign schema,
+            contains a malformed entry, or repeats a name. Messages carry no file contents.
+    """
+    try:
+        with path.open("rb") as handle:
+            document = tomllib.load(handle)
+    except OSError as exc:
+        raise CredentialRegistryError("registry file unreadable") from exc
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise CredentialRegistryError("registry is not valid TOML") from exc
+    if document.get("schema") != REGISTRY_SCHEMA:
+        raise CredentialRegistryError(f"registry schema is not {REGISTRY_SCHEMA}")
+    raw_entries = document.get("credential", [])
+    if not isinstance(raw_entries, list):
+        raise CredentialRegistryError("registry credential list is malformed")
+    parsed = [_parse_entry(raw) for raw in raw_entries]
+    selected = tuple(
+        CredentialExpiry(name=name, expires_on=expires_on, renew_hint=hint)
+        for name, status, consumers, expires_on, hint in parsed
+        if status == "active" and REGISTRY_CONSUMER in consumers and expires_on is not None
+    )
+    try:
+        validate_credential_expiries(selected)
+    except ValueError as exc:
+        raise CredentialRegistryError("registry entries failed validation") from exc
+    return selected
+
+
+def _parse_entry(raw: Any) -> tuple[str, str, tuple[str, ...], date | None, str]:
+    if not isinstance(raw, dict):
+        raise CredentialRegistryError("registry entry is malformed")
+    name, status, consumers = raw.get("name"), raw.get("status"), raw.get("consumers")
+    expires_on, hint = raw.get("expires_on"), raw.get("renew_hint", "")
+    if not isinstance(name, str) or not name:
+        raise CredentialRegistryError("registry entry name is malformed")
+    if status not in _REGISTRY_STATUSES:
+        raise CredentialRegistryError("registry entry status is malformed")
+    if not isinstance(consumers, list) or not all(isinstance(item, str) for item in consumers):
+        raise CredentialRegistryError("registry entry consumers are malformed")
+    if expires_on is not None and (not isinstance(expires_on, date) or isinstance(expires_on, datetime)):
+        raise CredentialRegistryError("registry entry expires_on is malformed")
+    if not isinstance(hint, str):
+        raise CredentialRegistryError("registry entry renew_hint is malformed")
+    return name, status, tuple(consumers), expires_on, hint

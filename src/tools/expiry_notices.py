@@ -6,16 +6,18 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 
+from src import settings
 from src.config.credential_expiry import (
-    CREDENTIAL_EXPIRIES,
     EXPIRY_NOTICE_DAYS,
     EXPIRY_WARNING_DAYS,
     CredentialExpiry,
+    load_credential_expiries,
 )
 from src.config.krx_calendar import KRX_CALENDAR, KrxCalendar
 
 CALENDAR_EXPIRY_NAME: str = "krx_calendar"
 CALENDAR_RENEW_HINT: str = "KRX 다음 해 휴장일·개장시간 공지 반영(연초 첫 거래일 10:00 개장 SHIFTED 포함)"
+REGISTRY_UNREADABLE_TAG: str = "credential_registry:unreadable"
 
 
 @dataclass(frozen=True)
@@ -36,7 +38,7 @@ class ExpiryReport:
 def evaluate_expiries(
     today: date,
     *,
-    credentials: Sequence[CredentialExpiry] = CREDENTIAL_EXPIRIES,
+    credentials: Sequence[CredentialExpiry] | None = None,
     calendar: KrxCalendar = KRX_CALENDAR,
     notice_days: int = EXPIRY_NOTICE_DAYS,
     warning_days: int = EXPIRY_WARNING_DAYS,
@@ -49,14 +51,19 @@ def evaluate_expiries(
 
     Args:
         today: KST date of the audit.
-        credentials: Registry entries.
+        credentials: Registry entries; None loads the shared credential registry.
         calendar: Verified session calendar.
         notice_days: Notice horizon in calendar days.
         warning_days: Escalation horizon in calendar days.
 
     Returns:
         ExpiryReport sorted by (days_left, name).
+
+    Raises:
+        CredentialRegistryError: credentials is None and the registry cannot be loaded.
     """
+    if credentials is None:
+        credentials = load_credential_expiries(settings.CREDENTIAL_REGISTRY_PATH)
     dated: list[tuple[str, date]] = [(entry.name, entry.expires_on) for entry in credentials]
     dated.append((CALENDAR_EXPIRY_NAME, calendar.verified_through))
     flagged: list[tuple[int, str, str]] = []

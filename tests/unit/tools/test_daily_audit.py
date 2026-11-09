@@ -24,6 +24,16 @@ def _standard_session(monkeypatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_credential_registry(monkeypatch, tmp_path_factory) -> None:
+    """Full-audit scenarios read an empty shared registry, never the host's quant-secrets file."""
+    from src import settings
+
+    registry = tmp_path_factory.mktemp("credential_registry") / "credential-registry.toml"
+    registry.write_text('schema = "credential-registry.v1"\n', encoding="utf-8")
+    monkeypatch.setattr(settings, "CREDENTIAL_REGISTRY_PATH", registry)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_ops_measurement(monkeypatch) -> None:
     """Full-audit scenarios isolate from host systemd; ops measurement is covered by dedicated p5 tests."""
     import src.tools.ops_sentinel as _sentinel
@@ -2701,6 +2711,61 @@ def test_run_daily_audit_passes_expiry_report(monkeypatch, tmp_path) -> None:
     daily_audit.run_daily_audit("2026-09-29", trading_day_fn=lambda _d: True, **stubs)
 
     assert sent == [] and "KIS_X:d9:2026-10-08" in _archived()[0][1]
+
+
+def test_unreadable_registry_is_a_warning_not_a_crash(monkeypatch, tmp_path) -> None:
+    from src.tools import daily_audit
+
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    stubs = _stub_weekday_audit(monkeypatch, tmp_path, _dispatch)
+    monkeypatch.setattr(daily_audit.settings, "CREDENTIAL_REGISTRY_PATH", tmp_path / "absent.toml")
+
+    subject = daily_audit.run_daily_audit("2026-09-29", trading_day_fn=lambda _d: True, **stubs)
+
+    assert subject is not None and "만료임박" in subject
+    assert len(sent) == 1
+    assert "expiry_warnings=credential_registry:unreadable" in _archived()[0][1]
+
+
+def test_registry_warning_levels_render_like_before(monkeypatch, tmp_path) -> None:
+    from src.tools import daily_audit
+
+    registry = tmp_path / "credential-registry.toml"
+    registry.write_text(
+        'schema = "credential-registry.v1"\n\n'
+        "[[credential]]\n"
+        'name = "KIS_DATA_1"\n'
+        'status = "active"\n'
+        'consumers = ["kca"]\n'
+        "expires_on = 2026-10-06\n\n"
+        "[[credential]]\n"
+        'name = "KIS_DATA_2"\n'
+        'status = "active"\n'
+        'consumers = ["kca"]\n'
+        "expires_on = 2026-10-29\n",
+        encoding="utf-8",
+    )
+    sent: list[tuple[str, str]] = []
+
+    def _dispatch(subject: str, body: str) -> dict[str, bool]:
+        sent.append((subject, body))
+        return {"webhook": False, "email": True}
+
+    stubs = _stub_weekday_audit(monkeypatch, tmp_path, _dispatch)
+    monkeypatch.setattr(daily_audit.settings, "CREDENTIAL_REGISTRY_PATH", registry)
+
+    daily_audit.run_daily_audit("2026-09-29", trading_day_fn=lambda _d: True, **stubs)
+
+    body = _archived()[0][1]
+    assert len(sent) == 1 and "만료임박" in sent[0][0]
+    assert "expiry_warnings=KIS_DATA_1:d7:2026-10-06" in body
+    assert "expiry_notices=KIS_DATA_2:d30:2026-10-29" in body
+    assert "credential_registry:unreadable" not in body
 
 
 def test_calendar_expiry_renders_renew_hint() -> None:
