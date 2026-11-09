@@ -153,23 +153,6 @@ def test_training_frame_eod_rows_precede_store_and_lack_core_extras() -> None:
         np.testing.assert_allclose(merged[col].to_numpy(), merged[f"{col}_exp"].to_numpy(), rtol=1e-12, equal_nan=True)
 
 
-def test_training_frame_pool_trim_is_exact(monkeypatch) -> None:
-    ph, market_dates, d_to_idx = _synth_ph()
-    store = _store_slice(ph, slice(-25, None))
-    store_start = pd.Timestamp(store["date"].min())
-
-    trim = core._pool_source_rows
-    source = trim(ph, market_dates, d_to_idx, store_start)
-    trimmed = _build(ph, market_dates, d_to_idx, store)
-    monkeypatch.setattr(core, "_pool_source_rows", lambda ph, *_args: ph)
-    untrimmed = _build(ph, market_dates, d_to_idx, store)
-
-    before = int(np.searchsorted(market_dates, np.datetime64(store_start)))
-    assert source["date"].max() == market_dates[before - 1 + core.FORWARD_EXIT_MAX_DAYS] < ph["date"].max()
-    pd.testing.assert_frame_equal(trimmed, untrimmed, check_exact=True)
-    assert trim(ph, market_dates, d_to_idx, pd.Timestamp(market_dates[0])).empty
-
-
 def test_training_frame_labels_ignore_future_perturbation() -> None:
     ph, market_dates, d_to_idx = _synth_ph()
     store = _store_slice(ph, slice(-25, -12))

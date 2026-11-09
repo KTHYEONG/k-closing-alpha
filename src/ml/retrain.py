@@ -204,6 +204,7 @@ def main(argv: list[str] | None = None) -> None:
         from src.ml.research.v3_engine import load_and_prepare_price_history
         from src.ml.topk_history_features import HISTORY_LOOKBACK_CALENDAR_DAYS
         from src.strategy.store import strategy_values
+        from src.utils.memory import release_free_memory
 
         if not os.path.exists(settings.PRICE_HISTORY_PARQUET_PATH):
             raise ValueError(f"price_history not found: {settings.PRICE_HISTORY_PARQUET_PATH}")
@@ -217,6 +218,7 @@ def main(argv: list[str] | None = None) -> None:
         raw_history = pd.read_parquet(
             settings.PRICE_HISTORY_PARQUET_PATH, columns=list(CORE_HISTORY_COLUMNS), filters=[("date", ">=", history_start)]
         )
+        release_free_memory()  # the filtered read leaves its full Arrow buffers in the pool
         values = strategy_values()
         frame = build_core_training_frame(
             ph, market_dates, d_to_idx, store=store, raw_history=raw_history, label_clip=values.label_clip,

@@ -22,6 +22,7 @@ from src.strategy.contract import (
     round_trip_cost_bp,
     select_universe,
 )
+from src.utils.memory import release_free_memory
 
 logger = logging.getLogger("research_v3_engine")
 
@@ -53,6 +54,8 @@ def load_and_prepare_price_history(
     """
     logger.info("Loading price history from %s...", path)
     ph, prov = prepare_price_panel(pd.read_parquet(path))
+    # The raw frame is gone; return its pages before the next full-panel pass peaks on top of them.
+    release_free_memory()
     logger.info("[DATA] stage=panel_integrity %s", prov.to_log_kv())
 
     # Baseline trading calendar
@@ -61,6 +64,7 @@ def load_and_prepare_price_history(
 
     classification = load_classification_panel(classification_path)
     ph, class_prov = attach_screenable_class(ph, classification, market_dates=market_dates)
+    release_free_memory()
     logger.info("[DATA] stage=screenable_class %s", class_prov.to_log_kv())
 
     return ph, market_dates, d_to_idx

@@ -475,3 +475,41 @@ def test_compute_topk_history_features_flow_features_exclude_todays_own_value() 
     row_a = a[a["date"] == target_date].set_index("symbol")[["f_inst_cum5", "f_foreign_cum5"]]
     row_b = b[b["date"] == target_date].set_index("symbol")[["f_inst_cum5", "f_foreign_cum5"]]
     assert np.allclose(row_a.to_numpy(), row_b.to_numpy(), equal_nan=True)
+
+
+def test_compute_topk_history_features_keys_select_rows_without_changing_values() -> None:
+    import pandas as pd
+
+    from src.ml.topk_history_features import compute_topk_history_features
+
+    # Given: a panel and a few (date, symbol) keys, one of them absent from the panel
+    panel = _panel()
+    dates = sorted(panel["date"].unique())
+    keys = pd.DataFrame({
+        "date": [dates[65], dates[80], dates[80], pd.Timestamp("2030-01-02")],
+        "symbol": ["000002", "000001", "000002", "000001"],
+    })
+
+    # When
+    full = compute_topk_history_features(panel).set_index(["date", "symbol"])
+    sub = compute_topk_history_features(panel, keys=keys).set_index(["date", "symbol"])
+
+    # Then: exactly the present keys are returned, with values identical to the unrestricted output
+    assert len(sub) == 3
+    pd.testing.assert_frame_equal(sub, full.loc[sub.index], check_exact=True)
+
+
+def test_compute_topk_history_features_ignores_input_row_order() -> None:
+    import pandas as pd
+
+    from src.ml.topk_history_features import compute_topk_history_features
+
+    # Given: the same panel already (symbol, date)-ordered and shuffled
+    panel = _panel().sort_values(["symbol", "date"]).reset_index(drop=True)
+    shuffled = panel.sample(frac=1.0, random_state=0)
+
+    # When / Then: the sorted fast path and the sorting path agree exactly
+    pd.testing.assert_frame_equal(
+        compute_topk_history_features(panel), compute_topk_history_features(shuffled), check_exact=True
+    )
+    assert compute_topk_history_features(panel.iloc[:1]).shape[0] == 1

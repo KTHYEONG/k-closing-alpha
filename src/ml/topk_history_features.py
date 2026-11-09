@@ -22,6 +22,7 @@ from src.ml.topk_contract import TOPK_FEATURE_COLS_V2 as TOPK_FEATURE_COLS_V2
 from src.ml.topk_contract import TOPK_FLOW_FEATURE_COLS as TOPK_FLOW_FEATURE_COLS
 from src.ml.topk_contract import TOPK_HISTORY_FEATURE_COLS as TOPK_HISTORY_FEATURE_COLS
 from src.strategy.contract import DEFAULT_UNIVERSE, derive_chg_ratio
+from src.utils.frame_codes import group_codes
 
 HISTORY_REQUIRED_COLUMNS: tuple[str, ...] = (
     "date",
@@ -108,14 +109,28 @@ def attach_lagged_flow_features(cands: pd.DataFrame, panel: pd.DataFrame) -> pd.
     return out.drop(columns=["_row_order", "_inst_netbuy_lag1"])
 
 
-def compute_topk_history_features(panel: pd.DataFrame) -> pd.DataFrame:
-    """Compute point-in-time per-symbol history features for every panel row.
+def _is_symbol_date_sorted(p: pd.DataFrame) -> bool:
+    if len(p) < 2:
+        return True
+    # Strictly ascending (symbol, date) pairs; any NaN/NaT compares False and falls back to sorting.
+    sym = p["symbol"]
+    prev_sym, next_sym = sym.iloc[:-1].reset_index(drop=True), sym.iloc[1:].reset_index(drop=True)
+    dates = p["date"].to_numpy()
+    same = (next_sym == prev_sym).to_numpy(dtype=bool)
+    ascending = (next_sym > prev_sym).to_numpy(dtype=bool) | (same & (dates[1:] > dates[:-1]))
+    return bool(ascending.all())
+
+
+def compute_topk_history_features(panel: pd.DataFrame, *, keys: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Compute point-in-time per-symbol history features for panel rows.
 
     Args:
         panel: Daily rows with HISTORY_REQUIRED_COLUMNS; one row per (date, symbol).
+        keys: Optional (date, symbol) rows; when given, only panel rows matching a key are returned.
+            Windows still read the full panel, so returned values equal the unrestricted output.
 
     Returns:
-        Frame with date, symbol and TOPK_HISTORY_FEATURE_COLS, one row per panel
+        Frame with date, symbol and TOPK_HISTORY_FEATURE_COLS, one row per (selected) panel
         row, sorted by (symbol, date). Undefined windows are NaN.
 
     Raises:
@@ -131,14 +146,21 @@ def compute_topk_history_features(panel: pd.DataFrame) -> pd.DataFrame:
     dup = int(p.duplicated(["date", "symbol"]).sum())
     if dup:
         raise ValueError(f"panel carries {dup} duplicate (date, symbol) rows")
-    p = p.sort_values(["symbol", "date"], kind="stable").reset_index(drop=True)
+    # A prepared price panel is already (symbol, date)-ordered; keys are unique, so the stable sort would
+    # reproduce that order and only cost a full copy.
+    if not _is_symbol_date_sorted(p):
+        p = p.sort_values(["symbol", "date"], kind="stable")
+    p = p.reset_index(drop=True)
     for c in ("open", "close", "prev_close", "volume", "inst_netbuy", "foreign_netbuy"):
         p[c] = pd.to_numeric(p[c], errors="coerce").astype("float64")
+    if keys is None:
+        keep = np.ones(len(p), dtype=bool)
+    else:
+        wanted = pd.MultiIndex.from_arrays([pd.to_datetime(keys["date"]), keys["symbol"].astype(str)])
+        keep = pd.MultiIndex.from_arrays([p["date"], p["symbol"]]).isin(wanted)
     # Integer group codes (first-appearance order, same partition as the symbols) avoid re-hashing
     # millions of strings in every grouped rolling call.
-    codes = pd.factorize(p["symbol"])[0].astype(np.float64)
-    codes[codes < 0] = np.nan  # missing symbols stay dropped by groupby, exactly as with string keys
-    labels = pd.Series(codes, index=p.index)
+    labels = pd.Series(group_codes(p["symbol"]), index=p.index)
     op = p["open"].to_numpy()
     cl = p["close"].to_numpy()
     pc = p["prev_close"].to_numpy()
@@ -150,48 +172,63 @@ def compute_topk_history_features(panel: pd.DataFrame) -> pd.DataFrame:
     on = pd.Series(np.where(on_ok, op / np.where(pc > 0, pc, 1.0) - 1.0, np.nan), index=p.index)
     id_ok = np.isfinite(op) & np.isfinite(cl) & (op > 0) & (cl > 0)
     idr = pd.Series(np.where(id_ok, cl / np.where(op > 0, op, 1.0) - 1.0, np.nan), index=p.index)
+    del op, cl, pc, on_ok, id_ok
+
+    def _g(s: pd.Series) -> pd.core.groupby.SeriesGroupBy:
+        return s.groupby(labels.to_numpy(), sort=False)
+
+    # Only the selected rows are kept per feature; full-length intermediates are dropped as soon as used.
+    feats: dict[str, np.ndarray] = {}
+
+    def _emit(name: str, values: pd.Series | np.ndarray) -> None:
+        kept = np.asarray(values, dtype=np.float64)[keep]
+        feats[name] = np.where(np.isinf(kept), np.nan, kept)
+
+    _emit("f_ret5", _lag_roll(lr, labels, 5, "sum"))
+    _emit("f_ret20", _lag_roll(lr, labels, 20, "sum"))
+    _emit("f_ret60", _lag_roll(lr, labels, 60, "sum"))
+    # 누적 로그수익 지수의 60일 고점 대비 거리 (시작점 무관)
+    idx = _g(lr).cumsum()
+    _emit("f_dist_high60", np.expm1(idx - _group_rolling(idx, labels, 60, 20, "max")))
+    del idx
+    up = (r >= UP_DAY_THRESHOLD).astype("float64")
+    up_sum = _group_rolling(_g(up).shift(1), labels, 20, 5, "sum")
+    del up
+    valid = _lag_roll(lr, labels, 20, "count")
+    del lr
+    _emit("f_upcount20", up_sum.where(valid.notna()))
+    del up_sum, valid
+    _emit("f_on_mean20", _lag_roll(on, labels, 20, "mean"))
+    _emit("f_on_mean60", _lag_roll(on, labels, 60, "mean"))
+    # 과거 상승일(s<=t-1) 다음날 시가갭: s+1<=t 이므로 결정시점에 이미 관측됨
+    cond = _g(on).shift(-1).where(r >= UP_DAY_THRESHOLD)
+    del r
+    cond_lag = _g(cond).shift(1)
+    del cond
+    cmean = _group_rolling(cond_lag, labels, 60, 1, "mean")
+    ccnt = _group_rolling(cond_lag, labels, 60, 1, "count")
+    del cond_lag
+    _emit("f_upnext_on60", cmean.where(ccnt >= MIN_CONDITIONAL_OBS))
+    del cmean, ccnt
+    _emit("f_gap", on)
+    del on
+    _emit("f_id_mean20", _lag_roll(idr, labels, 20, "mean"))
+    del idr
     # 순매수 금액 분모는 당시 실거래 금액이므로 원가격을 쓰고, 라이브 행(close_raw 없음)은 원가격 그대로인 close 로 폴백한다.
     level = (
         pd.to_numeric(p["close_raw"], errors="coerce").astype("float64").fillna(p["close"])
         if "close_raw" in p.columns
         else p["close"]
     )
-    val = level * p["volume"]
-
-    def _g(s: pd.Series) -> pd.core.groupby.SeriesGroupBy:
-        return s.groupby(labels.to_numpy(), sort=False)
-
-    out = p[["date", "symbol"]].copy()
-    out["f_ret5"] = _lag_roll(lr, labels, 5, "sum")
-    out["f_ret20"] = _lag_roll(lr, labels, 20, "sum")
-    out["f_ret60"] = _lag_roll(lr, labels, 60, "sum")
-    # 누적 로그수익 지수의 60일 고점 대비 거리 (시작점 무관)
-    idx = _g(lr).cumsum()
-    out["f_dist_high60"] = np.expm1(idx - _group_rolling(idx, labels, 60, 20, "max"))
-    up = (r >= UP_DAY_THRESHOLD).astype("float64")
-    up_sum = _group_rolling(_g(up).shift(1), labels, 20, 5, "sum")
-    valid = _lag_roll(lr, labels, 20, "count")
-    out["f_upcount20"] = up_sum.where(valid.notna())
-    out["f_on_mean20"] = _lag_roll(on, labels, 20, "mean")
-    out["f_on_mean60"] = _lag_roll(on, labels, 60, "mean")
-    # 과거 상승일(s<=t-1) 다음날 시가갭: s+1<=t 이므로 결정시점에 이미 관측됨
-    cond = _g(on).shift(-1).where(r >= UP_DAY_THRESHOLD)
-    cond_lag = _g(cond).shift(1)
-    cmean = _group_rolling(cond_lag, labels, 60, 1, "mean")
-    ccnt = _group_rolling(cond_lag, labels, 60, 1, "count")
-    out["f_upnext_on60"] = cmean.where(ccnt >= MIN_CONDITIONAL_OBS)
-    out["f_gap"] = on
-    out["f_id_mean20"] = _lag_roll(idr, labels, 20, "mean")
     # 5일 순매수 금액 / 5일 거래금액, 당일 제외 [t-5,t-1] 확정치만 사용(2026-09-15 룩어헤드 수정)
-    den = _lag_roll(val, labels, 5, "sum").replace(0.0, np.nan)
-    out["f_inst_cum5"] = (_lag_roll(p["inst_netbuy"], labels, 5, "sum") / den).clip(-1.0, 1.0)
-    out["f_foreign_cum5"] = (_lag_roll(p["foreign_netbuy"], labels, 5, "sum") / den).clip(-1.0, 1.0)
-    cols = list(TOPK_HISTORY_FEATURE_COLS)
-    # Column-wise: a frame-wide replace materializes a second copy of every feature column.
-    for c in cols:
-        values = out[c].to_numpy(dtype=np.float64)
-        out[c] = np.where(np.isinf(values), np.nan, values)
-    return out[["date", "symbol", *cols]]
+    den = _lag_roll(level * p["volume"], labels, 5, "sum").replace(0.0, np.nan)
+    del level
+    _emit("f_inst_cum5", (_lag_roll(p["inst_netbuy"], labels, 5, "sum") / den).clip(-1.0, 1.0))
+    _emit("f_foreign_cum5", (_lag_roll(p["foreign_netbuy"], labels, 5, "sum") / den).clip(-1.0, 1.0))
+    out = p.loc[keep, ["date", "symbol"]]
+    for c in TOPK_HISTORY_FEATURE_COLS:
+        out[c] = feats[c]
+    return out[["date", "symbol", *TOPK_HISTORY_FEATURE_COLS]]
 
 
 def attach_topk_features(cands: pd.DataFrame, panel: pd.DataFrame) -> pd.DataFrame:
@@ -213,10 +250,10 @@ def attach_topk_features(cands: pd.DataFrame, panel: pd.DataFrame) -> pd.DataFra
     missing = [c for c in ("date", "symbol", "close", "tick_cost_bp") if c not in cands.columns]
     if missing:
         raise ValueError(f"cands missing required columns: {missing}")
-    hist = compute_topk_history_features(panel)
     out = cands.copy()
     out["date"] = pd.to_datetime(out["date"])
     out["symbol"] = out["symbol"].astype(str)
+    hist = compute_topk_history_features(panel, keys=out[["date", "symbol"]])
     merged = out.merge(hist, on=["date", "symbol"], how="left", validate="many_to_one")
     # left merge 는 행 순서를 보존하므로 원 인덱스를 그대로 복원한다 (sel_mask 위치 정합)
     merged.index = cands.index

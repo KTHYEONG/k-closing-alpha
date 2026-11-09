@@ -22,6 +22,7 @@ from src.strategy.contract import (
     detect_mixed_unit_rows,
     mark_ceiling,
 )
+from src.utils.frame_codes import group_codes, shared_object_values
 
 __all__ = [
     "PANEL_INTEGRITY_COLUMNS",
@@ -132,7 +133,7 @@ def prepare_price_panel(
 
     dates = pd.to_datetime(out[date_col], errors="coerce").to_numpy()
     if market_col in out.columns:
-        market_values = out[market_col].astype(str).to_numpy(dtype=object)
+        market_values = shared_object_values(out[market_col].astype(str))
     else:
         # UNKNOWN은 KOSPI 밴드로 해석되어 보수적 틱을 준다.
         market_values = np.full(len(out), "UNKNOWN", dtype=object)
@@ -144,8 +145,8 @@ def prepare_price_panel(
 
     # --- provenance (입력 프레임 기준, 정렬 불변) ---
     n_input = len(price_history_df)
-    sym = out[symbol_col].to_numpy()
-    n_symbols = int(pd.Series(sym).nunique()) if len(out) else 0
+    sym_codes = group_codes(out[symbol_col])
+    n_symbols = int(pd.Series(sym_codes).nunique()) if len(out) else 0
     dts = pd.to_datetime(out[date_col], errors="coerce")
     n_days = int(dts.nunique()) if len(out) else 0
     if len(out) and dts.notna().any():
@@ -178,7 +179,7 @@ def prepare_price_panel(
     n_ceiling = int(np.asarray(out["is_ceiling"].to_numpy(dtype=bool)).sum())
     if len(out) and dts.notna().any():
         panel_max = dts.max()
-        per_sym_max = dts.groupby(pd.Series(sym).to_numpy()).max()
+        per_sym_max = dts.groupby(sym_codes).max()
         n_symbols_absent_at_end = int((per_sym_max < panel_max).sum())
     else:
         n_symbols_absent_at_end = 0

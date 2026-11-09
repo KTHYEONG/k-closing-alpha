@@ -29,7 +29,6 @@ from src.ml.research.pit_certification import (
     attach_eod_labels,
     select_usable_panel_days,
 )
-from src.ml.research.v3_engine import FORWARD_EXIT_MAX_DAYS
 from src.ml.retrain_gate import RETRAIN_GATE_EVAL_DAYS
 from src.ml.topk_contract import (
     FEATURE_CONTRACT_VERSION_KEY,
@@ -51,6 +50,7 @@ from src.ml.topk_ranker_research import (
 from src.strategy.contract import MIN_TOP_K, PRODUCTION_STRATEGY, StrategySpec, training_universe
 from src.strategy.store import StrategyStoreError, require_production_store
 from src.utils.cli_logging import configure_cli_logging
+from src.utils.memory import release_free_memory
 
 logger = logging.getLogger(__name__)
 
@@ -227,12 +227,9 @@ def build_core_training_frame(
     store_start = pd.Timestamp(store_norm["date"].min()).normalize()
 
     pool, _sel_mask = build_dual_pool(
-        _pool_source_rows(ph, market_dates, d_to_idx, store_start),
-        market_dates,
-        d_to_idx,
-        train_spec=training_universe(spec.universe),
-        select_spec=spec.universe,
+        ph, market_dates, d_to_idx, train_spec=training_universe(spec.universe), select_spec=spec.universe
     )
+    release_free_memory()  # the pool's full-panel feature intermediates are gone
     pool = demean_label_by_date(attach_pit_net_label(pool, cost=spec.cost), label_clip=label_clip)
     pool = _normalize_keys(pool)
     eod_cols = ["date", "symbol", *RANKER_FEATURE_COLS, "net_pit", "train_label", "exit_date"]
@@ -248,24 +245,13 @@ def build_core_training_frame(
         how="inner",
         validate="one_to_one",
     )
+    release_free_memory()
     history = core_history_features(raw_history)
     store_part = store_part.merge(history, on=["date", "symbol"], how="left", validate="one_to_one")
 
     frame = pd.concat([eod_rows, store_part], ignore_index=True)
     frame = attach_lagged_index(frame, index_table_from_price_history(ph))
     return frame[["date", "symbol", "tier", *PIT_CORE_FEATURE_COLS, "net_pit", "train_label", "exit_date"]]
-
-
-def _pool_source_rows(
-    ph: pd.DataFrame, market_dates: np.ndarray, d_to_idx: dict[pd.Timestamp, int], store_start: pd.Timestamp
-) -> pd.DataFrame:
-    # Only pool rows before the store survive, and their features and exits read at most
-    # FORWARD_EXIT_MAX_DAYS trading days past the last such date, so later rows are pure peak memory.
-    before = int(np.searchsorted(market_dates, np.datetime64(store_start), side="left"))
-    if before == 0:
-        return ph.iloc[:0]
-    cut_idx = min(before - 1 + FORWARD_EXIT_MAX_DAYS, len(market_dates) - 1)
-    return ph[ph["date"] <= market_dates[cut_idx]]
 
 
 def train_core_bundle(

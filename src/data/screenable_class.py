@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
+from src.utils.frame_codes import shared_object_values
+
 if TYPE_CHECKING:
     from src.strategy.contract import UniverseSpec
 
@@ -248,7 +250,10 @@ def attach_screenable_class(
         bad = panel_dates[pos < 0].drop_duplicates().head(3).dt.strftime("%Y-%m-%d").tolist()
         raise ValueError(f"panel dates not in market_dates: {bad}")
     has_asof = pos > 0
-    asof_dates = pd.DatetimeIndex([cal[i - 1] if i > 0 else pd.NaT for i in pos])
+    # Vectorized previous-session lookup: a per-row Timestamp list costs ~1 GB on the full panel.
+    asof_values = cal.to_numpy()[np.where(has_asof, pos - 1, 0)]
+    asof_values[~has_asof] = np.datetime64("NaT")
+    asof_dates = pd.DatetimeIndex(asof_values)
     class_dates = pd.to_datetime(classification["date"]).dt.normalize()
     coverage_start = class_dates.min()
     coverage_end = class_dates.max()
@@ -268,7 +273,7 @@ def attach_screenable_class(
     real_idx = np.flatnonzero(is_real)
     if len(real_idx):
         class_date_set = set(pd.DatetimeIndex(class_dates.unique()))
-        need = sorted({asof_dates[i] for i in real_idx.tolist()})
+        need = sorted(asof_dates[real_idx].unique())
         missing = [d for d in need if d not in class_date_set]
         if missing:
             first = [pd.Timestamp(d).strftime("%Y-%m-%d") for d in missing[:3]]
@@ -278,11 +283,11 @@ def attach_screenable_class(
     verdict = np.zeros(n, dtype=bool)
     source = np.full(n, ScreenableSource.PROXY.value, dtype=object)
     n_real_absent = 0
-    syms = panel[symbol_col].astype(str).to_numpy()
+    syms = shared_object_values(panel[symbol_col].astype(str))
     if len(real_idx):
         right = pd.DataFrame({
             "_cdate": pd.to_datetime(classification["date"]).dt.normalize().to_numpy(),
-            "_csym": classification["symbol"].astype(str).to_numpy(),
+            "_csym": shared_object_values(classification["symbol"].astype(str)),
             "_cflag": classification["is_screenable"].astype(bool).to_numpy(),
         })
         index = right.set_index(["_cdate", "_csym"])["_cflag"]
