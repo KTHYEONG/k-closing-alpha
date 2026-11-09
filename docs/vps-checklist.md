@@ -45,7 +45,7 @@
 | **E** post-decision (mandatory) | business day 15:45–16:30 | entry chain ends 15:45; the archive row is still the decision snapshot | `kca_probe E` | R01 R02 C01 C05 C12 C13 C14 Q01 P01 P03 P04 P06 A01 A03 X01 |
 | **L** liveness (optional) | 16:30–19:50 | aftermarket-book is the only long live capture (runs to ~19:59) | §5.2 `R06` | R06 |
 | **N** evening (mandatory; M re-checks if missed) | business day 21:50–22:10 | archive 20:05, tape 20:35, prune 21:00 and audit 21:20 are done; must finish before the 22:15 backup takes the Drive lock | `kca_probe N` | R01 R03 C03 C04 C06 C08 C13 C15 C11 Q06 Q07 Q08 Q09 Q10 B05 A01 A03 X01 |
-| **W** weekly (mandatory) | Monday 07:30–08:20, after M | Sat 22:00 retrain, Sun 10:00 snapshot, Sun 11:00 verify | `kca_probe W` + §5.1 local | H02 H03 H04 R04 B07 B08 Q11 A05 |
+| **W** weekly (mandatory) | Monday 07:30–08:20, after M | Sat 22:00 retrain, Sun 10:00 snapshot, Sun 11:00 verify | `kca_probe W` + §5.1 local | H02 H03 H04 R04 P08 B07 B08 Q11 A05 |
 | **Ev** event | after a deploy/alert/incident | parity of what changed | H02 H04 + affected rows | — |
 
 On a CLOSED weekday every probe prints `ALL SKIP(non_trading_day)` for D=today. M/W automatically audit the previous trading day.
@@ -101,7 +101,7 @@ Weekday timers also fire on weekday holidays; jobs self-skip through `resolve_se
 | altdata-capture (optional) | Mon–Fri 21:35 | `src/daily/altdata_capture.py:main` :137 | `history/altdata/*`, `_manifest.json` | panels `status=ok` | 22:05 | MED |
 | backup (host, `flock -w 7200` Drive lock; OnSuccess=audit-reconcile) P | **daily** 22:15 | `src/tools/offsite_backup.py:363-546` | `capture_sealed/<tier>/<YYYY-MM>/<D>/seg-<sha16>.tar.zst` (immutable, md5), `rclone copy data/ artifacts/` (backup-dir `_deleted/<sub>/<day>`), ledger `capture/offsite/ledger/<tier>/<D>.jsonl` | `last_run.json status=ok`; `stage=offsite_backup status=ok`; **no outcome** | 01:00 (`deadline_at`) | HIGH |
 | extended-backfill (bulk, batch) | daily 23:05 | `src/backfill/intraday/extended_session_backfill.py:main` :1350 | past-date partitions, `backfill_ledger/extended_sessions.parquet`, `1m_kis_adjusted`, raw for old trade dates | outcome `OK`, `status=DONE tasks_remaining=0 pending_conflicts=0` | 07:05 | MED |
-| retrain (6g/1.8 cpu) P | Sat 22:00 | `src/ml/retrain.py --train-ranker-bundle` | `artifacts/models/topk_ranker/retrain_registry.jsonl` | registry `PROMOTED\|PROMOTED_UNGATED` | Sun 00:00 | LOW |
+| retrain (6g/1.8 cpu) P | Sat 22:00 | `src/ml/retrain.py --train-core-bundle` (PIT-CORE: extends `data/history/pit_train/rows/` then trains) | `artifacts/models/topk_ranker/retrain_registry.jsonl`, new `pit_train/rows/<D>.parquet` | registry `PROMOTED\|PROMOTED_UNGATED`, `stage=pit_store extend days_written=` | Sun 00:00 | LOW |
 | core-snapshot (host, Drive lock) P | Sun 10:00 | `src/tools/core_snapshot.py` | `snapshots/<D>/` (price_history, archive, topk, rank_pool, paper/*, bundle) | `stage=core_snapshot … status=ok` | Sun 12:00 | MED |
 | offsite-verify (host, Drive lock) P | Sun 11:00 | `src/tools/capture_offsite.py verify` :1268-1468 | drill staging removed after | `missing=0 mismatched=0`, 3 `restore_drill … status=OK` | Sun 13:00 | HIGH |
 | kca-alert@ (host) | OnFailure of every kca unit (+ `krx-deferred-recreate`, `krx-host-backup`, `vps-image-gc`, `crypto-pilot-*`, `kse-alert@*`) | `src/tools/alerts.py` + `alert_policy.py` | CRITICAL: one page per kind/day (`incidents.json`), outbox; SILENT/DEFERRED: `logs/alerts/silent/<D>.jsonl` | `stage=alert unit=<unit> status=SILENT\|DEFERRED\|SENT\|DEDUPED`, `Finished kca-alert@<unit>` | +5 min | MED |
@@ -121,7 +121,7 @@ Optional timers (`OPTIONAL_MANUAL_TIMERS`, `src/tools/code_sync.py:35-37`): auct
 | R01 | EXT | M O E N | each unit due in the window has ≥1 `Finished` since its slot (optional timers only if enabled); a `Failed with result` followed by a Finished rerun is WARN | P1 (decision chain P0) | `journalctl --user -u kca-<u> --since <UTC>` |
 | R02 | EXT | M O E | outcome per job ∈ allowed set: price_ingest OK; order_exit OK/SKIPPED(no_open_positions\|trading_disabled); order_reconcile_exit OK/SKIPPED(no_orders); predict OK; order_entry OK; finalize_close OK; order_reconcile_entry OK; extended_backfill OK | P1 (decision P0) | `events/<YYYY-MM>/<D>.jsonl` |
 | R03 | EXT | M N | lists DEGRADED/NO_DECISION outcomes of D (WARN; each must map to an alert/known condition). `auction_path DEGRADED` is research (P2). A DEGRADED `extended_backfill` is actionable (transient outage, conflict); deterministic gaps show only as `deterministic_failed/exhausted` counts | P2 | outcome `reason`/metrics |
-| R04 | EXT | W | last registry row `PROMOTED\|PROMOTED_UNGATED\|MANUAL_HOTFIX` ≤ 8 d old and the live `model_version` is in the registry. A `strategy or screen changed vs live bundle` REJECTED fails the unit by design: the operator certifies and reruns with `--skip-promotion-gate`; auto-remediation never reruns retrain | P1 | `journalctl -u kca-retrain` |
+| R04 | EXT | W | last registry row `PROMOTED\|PROMOTED_UNGATED\|MANUAL_HOTFIX` ≤ 8 d old and the live `model_version` is in the registry. A `strategy or screen changed vs live bundle` REJECTED fails the unit by design: the operator certifies and reruns with `--skip-promotion-gate`; auto-remediation never reruns retrain. PIT-CORE freshness: `strategy_id == KCA-TOPK-COSTAWARE-002`; `pit_train/rows` newest day and the registry `training_cutoff` both ≥ the trading day 6 sessions before today (FAIL: a silent `days_written=0 reason=no_usable_days` still trains on the stale store); the last Sat run has a `stage=pit_store extend` line (WARN absent); WARN on `oom\|exit code 137\|Killed` in the retrain journal (6 GB container; measured peak 3.1 GB on 2026-11-09) | P1 | `journalctl -u kca-retrain` |
 | R05 | EXT | M | today 07:05: ≥7 distinct `slot=… issued=True` (DATA_n, PRIMARY, TRADING_MOCK) and the Kiwoom rotate status line; CLOSED day → `non_trading_day` skip | P1 | warmup journal |
 | R06 | EXT | L | `kca-aftermarket-book` active with container `kca-aftermarket-book` up between 15:40 and 19:59; ~92 % of its 4 h 40 min timeout is normal | P1 | §5.2 `R06` |
 | C01 | CORE | E M | §1 | P0 | collect journal `stage=realtime_quote/requote` |
@@ -157,6 +157,7 @@ Optional timers (`OPTIONAL_MANUAL_TIMERS`, `src/tools/code_sync.py:35-37`): auct
 | P03 | CORE | O E M | §1 | P0 | §5.2 `P-ledger` |
 | P04 | CORE | E M | §1 | P0 | `topk_decisions.parquet` |
 | P06 | CORE | O E | §1. Entry reconcile `n_intents` counts exit + entry intents for the day (e.g. 6 for 3 picks). A stuck UNKNOWN intent is operator-only (`src.daily.order_resolve`, dry-run first) | P0 | `data/orders/<env>/journal.jsonl` |
+| P08 | EXT | W | Live edge vs backtest: per-trade mean `net_ret` from `paper/trades.parquet` over the last 20 and 60 exit days (`exit_filled_at`), against the backtest expectation ≈ +36 bp/trade (PIT-CORE K3, 2-tick cost). WARN when the 60-day mean ≤ 0 or the 20-day mean < −50 bp (with ≥ 30 trades); never FAIL (single-trade sd is several %). Also reports win rate and mean cost | P2 | `paper/trades.parquet` |
 | P07 | EXT | E (manual) | paper entry symbols == order-journal entry intent symbols for D (same top-k) | P1 | journal `kind=intent` payload |
 | A01 | EXT | all | heartbeat `schema_version 2`, `undelivered_alerts 0`, `reconciled_at` ≤ 15 min (07:00–23:05), `snapshot_date == D` after 21:30 (N) and in M; WARN on open issues | P1 | `cat logs/heartbeat/*.json`, `tail remediation/ledger.jsonl` |
 | A02 | EXT | M | digest `logs/audit_digests/<D>.txt` line 1 `[kca] 🟢 <D> 일일점검 완료`; open issue keys each map to a finding; remediation rows `started` without `resolved/unresolved` are in flight; `unresolved/skipped_budget` need the operator; no forbidden unit (collect, predict, finalize, paper-*, aftermarket-book, auction-*, retrain, daily-audit, kiwoom-rotate) in the ledger | P1 | `head -1 audit_digests/<D>.txt` |
@@ -847,7 +848,30 @@ def _():
     t = pd.read_parquet(ROOT / "parquet/topk_decisions.parquet", columns=["decided_at", "model_version"])
     mv = str(t.sort_values("decided_at")["model_version"].iloc[-1])
     known = any(str(r.get("trained_at", "")) and str(r["trained_at"]) in mv for r in reg)
-    out("R04", lv(last["outcome"] not in ("PROMOTED", "PROMOTED_UNGATED", "MANUAL_HOTFIX") or not known, age > 8 or last["outcome"] == "MANUAL_HOTFIX"), last=last["outcome"], age_days=age, agreement=last.get("agreement"), live_model_in_registry=known)
+    floor = TODAY
+    for _ in range(6):
+        floor = prev_td(floor)
+    rows = sorted(p.stem for p in (ROOT / "history/pit_train/rows").glob("*.parquet"))
+    store_max = rows[-1] if rows else "-"
+    cutoff = str(last.get("training_cutoff", ""))[:10]
+    ext = jr("retrain", at(sat, "21:59:00"), at(sun, "06:00:00"), r"stage=pit_store extend")
+    oom = jr("retrain", at(sat, "21:59:00"), at(sun, "06:00:00"), r"(?i)oom|exit code 137|killed")
+    stale = store_max < str(floor) or cutoff < str(floor) or last.get("strategy_id") != "KCA-TOPK-COSTAWARE-002"
+    out("R04", lv(last["outcome"] not in ("PROMOTED", "PROMOTED_UNGATED", "MANUAL_HOTFIX") or not known or stale, age > 8 or last["outcome"] == "MANUAL_HOTFIX" or not ext or bool(oom)),
+        last=last["outcome"], age_days=age, agreement=last.get("agreement"), live_model_in_registry=known, strategy=last.get("strategy_id"),
+        store_max=store_max, cutoff=cutoff, floor=floor, extend=(ext[-1].split("extend")[-1][:40] if ext else "absent"), oom_lines=len(oom))
+@check("P08")
+def _():
+    tr = pd.read_parquet(ROOT / "paper/trades.parquet", columns=["exit_filled_at", "net_ret", "cost"])
+    tr["d"] = pd.to_datetime(tr["exit_filled_at"], utc=True).dt.tz_convert(KST).dt.date
+    days = sorted(tr["d"].unique())
+    def win(n):
+        t = tr[tr["d"].isin(days[-n:])]
+        return len(t), (float(t["net_ret"].mean()) * 1e4 if len(t) else float("nan")), (float((t["net_ret"] > 0).mean()) if len(t) else float("nan"))
+    n20, m20, w20 = win(20)
+    n60, m60, w60 = win(60)
+    out("P08", lv(False, (n60 >= 30 and m60 <= 0) or (n20 >= 30 and m20 < -50)), expect_bp=36,
+        n20=n20, mean20_bp=round(m20, 1), win20=round(w20, 2), n60=n60, mean60_bp=round(m60, 1), win60=round(w60, 2), mean_cost=round(float(tr["cost"].tail(60).mean()), 0))
 @check("B07")
 def _():
     v = jr("offsite-verify", at(sun, "10:59:00"), at(sun, "23:59:00"), r"stage=(offsite_verify|restore_drill)|finding=")
@@ -936,6 +960,7 @@ Baselines (trailing rule: compare with the prev-5 trading-day median, never with
 Known conditions:
 | Since | Condition | Expected verdict while open | Re-check / expiry | Close when |
 |---|---|---|---|---|
+| 2026-11-09 | PIT-CORE switch (`KCA-TOPK-COSTAWARE-002`, bundle `9dea1ec206ff`, cutoff 11-05, store 905 days; rollback copy `artifacts/models/_rollback/topk_ranker_A_20261109/`). First live decision 11-10 15:21: P04 shows the new `model_version`; first CORE retrain Sat 11-14 22:00 | R04 PASS from W 11-16 with `store_max`/`cutoff` ≥ 11-13; P08 n small until ~12-08 | 2026-11-16 | W 11-16 PASS |
 | 2026-11-05 | CLOSED: extended-backfill reached `status=DONE tasks_remaining=0 complete=47611` on the 11-04 23:05 run (00:51) | — | — | — |
 | 2026-11-04 | (closed 11-05, see above) Direction-free PIT superset (`d6abd78`): extended-backfill drains ~40 k new KIS symbol-days over several nights and stops at 06:50 | R02/R03 WARN `tasks_remaining>0` on the 23:05 run | 2026-11-12 | `status=DONE tasks_remaining=0` again |
 | 2026-11-05 | Toss manual backfill finished `status=DONE tasks_done=927 tasks_remaining=0`, but `failed=6771` rows remain: one rerun for FAILED rows is still open (needs the Toss token: not run by the ops audit) | Q11 lists `toss_regular` FAILED rows | 2026-11-06 | rerun done and Q11 clean |
