@@ -273,9 +273,16 @@ def manifest_status(d, prefix, research=False):
         st = {f.name[9:-5] for f in run.glob("manifest-*.json")}
         res[run.name] = "complete" if "complete" in st else ("partial" if "partial" in st else ("pending" if st else "none"))
     return res
+OPEN_STATUSES = {"FAILED", "PARTIAL", "UNKNOWN"}
 def failed_entries(d, run):
     m = json.loads((CAP / f"manifests/{d}/{run}/manifest-partial.json").read_text())
-    return sum(e.get("status") != "COMPLETE" for e in m.get("entries", []))
+    return sum(e.get("status") in OPEN_STATUSES for e in m.get("entries", []))
+def failed_symbols(d, run):
+    m = json.loads((CAP / f"manifests/{d}/{run}/manifest-partial.json").read_text())
+    return {e.get("symbol") for e in m.get("entries", []) if e.get("status") in OPEN_STATUSES}
+def open_symbols(d, run, session):
+    healed = {e.get("symbol") for f in (CAP / f"manifests/{d}").glob(f"tape-{d}-{session}-*/manifest-*.json") for e in json.loads(f.read_text()).get("entries", []) if e.get("status") in ("COMPLETE", "NO_TRADES")}
+    return len(failed_symbols(d, run) - healed)
 def manifest_entries(d, run):
     for f in sorted((CAP / f"manifests/{d}/{run}").glob("manifest-*.json")):
         return json.loads(f.read_text())
@@ -306,19 +313,17 @@ def c_manifests_live(d):
     @check("C04")
     def _():
         streams = ["regular-bars", "regular-ticks", "nxt-premarket-bars", "nxt-aftermarket-bars", "krx-aftermarket-bars", "krx-aftermarket-ticks", "nxt-aftermarket-ticks"]
-        tape = manifest_status(d, f"tape-{d}-")
         res, fail, warn = {}, [], []
         for s in streams:
             st = manifest_status(d, f"archive-{d}-{s}-")
             best = "complete" if "complete" in st.values() else ("partial" if "partial" in st.values() else "missing")
-            if best == "partial" and s.endswith("ticks"):
-                sess = s[: -len("-ticks")].replace("-", "_")
-                if any(k.startswith(f"tape-{d}-{sess}-") and v == "complete" for k, v in tape.items()):
-                    best = "tape_healed"
             if best == "partial":
                 run = [k for k, v in st.items() if v == "partial"][-1]
-                best = f"partial({failed_entries(d, run)}failed)"
-                warn.append(s)
+                tick = s.endswith("ticks")
+                opened = open_symbols(d, run, s[: -len("-ticks")].replace("-", "_")) if tick else len(failed_symbols(d, run))
+                best = "tape_healed" if tick and opened == 0 else f"partial({failed_entries(d, run)}failed,{opened}open)"
+                if best != "tape_healed":
+                    warn.append(s)
             if best == "missing":
                 fail.append(s)
             res[s] = best
@@ -893,7 +898,7 @@ def _():
 |---|---|---|---|
 | `C01 FAIL coverage<0.99` | KIS decision slots throttled (`EGW00201`) or requote deadline `152800` hit | `collect.py:201,954,1309`; slots 1/5 (`kis_slot_assignments.toml`) | slot contention vs krx; requote budget |
 | `C03 WARN partial` / `INCOMPLETE held_roster_unavailable` | aftermarket roster missing or `slot_token_failed` (slots 2/3) | `aftermarket_book.py:589-673` | token/slot health at 15:40 |
-| `C04 partial(n failed)` on ticks, no tape_healed | vendor_failure in the evening archive; tape sweep not yet published | `archive_intraday.py:292-372`; `tick_tape_sweep.py` | check C08; the tape horizon is 30 d |
+| `C04 partial(n failed)` on ticks, no tape_healed | vendor_failure in the evening archive; tape sweep not yet published | `archive_intraday.py:292-372`; `tick_tape_sweep.py` | read `open` (holes not yet filled by a tape manifest), not `failed`, and check C08; the cause lives in the raw pages' `return_code` (see `kiwoom_tick_vendor_failure_retry_spec.md`); the tape horizon is 30 d |
 | `C07 FAIL stale` / `R01 price-ingest failed` | KRX `data-dbg.krx.co.kr` read timeout (10-30, 11-03); the strict fetch now retries ~10 min per endpoint (`PRICE_INGEST_KRX_RETRY`), then the unit fails SILENTLY (no OnFailure mail) and is auto-rerun after the 09:40 blackout | remediation ledger `failed_unit:kca-price-ingest`; `logs/alerts/silent/<D>.jsonl` | expected once; the only page is `stale_panel` after the 11:30 safety run; repeat = KRX outage |
 | `C08 WARN expiring>0` | Kiwoom tape needs ≤3 d from the 30-d depth | `config/collection.py:125-130`; `market_session.py:85-87` | auto `intraday:tape_expiring:` rerun of tape-sweep; else manual |
 | `C11 missing=[intraday_complete]` | blocking `intraday:*` issues in the D audit | daily-audit journal `step=intraday_complete status=FAIL` | the issue keys name the session/symbol |
