@@ -100,7 +100,7 @@ class ModelConfig:
         embargo_days: Trading days between the last resolved training label and the block start.
         min_train_days: Distinct training dates required before a block is evaluated.
         model_params: LightGBM parameters (None = the strategy store ranker parameters).
-        seeds: Seed ensemble (None = the strategy store seeds).
+        seeds: Seed ensemble (None = the strategy store seeds). Fitting refuses the public example store.
         huber_delta: Huber alpha.
         extra_features: Dataset columns appended to the feature set (e.g. intraday path features).
         objective: OBJECTIVES member; huber regresses the demeaned label, lambdarank ranks within each date on
@@ -502,9 +502,10 @@ def default_fit_fn(config: ModelConfig) -> Callable[[pd.DataFrame, list[str]], A
 
     from src.ml.bundle import SeedEnsembleModel, fit_seed_ensemble
     from src.ml.oof import _finite_nan
-    from src.strategy.store import strategy_values
+    from src.strategy.store import require_production_store
 
-    values = strategy_values()
+    # Research results are compared against the deployed strategy, so placeholder values must never fit a model.
+    values = require_production_store()
     params = dict(config.model_params) if config.model_params is not None else dict(values.ranker_model_params)
     seeds = tuple(config.seeds) if config.seeds is not None else tuple(values.ranker_seeds)
 
@@ -717,6 +718,7 @@ def build_dataset(  # pragma: no cover - multi-year store orchestration, exercis
     recovered_keys: frozenset[tuple[str, str]],
     min_day_coverage: float,
     eod_until: pd.Timestamp,
+    spec: Any = None,
 ) -> pd.DataFrame:
     """Assemble 15:20 rows (serving features, tiered) and EOD rows (pre-panel and full, for training arms).
 
@@ -726,6 +728,7 @@ def build_dataset(  # pragma: no cover - multi-year store orchestration, exercis
         recovered_keys: (YYYY-MM-DD, symbol) symbol-days whose bars came from the off-session recovery.
         min_day_coverage: Bar days need superset_coverage at least this.
         eod_until: EOD rows dated on/after this are tagged eod but used only by the eod_all train source.
+        spec: Strategy whose screen defines the rank pool (None = PRODUCTION_STRATEGY); research only.
 
     Returns:
         Frame with date, symbol, tier, RANKER_FEATURE_COLS, index lag columns, net_pit, train_label, exit_date.
@@ -746,10 +749,10 @@ def build_dataset(  # pragma: no cover - multi-year store orchestration, exercis
         demean_label_by_date,
     )
     from src.strategy.contract import PRODUCTION_STRATEGY, training_universe
-    from src.strategy.store import strategy_values
+    from src.strategy.store import require_production_store
 
-    spec = PRODUCTION_STRATEGY
-    clip = float(strategy_values().label_clip)
+    spec = PRODUCTION_STRATEGY if spec is None else spec
+    clip = float(require_production_store().label_clip)
     ph, market_dates, d_to_idx = load_and_prepare_price_history(settings.PRICE_HISTORY_PARQUET_PATH)
     pool, sel_mask = build_dual_pool(
         ph, market_dates, d_to_idx, train_spec=training_universe(spec.universe), select_spec=spec.universe

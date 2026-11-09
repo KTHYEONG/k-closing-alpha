@@ -430,3 +430,16 @@ def test_default_fit_fn_lambdarank_orders_by_the_signal() -> None:
     model = wf.default_fit_fn(cfg)(train, ["x"])
     pred = model.predict(pd.DataFrame({"x": [-2.0, 0.0, 2.0]}))
     assert pred[0] < pred[1] < pred[2]
+
+
+def test_default_fit_fn_refuses_the_public_example_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.strategy import store
+
+    monkeypatch.setenv("KCA_STRATEGY_STORE", str(store.EXAMPLE_STORE_ROOT))
+    store.strategy_values.cache_clear()
+    try:
+        with pytest.raises(store.StrategyStoreError, match="private strategy store required"):
+            wf.default_fit_fn(wf.ModelConfig())
+    finally:
+        monkeypatch.undo()
+        store.strategy_values.cache_clear()
