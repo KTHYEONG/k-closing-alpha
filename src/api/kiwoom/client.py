@@ -8,7 +8,9 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal
+
+from aiohttp import ClientError
 
 from src.api._common import SEOUL_TZ, deadline_remaining, now_seoul, resolve_chart_budget, validate_target_ymd
 from src.api._transport import RetryPolicy, send_with_auth_retry
@@ -42,6 +44,22 @@ KIWOOM_AUTH_EXPIRED_MSG_CODE: str = next(iter(AUTH_REJECTION_CODES["kiwoom"]))
 KIWOOM_REVOKE_PATH: str = "/oauth2/revoke"
 
 _CNTR_TM_RE = re.compile(r"^\d{14}$")
+
+_TRANSPORT_ERRORS: Final[tuple[type[BaseException], ...]] = (ClientError, TimeoutError, ConnectionError)
+_DEADLINE_TIMEOUT_SLACK_SECONDS: Final[float] = 1.0
+
+
+def _transport_error_name(exc: BaseException) -> str | None:
+    """Exception class name when `exc` is a transport failure, else None."""
+    return type(exc).__name__ if isinstance(exc, _TRANSPORT_ERRORS) else None
+
+
+def _is_deadline_timeout(exc: BaseException, deadline: datetime | None) -> bool:
+    """True when a plain TimeoutError is the budget's own deadline expiring rather than a transport timeout."""
+    if deadline is None or not isinstance(exc, TimeoutError) or isinstance(exc, ClientError):
+        return False
+    remaining = deadline_remaining(deadline)
+    return remaining is not None and remaining <= _DEADLINE_TIMEOUT_SLACK_SECONDS
 
 
 @dataclass(frozen=True)
@@ -590,6 +608,8 @@ class KiwoomApiClient:
         in_observer = False
         last_header_cont = "N"
         last_header_key = ""
+        in_request = False
+        failure_transport: str | None = None
         request_code = str(code) if venue == "KRX" else f"{str(code).split('_')[0]}_NX"
         try:
             for page_index in range(max(1, int(page_budget))):
@@ -599,6 +619,7 @@ class KiwoomApiClient:
                     truncated = True
                     break
                 started = now_seoul()
+                in_request = True
                 call = self._post_tr(
                     session,
                     "ka10079",
@@ -611,6 +632,7 @@ class KiwoomApiClient:
                     data, resp_headers = await call
                 else:
                     data, resp_headers = await asyncio.wait_for(call, timeout=deadline_left)
+                in_request = False
                 received = now_seoul()
                 header_cont = str(resp_headers.get("cont-yn", "N") or "N")
                 header_key = str(resp_headers.get("next-key", "") or "")
@@ -684,27 +706,43 @@ class KiwoomApiClient:
             else:
                 termination = "page_budget"
                 truncated = True
-        except TimeoutError:
-            termination = "deadline"
-            truncated = True
         except Exception as e:
             if in_observer:
                 raise
-            logger.warning("Kiwoom tick chart failed code=%s: %s", code, e)
-            return {
-                "rt_cd": "1",
-                "msg1": str(e),
-                "output2": [],
-                "vendor": "kiwoom",
-                "truncated": True,
-                "termination_reason": "vendor_failure",
-                "pages_fetched": pages_fetched,
-                "continuation": metadata,
-                "cursor": None,
-                "vendor_total_ticks": vendor_total,
-                "rows_received": rows_received,
-                "complete_by_total": False,
-            }
+            if _is_deadline_timeout(e, deadline):
+                termination = "deadline"
+                truncated = True
+            elif in_request and (transport_name := _transport_error_name(e)) is not None:
+                termination = "vendor_failure"
+                truncated = True
+                failure_msg = f"transport:{transport_name}"
+                failure_transport = transport_name
+                failure_request_key = next_key if cont_yn == "Y" and next_key else None
+                logger.warning(
+                    "[DATA] stage=kiwoom_ticks status=TRANSPORT_FAILURE symbol=%s venue=%s error=%s pages=%d rows=%d request_key=%s",
+                    code, venue, transport_name, pages_fetched, rows_received, failure_request_key or "-",
+                )
+            else:
+                logger.warning(
+                    "[DATA] stage=kiwoom_ticks status=ERROR symbol=%s venue=%s pages=%d rows=%d request_key=%s error=%s",
+                    code, venue, pages_fetched, rows_received, next_key if cont_yn == "Y" and next_key else "-",
+                    type(e).__name__, exc_info=True,
+                )
+                return {
+                    "rt_cd": "1",
+                    "msg1": str(e),
+                    "output2": [],
+                    "vendor": "kiwoom",
+                    "truncated": True,
+                    "termination_reason": "vendor_failure",
+                    "pages_fetched": pages_fetched,
+                    "continuation": metadata,
+                    "cursor": None,
+                    "vendor_total_ticks": vendor_total,
+                    "rows_received": rows_received,
+                    "complete_by_total": False,
+                    "error_type": type(e).__name__,
+                }
         if termination == "vendor_failure":
             failed_filtered = [dict(r) for r in all_rows if str(r.get("cntr_tm", "")).startswith(ymd)]
             failed_cursor: TickCursor | None = None
@@ -726,6 +764,7 @@ class KiwoomApiClient:
                 "rows_received": rows_received,
                 "complete_by_total": False,
                 "vendor_return_code": failure_code,
+                "transport_error": failure_transport,
             }
         filtered = [dict(r) for r in all_rows if str(r.get("cntr_tm", "")).startswith(ymd)]
         complete_by_total = termination == "exhausted" and vendor_total is not None

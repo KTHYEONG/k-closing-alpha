@@ -3330,3 +3330,150 @@ def test_tick_vendor_aftermarket_first_page_failure_recovers(tmp_path) -> None:
 
     assert entry.status.value == "COMPLETE"
     assert frame["ts_hms"].tolist() == [180000]
+
+
+class _PayloadKiwoom:
+    """Scripted Kiwoom stub returning raw get_tick_chart payloads; each payload's output2 is observed as one page."""
+
+    def __init__(self, payloads):
+        self._payloads = list(payloads)
+        self.calls = []
+
+    async def get_tick_chart(self, session, code, snapshot_date, max_pages=None, budget=None, on_page=None, **kwargs):
+        self.calls.append({"budget": budget, "resume": kwargs.get("resume")})
+        payload = dict(self._payloads.pop(0))
+        if on_page is not None:
+            start, received = _aware_page_clocks()
+            on_page({"stk_tic_chart_qry": payload.get("output2") or []}, {"cont-yn": "N"}, start, received, 0, 0)
+        return payload
+
+
+def _kiwoom_tick_failure(rows, *, transport=None, vendor_code=None, cursor=None, total=None):
+    from src.api.kiwoom.client import TickCursor
+
+    return {
+        "rt_cd": "1", "msg1": "transport", "output2": rows, "vendor": "kiwoom", "truncated": True,
+        "termination_reason": "vendor_failure", "pages_fetched": 2 if rows else 0, "continuation": {},
+        "cursor": cursor if cursor is not None else None,
+        "vendor_total_ticks": total, "rows_received": len(rows), "complete_by_total": False,
+        "vendor_return_code": vendor_code, "transport_error": transport,
+    } if cursor is None or isinstance(cursor, TickCursor) else {}
+
+
+def _kiwoom_tick_success(rows, *, total=None):
+    return {
+        "rt_cd": "0", "output2": rows, "vendor": "kiwoom", "truncated": False,
+        "termination_reason": "exhausted", "pages_fetched": 1, "continuation": {},
+        "cursor": None, "vendor_total_ticks": total, "rows_received": len(rows), "complete_by_total": total is not None,
+    }
+
+
+def _vendor_retry_tick_profile(tmp_path, *, vendor_retries):
+    from src.config.collection import CollectionSettings
+
+    return CollectionSettings(
+        COLLECTION_ROOT=tmp_path / "capture",
+        COLLECTION_VERIFIED_CHART_ROUTES={"kiwoom:ka10079": "KRX", "kiwoom:ka10079-nx": "NXT"},
+        COLLECTION_TRANSPORT_RETRIES=2,
+        COLLECTION_TRANSPORT_BACKOFF_SECONDS=0.0,
+        COLLECTION_TICK_VENDOR_RETRIES=vendor_retries,
+    )
+
+
+def _run_vendor_retry_ticks(tmp_path, kiwoom, run_id, *, vendor_retries=3):
+    import asyncio
+
+    from src.backfill.intraday.collector import collect_aftermarket_trade_ticks
+
+    today, _ = _today()
+    delivered = {}
+    asyncio.run(
+        collect_aftermarket_trade_ticks(
+            kiwoom, None, ["005930"], today, venue="KRX",
+            profile=_vendor_retry_tick_profile(tmp_path, vendor_retries=vendor_retries),
+            capture_store=_capture_store(tmp_path), run_id=run_id,
+            on_symbol=lambda symbol, frame, entry: delivered.update({symbol: (frame, entry)}),
+        )
+    )
+    return delivered["005930"]
+
+
+def test_tick_transport_failure_mid_walk_resumes_and_completes(tmp_path) -> None:
+    from src.api.kiwoom.client import TickCursor
+
+    _, ymd = _today()
+    first = [_kw_tick_row(f"{ymd}160000"), _kw_tick_row(f"{ymd}170000")]
+    rest = [_kw_tick_row(f"{ymd}175000"), _kw_tick_row(f"{ymd}180000")]
+    kiwoom = _PayloadKiwoom([
+        _kiwoom_tick_failure(first, transport="ClientConnectionError", cursor=TickCursor("k2", 2, 4), total=4),
+        _kiwoom_tick_success(rest, total=4),
+    ])
+    frame, entry = _run_vendor_retry_ticks(tmp_path, kiwoom, "run-transport-resume")
+
+    assert entry.status.value == "COMPLETE"
+    assert len(kiwoom.calls) == 2
+    assert kiwoom.calls[1]["resume"] == TickCursor("k2", 2, 4)
+    assert _ref_attempt_slots(entry) == {0, 1}
+    assert sorted(frame["ts_hms"].tolist()) == [160000, 170000, 175000, 180000]
+
+
+def test_tick_transport_failure_first_page_restarts_with_same_request(tmp_path) -> None:
+    _, ymd = _today()
+    kiwoom = _PayloadKiwoom([
+        _kiwoom_tick_failure([], transport="ClientError"),
+        _kiwoom_tick_success([_kw_tick_row(f"{ymd}160000")]),
+    ])
+    frame, entry = _run_vendor_retry_ticks(tmp_path, kiwoom, "run-transport-restart")
+
+    assert entry.status.value == "COMPLETE"
+    assert len(kiwoom.calls) == 2
+    assert kiwoom.calls[1]["resume"] is None
+    assert kiwoom.calls[1]["budget"] == kiwoom.calls[0]["budget"]
+    assert frame["ts_hms"].tolist() == [160000]
+
+
+def test_tick_transport_retries_exhausted_reports_transient_reason(tmp_path, caplog) -> None:
+    import logging
+
+    kiwoom = _PayloadKiwoom([_kiwoom_tick_failure([], transport="ClientConnectionError")] * 4)
+    with caplog.at_level(logging.WARNING):
+        frame, entry = _run_vendor_retry_ticks(tmp_path, kiwoom, "run-transport-exhausted", vendor_retries=3)
+
+    assert len(kiwoom.calls) == 4
+    assert entry.status.value == "FAILED"
+    assert entry.reason == "vendor_failure:transient:transport-ClientConnectionError"
+    assert frame.empty
+    retry_logs = [r.getMessage() for r in caplog.records if "status=VENDOR_RETRY" in r.getMessage()]
+    assert len(retry_logs) == 3
+    assert all("transport=ClientConnectionError" in line for line in retry_logs)
+
+
+def test_tick_transport_failure_with_retries_zero_is_single_call(tmp_path) -> None:
+    kiwoom = _PayloadKiwoom([_kiwoom_tick_failure([], transport="ClientConnectionError")])
+    _, entry = _run_vendor_retry_ticks(tmp_path, kiwoom, "run-transport-zero", vendor_retries=0)
+
+    assert len(kiwoom.calls) == 1
+    assert entry.status.value == "FAILED"
+    assert entry.reason == "vendor_failure:transient:transport-ClientConnectionError"
+
+
+def test_tick_empty_transport_error_is_not_recoverable(tmp_path) -> None:
+    for transport in ("", None):
+        kiwoom = _PayloadKiwoom([_kiwoom_tick_failure([], transport=transport)])
+        _, entry = _run_vendor_retry_ticks(tmp_path, kiwoom, f"run-transport-empty-{transport!r}")
+
+        assert len(kiwoom.calls) == 1
+        assert entry.status.value == "FAILED"
+        assert entry.reason == "vendor_failure"
+
+
+def test_tick_body_codes_keep_existing_retry_and_reason(tmp_path) -> None:
+    transient = _PayloadKiwoom([_kiwoom_tick_failure([], vendor_code=7)] * 4)
+    _, entry = _run_vendor_retry_ticks(tmp_path, transient, "run-body-transient", vendor_retries=3)
+    assert len(transient.calls) == 4
+    assert entry.reason == "vendor_failure:transient:rc7"
+
+    rejected = _PayloadKiwoom([_kiwoom_tick_failure([], vendor_code=3)])
+    _, entry = _run_vendor_retry_ticks(tmp_path, rejected, "run-body-rejected", vendor_retries=3)
+    assert len(rejected.calls) == 1
+    assert entry.reason == "vendor_failure:rc3"

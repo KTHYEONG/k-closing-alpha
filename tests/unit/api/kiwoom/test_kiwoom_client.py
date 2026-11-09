@@ -2162,3 +2162,188 @@ def test_kiwoom_tick_exception_path_has_no_vendor_return_code() -> None:
     assert res["rt_cd"] == "1"
     assert "vendor_return_code" not in res
     assert res["output2"] == []
+
+
+def _post_tr_steps(steps: list[Any]) -> tuple[Any, list[tuple[str, str]]]:
+    sent: list[tuple[str, str]] = []
+
+    async def fake_post_tr(session: Any, api_id: str, path: str, body: dict, cont_yn: str = "N", next_key: str = "", max_retries: int = 3) -> tuple[dict, dict]:
+        sent.append((cont_yn, next_key))
+        step = steps[len(sent) - 1]
+        if isinstance(step, BaseException):
+            raise step
+        return step
+
+    return fake_post_tr, sent
+
+
+def test_kiwoom_tick_client_error_mid_walk_keeps_rows_and_cursor() -> None:
+    import aiohttp
+
+    from src.api.kiwoom.client import TickCursor
+
+    client = _kiwoom_client()
+    good = [_tick_page([_tick_row(i * 2), _tick_row(i * 2 + 1)], "Y", f"k{i + 1}") for i in range(3)]
+    fake, sent = _post_tr_steps([*good, aiohttp.ClientConnectionError("drop")])
+    client._post_tr = fake
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04"))
+    assert sent[-1] == ("Y", "k3")
+    assert res["rt_cd"] == "1"
+    assert res["termination_reason"] == "vendor_failure"
+    assert res["transport_error"] == "ClientConnectionError"
+    assert res["vendor_return_code"] is None
+    assert res["output2"] == [_tick_row(i) for i in range(6)]
+    assert res["cursor"] == TickCursor(next_key="k3", rows_received=6, total_ticks=None)
+
+
+def test_kiwoom_tick_transport_error_first_page_has_no_cursor() -> None:
+    import aiohttp
+
+    client = _kiwoom_client()
+    fake, _ = _post_tr_steps([aiohttp.ClientError("reset")])
+    client._post_tr = fake
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04"))
+    assert res["cursor"] is None
+    assert res["output2"] == []
+    assert res["transport_error"] == "ClientError"
+
+
+def test_kiwoom_tick_transport_error_on_resume_returns_resume_key() -> None:
+    import aiohttp
+
+    from src.api.kiwoom.client import TickCursor
+
+    client = _kiwoom_client()
+    fake, sent = _post_tr_steps([aiohttp.ClientError("reset")])
+    client._post_tr = fake
+    res = asyncio.run(
+        client.get_tick_chart(object(), "005930", "2026-09-04", resume=TickCursor(next_key="K0", rows_received=900, total_ticks=2700))
+    )
+    assert sent == [("Y", "K0")]
+    assert res["cursor"] is not None
+    assert res["cursor"].next_key == "K0"
+    assert res["cursor"].rows_received == 900
+    assert res["cursor"].total_ticks == 2700
+
+
+def test_kiwoom_tick_timeout_without_deadline_is_transport_not_deadline() -> None:
+    client = _kiwoom_client()
+    fake, _ = _post_tr_steps([TimeoutError()])
+    client._post_tr = fake
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04"))
+    assert res["termination_reason"] == "vendor_failure"
+    assert res["transport_error"] == "TimeoutError"
+
+
+def test_kiwoom_tick_wait_for_timeout_with_deadline_is_deadline() -> None:
+    client = _kiwoom_client()
+
+    async def _sleepy(session: Any, *args: Any, **kwargs: Any) -> Any:
+        await asyncio.sleep(5)
+        return _tick_page([], "N", "")
+
+    client._post_tr = _sleepy
+    tight = datetime.now(_SEOUL) + timedelta(seconds=0.05)
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", budget=_budget(deadline=tight)))
+    assert res["termination_reason"] == "deadline"
+    assert res["truncated"] is True
+    assert res["rt_cd"] == "0"
+
+
+def test_kiwoom_tick_server_timeout_with_deadline_is_transport() -> None:
+    import aiohttp
+
+    client = _kiwoom_client()
+    fake, _ = _post_tr_steps([aiohttp.ServerTimeoutError("slow")])
+    client._post_tr = fake
+    res = asyncio.run(
+        client.get_tick_chart(object(), "005930", "2026-09-04", budget=_budget(deadline=datetime.now(_SEOUL) + timedelta(hours=1)))
+    )
+    assert res["termination_reason"] == "vendor_failure"
+    assert res["transport_error"] == "ServerTimeoutError"
+
+
+def test_kiwoom_tick_observer_timeout_still_raises() -> None:
+    client = _kiwoom_client()
+    fake, _ = _post_tr_steps([_tick_page([_tick_row(0)], "N", "")])
+    client._post_tr = fake
+
+    def _observer(*args: Any) -> None:
+        raise TimeoutError("evidence store stalled")
+
+    with pytest.raises(TimeoutError, match="evidence store stalled"):
+        asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", on_page=_observer))
+
+
+def test_kiwoom_tick_parse_bug_logs_traceback_and_error_type(caplog) -> None:
+    import logging
+
+    client = _kiwoom_client()
+    fake, _ = _post_tr_steps([(None, {})])
+    client._post_tr = fake
+    with caplog.at_level(logging.WARNING, logger="src.api.kiwoom.client"):
+        res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04"))
+    assert res["rt_cd"] == "1"
+    assert "vendor_return_code" not in res
+    assert res["error_type"] == "AttributeError"
+    records = [r for r in caplog.records if "status=ERROR" in r.getMessage()]
+    assert len(records) == 1
+    assert records[0].exc_info is not None
+    assert "symbol=005930" in records[0].getMessage()
+
+
+def test_kiwoom_tick_transport_log_has_identifiers_and_no_secrets(caplog) -> None:
+    import logging
+
+    import aiohttp
+
+    client = KiwoomApiClient(app_key="app-secret-key", secret_key="s")
+    client.token = "tok-secret"
+    good = [_tick_page([_tick_row(i * 2), _tick_row(i * 2 + 1)], "Y", f"k{i + 1}") for i in range(3)]
+    fake, _ = _post_tr_steps([*good, aiohttp.ClientConnectionError("tok-secret app-secret-key")])
+    client._post_tr = fake
+    with caplog.at_level(logging.WARNING, logger="src.api.kiwoom.client"):
+        asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", venue="KRX"))
+    records = [r for r in caplog.records if "status=TRANSPORT_FAILURE" in r.getMessage()]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    for token in ("symbol=005930", "venue=KRX", "error=ClientConnectionError", "pages=3", "request_key=k3"):
+        assert token in message
+    assert "tok-secret" not in caplog.text
+    assert "app-secret-key" not in caplog.text
+
+
+def test_kiwoom_tick_error_outside_request_is_not_transport(monkeypatch) -> None:
+    import aiohttp
+
+    import src.api.kiwoom.client as kiwoom_client_module
+
+    client = _kiwoom_client()
+    fake, _ = _post_tr_steps([_tick_page([_tick_row(0)], "Y", "k1")])
+    client._post_tr = fake
+    real_parse = kiwoom_client_module._parse_tick_remaining
+
+    def _parse_raises_client_error(next_key: str, base_code: str, ymd: str) -> int | None:
+        raise aiohttp.ClientError("raised after the page was accumulated")
+
+    monkeypatch.setattr(kiwoom_client_module, "_parse_tick_remaining", _parse_raises_client_error)
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04"))
+    monkeypatch.setattr(kiwoom_client_module, "_parse_tick_remaining", real_parse)
+    assert res["rt_cd"] == "1"
+    assert res["error_type"] == "ClientError"
+    assert res.get("transport_error") is None
+    assert res["cursor"] is None
+    assert res["output2"] == []
+
+
+def test_kiwoom_tick_server_timeout_near_deadline_is_still_transport() -> None:
+    import aiohttp
+
+    client = _kiwoom_client()
+    fake, _ = _post_tr_steps([aiohttp.ServerTimeoutError("slow")])
+    client._post_tr = fake
+    res = asyncio.run(
+        client.get_tick_chart(object(), "005930", "2026-09-04", budget=_budget(deadline=datetime.now(_SEOUL) + timedelta(seconds=0.5)))
+    )
+    assert res["termination_reason"] == "vendor_failure"
+    assert res["transport_error"] == "ServerTimeoutError"

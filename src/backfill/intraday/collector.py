@@ -83,8 +83,17 @@ def _classify_kis_vendor_failure(payload: object) -> str:
     return f"{VENDOR_FAILURE_REJECTED_PREFIX}{tag}"
 
 
+def _transport_error_of(payload: Mapping[str, Any]) -> str | None:
+    """Transport exception class name a Kiwoom tick payload carries, or None."""
+    name = payload.get("transport_error")
+    return name if isinstance(name, str) and name else None
+
+
 def _classify_kiwoom_vendor_failure(payload: Mapping[str, Any], transient_codes: Collection[int]) -> str:
-    """Return the FAILED reason for a Kiwoom body failure, keeping its return code and vendor message tag."""
+    """Return the FAILED reason for a Kiwoom body or transport failure, keeping its return code or exception tag."""
+    transport = _transport_error_of(payload)
+    if transport is not None:
+        return f"{VENDOR_FAILURE_TRANSIENT_PREFIX}{_ERROR_RE.sub('-', 'transport-' + transport).strip('-')}"
     code = payload["vendor_return_code"]
     found = _KIWOOM_MSG_CODE_RE.search(str(payload.get("msg1", "") or ""))
     raw_tag = f"rc{code}-{found.group(1)}" if found else f"rc{code}"
@@ -569,12 +578,13 @@ async def _run_kiwoom_pass(
 
 
 def _is_recoverable_vendor_failure(payload: Any, transient_codes: frozenset[int]) -> bool:
-    return (
+    if not (
         isinstance(payload, dict)
         and payload.get("rt_cd") == "1"
         and payload.get("termination_reason") == "vendor_failure"
-        and payload.get("vendor_return_code") in transient_codes
-    )
+    ):
+        return False
+    return _transport_error_of(payload) is not None or payload.get("vendor_return_code") in transient_codes
 
 
 async def _fetch_with_vendor_retry(
@@ -586,7 +596,7 @@ async def _fetch_with_vendor_retry(
     profile: CollectionSettings,
     code: str,
 ) -> tuple[Any, int]:
-    """Run one Kiwoom tick pass, resuming from the failed page when the vendor reports a transient body error.
+    """Run one Kiwoom tick pass, resuming from the failed page when the vendor reports a transient body error or transport failure.
 
     A transient failure keeps the rows already served and its continuation key, so the next pass re-requests
     only the failed page onward; the returned payload carries every row of the stitched pass. Without a
@@ -620,9 +630,9 @@ async def _fetch_with_vendor_retry(
             return payload, slot
         retries += 1
         logger.warning(
-            "[DATA] stage=ticks symbol=%s status=VENDOR_RETRY rc=%s page=%d rows=%d retry=%d/%d",
+            "[DATA] stage=ticks symbol=%s status=VENDOR_RETRY rc=%s page=%d rows=%d retry=%d/%d transport=%s",
             code, payload.get("vendor_return_code"), int(payload.get("pages_fetched", 0) or 0),
-            int(payload.get("rows_received", 0) or 0), retries, max_retries,
+            int(payload.get("rows_received", 0) or 0), retries, max_retries, _transport_error_of(payload) or "-",
         )
         delay = base_backoff * (2 ** (retries - 1))
         if delay > 0:
@@ -1196,7 +1206,9 @@ async def _tick_source_attempt(
     venue = _venue_for(vendor=vendor, endpoint=endpoint, market_div_code=market_div_code, profile=profile)
     if not isinstance(payload, dict) or payload.get("rt_cd") != "0":
         reason = "vendor_failure"
-        if isinstance(payload, dict) and isinstance(payload.get("vendor_return_code"), int):
+        if isinstance(payload, dict) and (
+            isinstance(payload.get("vendor_return_code"), int) or _transport_error_of(payload) is not None
+        ):
             reason = _classify_kiwoom_vendor_failure(payload, profile.COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES)
         return _empty_tick_frame(snapshot_date), _terminal_entry(
             symbol=code, dataset=dataset, venue=venue, session=session_tag,
