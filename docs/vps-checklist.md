@@ -852,7 +852,7 @@ def _():
     out("B07", lv(not ok), sunday=sun, summary=s.split("stage=offsite_verify")[-1][:80] or "absent", drills=drills or "-")
 @check("B08")
 def _():
-    snaps = sorted(x.strip("/") for x in sh([RCLONE, "lsf", "--dirs-only", f"{REMOTE}/snapshots"]).splitlines())
+    snaps = sorted(x.strip("/") for x in sh([RCLONE, "lsf", "--dirs-only", f"{REMOTE}/snapshots"]).splitlines() if re.fullmatch(r"\d{4}-\d{2}-\d{2}/?", x.strip()))
     cs = jr("core-snapshot", at(sun, "09:59:00"), at(sun, "23:59:00"), r"stage=core_snapshot .*status=")
     out("B08", lv(not snaps or snaps[-1] != str(sun) or not cs or "status=ok" not in cs[-1]), newest=snaps[-1] if snaps else "-", count=len(snaps), core_snapshot=cs[-1].split("status=")[1][:20] if cs else "absent")
 @check("Q11")
