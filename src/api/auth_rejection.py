@@ -18,6 +18,10 @@ AUTH_REJECTION_CODES: Final[Mapping[BrokerVendor, frozenset[str]]] = MappingProx
     }
 )
 
+RATE_LIMIT_RSP_CODES: Final[Mapping[BrokerVendor, frozenset[str]]] = MappingProxyType(
+    {"ls": frozenset({"IGW00201"}), "dbsec": frozenset({"IGW00201"})}
+)
+
 KIWOOM_AUTH_EXPIRED_RETURN_CODE: Final[int] = 3
 
 
@@ -56,6 +60,7 @@ def is_kis_data_auth_rejected(body: object) -> bool:
 __all__ = [
     "AUTH_REJECTION_CODES",
     "KIWOOM_AUTH_EXPIRED_RETURN_CODE",
+    "RATE_LIMIT_RSP_CODES",
     "BrokerVendor",
     "is_auth_rejected",
     "is_kis_data_auth_rejected",

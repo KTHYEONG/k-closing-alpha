@@ -3477,3 +3477,144 @@ def test_tick_body_codes_keep_existing_retry_and_reason(tmp_path) -> None:
     _, entry = _run_vendor_retry_ticks(tmp_path, rejected, "run-body-rejected", vendor_retries=3)
     assert len(rejected.calls) == 1
     assert entry.reason == "vendor_failure:rc3"
+
+
+class _CodedBars:
+    def __init__(self, payload):
+        self._payload = payload
+
+    async def get_minute_chart(self, *args, **kwargs):
+        return self._payload
+
+    async def get_tick_chart(self, *args, **kwargs):
+        return self._payload
+
+
+def _coded_payload(code, *, vendor="ls"):
+    return {
+        "rt_cd": "1", "msg1": "bad", "output2": [], "vendor": vendor, "truncated": True,
+        "termination_reason": "vendor_failure", "pages_fetched": 1, "continuation": {},
+        **({"vendor_error_code": code} if code is not None else {}),
+    }
+
+
+def _coded_bar_reason(tmp_path, vendor, code):
+    import datetime as _dt
+
+    from src.backfill.intraday.collector import _dbsec_bar_attempt, _ls_bar_attempt
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _capture_store(tmp_path)
+    profile = _dbsec_routes(tmp_path)
+    day = _dt.date(2026, 9, 4)
+    kwargs = {
+        "code": "005930", "snapshot_date": "2026-09-04", "trading_day": day, "ymd": "20260904",
+        "floor": "090000", "ceil": "153000", "session_tag": "regular", "dataset": CaptureDataset.MINUTE_BARS,
+        "store": store, "run_id": f"r-{vendor}-{code}", "profile": profile, "session": None,
+    }
+    if vendor == "ls":
+        _, entry = asyncio.run(_ls_bar_attempt(ls_client=_CodedBars(_coded_payload(code)), **kwargs))
+    else:
+        _, entry = asyncio.run(
+            _dbsec_bar_attempt(dbsec_client=_CodedBars(_coded_payload(code, vendor="dbsec")), **kwargs)
+        )
+    return entry.reason
+
+
+def test_ls_bar_failure_reason_carries_code(tmp_path) -> None:
+    from src.backfill.intraday.extended_session_backfill import is_deterministic_failure, is_transient_failure
+
+    assert _coded_bar_reason(tmp_path, "ls", "99999") == "vendor_failure:99999"
+    throttled = _coded_bar_reason(tmp_path, "ls", "IGW00201")
+    assert throttled == "vendor_failure:transient:IGW00201"
+    assert is_transient_failure(throttled)
+    assert _coded_bar_reason(tmp_path, "ls", "IGW00123") == "vendor_failure:transient:IGW00123"
+    neutral = _coded_bar_reason(tmp_path, "ls", "99999")
+    assert not is_transient_failure(neutral)
+    assert not is_deterministic_failure(neutral)
+
+
+def test_dbsec_bar_failure_reason_carries_code(tmp_path) -> None:
+    from src.backfill.intraday.extended_session_backfill import is_transient_failure
+
+    assert _coded_bar_reason(tmp_path, "dbsec", "IGW00201") == "vendor_failure:transient:IGW00201"
+    assert is_transient_failure("vendor_failure:transient:IGW00201")
+    assert _coded_bar_reason(tmp_path, "dbsec", "E") == "vendor_failure:E"
+
+
+def test_ls_tick_failure_reason_carries_code(tmp_path) -> None:
+    import datetime as _dt
+
+    from src.backfill.intraday.collector import _tick_source_attempt
+    from src.data.capture_contracts import CaptureDataset
+
+    store = _capture_store(tmp_path)
+    profile = _dbsec_routes(tmp_path)
+    _, entry = asyncio.run(
+        _tick_source_attempt(
+            vendor="ls", endpoint="t8411", payload=_coded_payload("IGW00123"), code="005930",
+            snapshot_date="2026-09-04", trading_day=_dt.date(2026, 9, 4), ymd="20260904", floor="090000",
+            ceil="153000", market_div_code=None, store=store, run_id="r-ls-tick", profile=profile,
+            attempt=0, refs=[],
+        )
+    )
+    assert entry.reason == "vendor_failure:transient:IGW00123"
+    assert entry.dataset == CaptureDataset.TRADE_TICKS
+
+
+def test_kis_tick_fallback_reason_carries_msg_cd(tmp_path) -> None:
+    import datetime as _dt
+
+    from src.backfill.intraday.collector import _acquire_ticks_symbol
+    from src.backfill.intraday.extended_session_backfill import is_transient_failure
+
+    class _KisTicks:
+        def __init__(self, msg_cd):
+            self._msg_cd = msg_cd
+
+        async def get_intraday_trade_ticks(self, *args, **kwargs):
+            return {"rt_cd": "1", "msg_cd": self._msg_cd, "msg1": "x", "output2": []}
+
+    def _reason(msg_cd):
+        _, entry = asyncio.run(
+            _acquire_ticks_symbol(
+                client=_KisTicks(msg_cd), session=None, code="005930", snapshot_date="2099-01-05",
+                trading_day=_dt.date(2099, 1, 5), ymd="20990105", ls_client=None, kiwoom_client=None,
+                ls_max_pages=1, profile=_dbsec_routes(tmp_path), store=_capture_store(tmp_path),
+                run_id=f"r-kis-{msg_cd}",
+            )
+        )
+        return entry.reason
+
+    auth = _reason("EGW00123")
+    assert auth == "vendor_failure:transient:EGW00123"
+    assert is_transient_failure(auth)
+    assert _reason("EGW00999") == "vendor_failure:EGW00999"
+
+
+def test_unknown_or_missing_code_is_neutral_not_rejected() -> None:
+    from src.backfill.intraday.collector import _classify_coded_vendor_failure
+
+    inputs = [
+        ({}, frozenset()),
+        ({"vendor_error_code": ""}, frozenset()),
+        ({"vendor_error_code": "@@@"}, frozenset()),
+        (None, frozenset()),
+        ("IGW00201", frozenset({"IGW00201"})),
+        ({"vendor_error_code": "99999"}, frozenset()),
+    ]
+    reasons = [_classify_coded_vendor_failure(payload, codes) for payload, codes in inputs]
+    assert reasons[:5] == ["vendor_failure"] * 5
+    assert reasons[5] == "vendor_failure:99999"
+    assert not any(reason.startswith("vendor_failure:rejected:") for reason in reasons)
+
+
+def test_tag_is_sanitized_and_bounded() -> None:
+    import re
+
+    from src.backfill.intraday.collector import _classify_coded_vendor_failure
+
+    reason = _classify_coded_vendor_failure({"vendor_error_code": "A/B C" * 20}, frozenset())
+    assert re.fullmatch(r"[A-Za-z0-9_:-]+", reason)
+    tag = reason.split("vendor_failure:", 1)[1]
+    assert 0 < len(tag) <= 32

@@ -9,6 +9,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 import numpy as np
@@ -21,7 +22,7 @@ if TYPE_CHECKING:
     from src.api.kis.client import KisApiClient
     from src.api.kiwoom.client import KiwoomApiClient
 
-from src.api.auth_rejection import is_kis_data_auth_rejected
+from src.api.auth_rejection import AUTH_REJECTION_CODES, RATE_LIMIT_RSP_CODES, is_kis_data_auth_rejected
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
     INTRADAY_SESSION_KRX_AFTERMARKET,
@@ -66,6 +67,13 @@ _KIWOOM_MSG_CODE_RE = re.compile(r"\[(\d+)\]")
 
 VENDOR_FAILURE_TRANSIENT_PREFIX: Final[str] = "vendor_failure:transient:"
 VENDOR_FAILURE_REJECTED_PREFIX: Final[str] = "vendor_failure:rejected:"
+_TRANSIENT_RSP_CODES: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
+    {
+        "ls": RATE_LIMIT_RSP_CODES["ls"] | AUTH_REJECTION_CODES["ls"],
+        "dbsec": RATE_LIMIT_RSP_CODES["dbsec"] | AUTH_REJECTION_CODES["dbsec"],
+        "kis": AUTH_REJECTION_CODES["kis"],
+    }
+)
 
 
 def _classify_kis_vendor_failure(payload: object) -> str:
@@ -81,6 +89,19 @@ def _classify_kis_vendor_failure(payload: object) -> str:
     if str(payload.get("rt_cd", "")) == "9" and not str(payload.get("msg_cd", "") or ""):
         return f"{VENDOR_FAILURE_TRANSIENT_PREFIX}{tag}"
     return f"{VENDOR_FAILURE_REJECTED_PREFIX}{tag}"
+
+
+def _classify_coded_vendor_failure(payload: object, transient_codes: Collection[str]) -> str:
+    """Return the FAILED reason for a coded LS/DBSec/KIS failure: transient:<code>, <code>, or bare vendor_failure."""
+    if not isinstance(payload, dict):
+        return "vendor_failure"
+    raw = payload.get("vendor_error_code") or payload.get("msg_cd")
+    tag = _ERROR_RE.sub("-", str(raw or "")).strip("-")[:32]
+    if not tag:
+        return "vendor_failure"
+    if str(raw) in transient_codes:
+        return f"{VENDOR_FAILURE_TRANSIENT_PREFIX}{tag}"
+    return f"vendor_failure:{tag}"
 
 
 def _transport_error_of(payload: Mapping[str, Any]) -> str | None:
@@ -958,7 +979,8 @@ async def _ls_bar_attempt(
     if not isinstance(payload, dict) or payload.get("rt_cd") != "0":
         return _empty_bar_frame(snapshot_date), _terminal_entry(
             symbol=code, dataset=dataset, venue=venue, session=session_tag,
-            status=CaptureStatus.FAILED, rows=0, reason="vendor_failure", refs=refs,
+            status=CaptureStatus.FAILED, rows=0,
+            reason=_classify_coded_vendor_failure(payload, _TRANSIENT_RSP_CODES["ls"]), refs=refs,
         )
     terminal = str(payload.get("termination_reason", "") or "")
     rows = [dict(r) for r in (payload.get("output2") or []) if isinstance(r, dict)]
@@ -1034,7 +1056,8 @@ async def _dbsec_bar_attempt(
     if not isinstance(payload, dict) or payload.get("rt_cd") != "0":
         return _empty_bar_frame(snapshot_date), _terminal_entry(
             symbol=code, dataset=dataset, venue=venue, session=session_tag,
-            status=CaptureStatus.FAILED, rows=0, reason="vendor_failure", refs=refs,
+            status=CaptureStatus.FAILED, rows=0,
+            reason=_classify_coded_vendor_failure(payload, _TRANSIENT_RSP_CODES["dbsec"]), refs=refs,
         )
     terminal = str(payload.get("termination_reason", "") or "")
     rows = [dict(r) for r in (payload.get("output2") or []) if isinstance(r, dict)]
@@ -1210,6 +1233,8 @@ async def _tick_source_attempt(
             isinstance(payload.get("vendor_return_code"), int) or _transport_error_of(payload) is not None
         ):
             reason = _classify_kiwoom_vendor_failure(payload, profile.COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES)
+        elif isinstance(payload, dict) and vendor in _TRANSIENT_RSP_CODES:
+            reason = _classify_coded_vendor_failure(payload, _TRANSIENT_RSP_CODES[vendor])
         return _empty_tick_frame(snapshot_date), _terminal_entry(
             symbol=code, dataset=dataset, venue=venue, session=session_tag,
             status=CaptureStatus.FAILED, rows=0, reason=reason, refs=refs,
@@ -1360,7 +1385,7 @@ async def _acquire_ticks_symbol(
             return _empty_tick_frame(snapshot_date), _terminal_entry(
                 symbol=code, dataset=CaptureDataset.TRADE_TICKS, venue=context.venue,
                 session=INTRADAY_SESSION_REGULAR, status=CaptureStatus.FAILED, rows=0,
-                reason="vendor_failure", refs=refs,
+                reason=_classify_coded_vendor_failure(payload, _TRANSIENT_RSP_CODES["kis"]), refs=refs,
             )
         frame = _canonical_kis_ticks(rows, snapshot_date, code)
         if frame.empty:

@@ -16,11 +16,12 @@ from src.api._common import (
 )
 from src.api._token_client import SharedTokenClientMixin
 from src.api._transport import RetryPolicy, send_with_auth_retry
-from src.api.auth_rejection import AUTH_REJECTION_CODES, is_auth_rejected
+from src.api.auth_rejection import AUTH_REJECTION_CODES, RATE_LIMIT_RSP_CODES, is_auth_rejected
 from src.api.host_broker_contract import TokenIssueThrottled
 from src.api.kis.rate_limit import HostPacedRateLimiter, vendor_limiter
 from src.api.shared_token import IssuedToken
 from src.config import settings
+from src.tools.alerts import redact_for_egress
 
 if TYPE_CHECKING:
     import aiohttp
@@ -33,7 +34,7 @@ _CODE_RE = re.compile(r"^[0-9A-Z]{6}$")
 _HHMMSS_RE = re.compile(r"^\d{6}$")
 
 DB_AUTH_REJECTED_RSP_CODES: frozenset[str] = AUTH_REJECTION_CODES["dbsec"]
-DB_THROTTLE_RSP_CODE: str = "IGW00201"
+DB_THROTTLE_RSP_CODE: str = next(iter(RATE_LIMIT_RSP_CODES["dbsec"]))
 DB_AUCTION_PATH_HOUR_CLASS: str = "8"
 
 _CHARTMIN_PATH = "/api/v1/quote/kr-chart/min"
@@ -192,6 +193,7 @@ class DbsecApiClient(SharedTokenClientMixin):
         truncated = False
         pages_fetched = 0
         failure_msg = ""
+        failure_code = ""
         prev_identity: tuple[Any, ...] | None = None
         stalls = 0
         in_observer = False
@@ -221,6 +223,7 @@ class DbsecApiClient(SharedTokenClientMixin):
                 if not isinstance(data, dict) or str(data.get("rsp_cd", "")) != "00000":
                     termination = "vendor_failure"
                     truncated = True
+                    failure_code = str(data.get("rsp_cd", "")) if isinstance(data, dict) else ""
                     failure_msg = str(data.get("rsp_msg", "") if isinstance(data, dict) else "")
                     break
                 rows = _rows_of(data)
@@ -268,9 +271,14 @@ class DbsecApiClient(SharedTokenClientMixin):
                 "continuation": metadata,
             }
         if termination == "vendor_failure":
+            logger.warning(
+                "[DATA] stage=dbsec_chart status=VENDOR_FAILURE endpoint=chartmin code=%s rsp_cd=%s pages=%d rsp_msg=%s",
+                code, failure_code, pages_fetched, redact_for_egress(failure_msg)[:200],
+            )
             return {
                 "rt_cd": "1",
                 "msg1": failure_msg,
+                "vendor_error_code": failure_code,
                 "output2": [],
                 "vendor": "dbsec",
                 "truncated": True,
@@ -315,6 +323,7 @@ class DbsecApiClient(SharedTokenClientMixin):
         truncated = False
         pages_fetched = 0
         failure_msg = ""
+        failure_code = ""
         prev_identity: tuple[Any, ...] | None = None
         stalls = 0
         in_observer = False
@@ -344,6 +353,7 @@ class DbsecApiClient(SharedTokenClientMixin):
                 if not isinstance(data, dict) or str(data.get("rsp_cd", "")) != "00000":
                     termination = "vendor_failure"
                     truncated = True
+                    failure_code = str(data.get("rsp_cd", "")) if isinstance(data, dict) else ""
                     failure_msg = str(data.get("rsp_msg", "") if isinstance(data, dict) else "")
                     break
                 rows = _rows_of(data)
@@ -391,9 +401,14 @@ class DbsecApiClient(SharedTokenClientMixin):
                 "continuation": metadata,
             }
         if termination == "vendor_failure":
+            logger.warning(
+                "[DATA] stage=dbsec_chart status=VENDOR_FAILURE endpoint=auction_path code=%s rsp_cd=%s pages=%d rsp_msg=%s",
+                code, failure_code, pages_fetched, redact_for_egress(failure_msg)[:200],
+            )
             return {
                 "rt_cd": "1",
                 "msg1": failure_msg,
+                "vendor_error_code": failure_code,
                 "output2": [],
                 "vendor": "dbsec",
                 "truncated": True,

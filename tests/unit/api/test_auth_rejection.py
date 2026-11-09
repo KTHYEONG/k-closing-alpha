@@ -134,3 +134,13 @@ def test_non_dict_never_raises() -> None:
 
 def test_unknown_vendor_is_not_a_rejection() -> None:
     assert is_auth_rejected("unknown", 401, {}) is False  # type: ignore[arg-type]
+
+
+def test_throttle_constants_derive_from_shared_rate_limit_codes() -> None:
+    from src.api.auth_rejection import RATE_LIMIT_RSP_CODES
+    from src.api.dbsec.client import DB_THROTTLE_RSP_CODE
+    from src.api.ls.client import LS_THROTTLE_RSP_CODE
+
+    assert DB_THROTTLE_RSP_CODE == "IGW00201"
+    assert LS_THROTTLE_RSP_CODE == "IGW00201"
+    assert set(RATE_LIMIT_RSP_CODES) == {"ls", "dbsec"}

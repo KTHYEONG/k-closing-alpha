@@ -1383,3 +1383,66 @@ def test_ls_tr_retry_settings_honored(tmp_path, monkeypatch) -> None:
 
     assert len(session.requests_to("/stock/chart")) == 2
     assert sleeps == [0.5]
+
+
+def test_ls_minute_failure_keeps_rsp_cd() -> None:
+    client, _ = _paging_client([({"rsp_cd": "99999", "rsp_msg": "bad"}, {"tr_cont": "N"})])
+    res = asyncio.run(client.get_minute_chart(object(), "005930", "2026-09-04"))
+    assert res["termination_reason"] == "vendor_failure"
+    assert res["vendor_error_code"] == "99999"
+    assert res["msg1"] == "bad"
+
+
+def test_ls_tick_failure_keeps_rsp_cd() -> None:
+    client, _ = _paging_client([({"rsp_cd": "99999", "rsp_msg": "bad"}, {"tr_cont": "N"})])
+    res = asyncio.run(client.get_tick_chart(object(), "005930", "2026-09-04", max_pages=3))
+    assert res["termination_reason"] == "vendor_failure"
+    assert res["vendor_error_code"] == "99999"
+    assert res["msg1"] == "bad"
+
+
+def test_ls_exception_path_has_no_vendor_error_code() -> None:
+    async def _down(*a: Any, **k: Any) -> Any:
+        raise ConnectionError("wire cut")
+
+    client = _ls_client()
+    client._post_tr = _down  # type: ignore[method-assign]
+    res = asyncio.run(client.get_minute_chart(object(), "005930", "2026-09-04"))
+    assert res["termination_reason"] == "vendor_failure"
+    assert "vendor_error_code" not in res
+
+
+def test_ls_vendor_failure_logs_one_bounded_warning(caplog) -> None:
+    import logging
+
+    client, _ = _paging_client([({"rsp_cd": "99999", "rsp_msg": "x" * 300}, {"tr_cont": "N"})])
+    with caplog.at_level(logging.WARNING, logger="src.api.ls.client"):
+        asyncio.run(client.get_minute_chart(object(), "005930", "2026-09-04"))
+    records = [r.getMessage() for r in caplog.records if "VENDOR_FAILURE" in r.getMessage()]
+    assert len(records) == 1
+    message = records[0]
+    assert "[DATA]" in message
+    for token in ("endpoint=t8412", "code=005930", "rsp_cd=99999", "pages=1"):
+        assert token in message
+    assert "x" * 200 in message
+    assert "x" * 201 not in message
+
+    caplog.clear()
+    ok, _ = _paging_client([_tick_page([{"date": _YMD, "time": "120000", "close": 1}], "", "", "N", "")])
+    with caplog.at_level(logging.WARNING, logger="src.api.ls.client"):
+        asyncio.run(ok.get_tick_chart(object(), "005930", "2026-09-04", max_pages=3))
+    assert not [r for r in caplog.records if "VENDOR_FAILURE" in r.getMessage()]
+
+
+def test_ls_vendor_failure_log_masks_credentials(caplog) -> None:
+    import logging
+
+    client, _ = _paging_client(
+        [({"rsp_cd": "99999", "rsp_msg": "Bearer abc.def.ghi appkey=SECRET123"}, {"tr_cont": "N"})]
+    )
+    with caplog.at_level(logging.WARNING, logger="src.api.ls.client"):
+        asyncio.run(client.get_minute_chart(object(), "005930", "2026-09-04"))
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "VENDOR_FAILURE" in text
+    assert "SECRET123" not in text
+    assert "abc.def.ghi" not in text

@@ -511,3 +511,59 @@ def test_token_throttle_propagates_from_paging_loops(tmp_path, monkeypatch) -> N
         asyncio.run(client.get_auction_path(object(), "005930", floor_hhmmss="152000"))  # type: ignore[arg-type]
     with pytest.raises(DbsecTokenThrottled):
         asyncio.run(client.get_minute_chart(object(), "005930", _YMD))  # type: ignore[arg-type]
+
+
+def test_dbsec_failure_keeps_rsp_cd_for_minute_and_auction_path() -> None:
+    minute, _ = _paging_client([({"rsp_cd": "E", "rsp_msg": "bad"}, {"cont_yn": "N"})])
+    res = asyncio.run(minute.get_minute_chart(object(), "005930", _YMD))  # type: ignore[arg-type]
+    assert res["termination_reason"] == "vendor_failure"
+    assert res["vendor_error_code"] == "E"
+    assert res["msg1"] == "bad"
+
+    auction, _ = _paging_client([({"rsp_cd": "E", "rsp_msg": "bad"}, {"cont_yn": "N"})])
+    res2 = asyncio.run(auction.get_auction_path(object(), "005930", floor_hhmmss="152000"))  # type: ignore[arg-type]
+    assert res2["termination_reason"] == "vendor_failure"
+    assert res2["vendor_error_code"] == "E"
+
+    non_dict, _ = _paging_client([("garbage", {"cont_yn": "N"})])
+    res3 = asyncio.run(non_dict.get_minute_chart(object(), "005930", _YMD))  # type: ignore[arg-type]
+    assert res3["termination_reason"] == "vendor_failure"
+    assert res3["vendor_error_code"] == ""
+
+
+def test_dbsec_vendor_failure_logs_one_bounded_warning_per_walk(caplog) -> None:
+    import logging
+
+    minute, _ = _paging_client([({"rsp_cd": "E", "rsp_msg": "x" * 300}, {"cont_yn": "N"})])
+    with caplog.at_level(logging.WARNING, logger="src.api.dbsec.client"):
+        asyncio.run(minute.get_minute_chart(object(), "005930", _YMD))  # type: ignore[arg-type]
+    records = [r.getMessage() for r in caplog.records if "VENDOR_FAILURE" in r.getMessage()]
+    assert len(records) == 1
+    message = records[0]
+    assert "[DATA]" in message
+    for token in ("endpoint=chartmin", "code=005930", "rsp_cd=E", "pages=1"):
+        assert token in message
+    assert "x" * 200 in message
+    assert "x" * 201 not in message
+
+    caplog.clear()
+    auction, _ = _paging_client([({"rsp_cd": "E", "rsp_msg": "bad"}, {"cont_yn": "N"})])
+    with caplog.at_level(logging.WARNING, logger="src.api.dbsec.client"):
+        asyncio.run(auction.get_auction_path(object(), "005930", floor_hhmmss="152000"))
+    auction_records = [r.getMessage() for r in caplog.records if "VENDOR_FAILURE" in r.getMessage()]
+    assert len(auction_records) == 1
+    assert "endpoint=auction_path" in auction_records[0]
+
+
+def test_dbsec_vendor_failure_log_masks_credentials(caplog) -> None:
+    import logging
+
+    client, _ = _paging_client(
+        [({"rsp_cd": "E", "rsp_msg": "Bearer abc.def.ghi appkey=SECRET123"}, {"cont_yn": "N"})]
+    )
+    with caplog.at_level(logging.WARNING, logger="src.api.dbsec.client"):
+        asyncio.run(client.get_minute_chart(object(), "005930", _YMD))  # type: ignore[arg-type]
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "VENDOR_FAILURE" in text
+    assert "SECRET123" not in text
+    assert "abc.def.ghi" not in text

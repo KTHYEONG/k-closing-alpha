@@ -10,11 +10,12 @@ from typing import TYPE_CHECKING, Any
 from src.api._common import deadline_remaining, now_seoul, parse_expires_in, resolve_chart_budget, validate_target_ymd
 from src.api._token_client import SharedTokenClientMixin
 from src.api._transport import RetryPolicy, send_with_auth_retry
-from src.api.auth_rejection import AUTH_REJECTION_CODES
+from src.api.auth_rejection import AUTH_REJECTION_CODES, RATE_LIMIT_RSP_CODES
 from src.api.host_broker_contract import TokenIssueThrottled
 from src.api.kis.rate_limit import HostPacedRateLimiter, vendor_limiter
 from src.api.shared_token import IssuedToken
 from src.config import settings
+from src.tools.alerts import redact_for_egress
 
 if TYPE_CHECKING:
     import aiohttp
@@ -27,6 +28,7 @@ _YMD_RE = re.compile(r"^\d{8}$")
 _HHMMSS_RE = re.compile(r"^\d{6}$")
 
 LS_AUTH_REJECTED_RSP_CODES: frozenset[str] = AUTH_REJECTION_CODES["ls"]
+LS_THROTTLE_RSP_CODE: str = next(iter(RATE_LIMIT_RSP_CODES["ls"]))
 
 
 class LsApiClient(SharedTokenClientMixin):
@@ -129,7 +131,7 @@ class LsApiClient(SharedTokenClientMixin):
         policy = RetryPolicy(
             max_attempts=limit,
             rate_limit_wait=lambda attempt, response: (
-                backoff * (2**attempt) if str(response.body.get("rsp_cd", "")) == "IGW00201" else None
+                backoff * (2**attempt) if str(response.body.get("rsp_cd", "")) == LS_THROTTLE_RSP_CODE else None
             ),
         )
         response = await send_with_auth_retry(
@@ -184,6 +186,7 @@ class LsApiClient(SharedTokenClientMixin):
         truncated = False
         pages_fetched = 0
         failure_msg = ""
+        failure_code = ""
         prev_identity: tuple[Any, ...] | None = None
         stalls = 0
         in_observer = False
@@ -243,6 +246,7 @@ class LsApiClient(SharedTokenClientMixin):
                 if str(data.get("rsp_cd", "")) not in ("00000", "0"):
                     termination = "vendor_failure"
                     truncated = True
+                    failure_code = str(data.get("rsp_cd", ""))
                     failure_msg = str(data.get("rsp_msg", ""))
                     break
                 rows = data.get("t8412OutBlock1") or []
@@ -311,9 +315,14 @@ class LsApiClient(SharedTokenClientMixin):
                 "continuation": metadata,
             }
         if termination == "vendor_failure":
+            logger.warning(
+                "[DATA] stage=ls_chart status=VENDOR_FAILURE endpoint=t8412 code=%s rsp_cd=%s pages=%d rsp_msg=%s",
+                code, failure_code, pages_fetched, redact_for_egress(failure_msg)[:200],
+            )
             return {
                 "rt_cd": "1",
                 "msg1": failure_msg,
+                "vendor_error_code": failure_code,
                 "output2": [],
                 "vendor": "ls",
                 "truncated": True,
@@ -378,6 +387,7 @@ class LsApiClient(SharedTokenClientMixin):
         truncated = False
         pages_fetched = 0
         failure_msg = ""
+        failure_code = ""
         prev_identity: tuple[Any, ...] | None = None
         stalls = 0
         in_observer = False
@@ -435,6 +445,7 @@ class LsApiClient(SharedTokenClientMixin):
                 if str(data.get("rsp_cd", "")) not in ("00000", "0"):
                     termination = "vendor_failure"
                     truncated = True
+                    failure_code = str(data.get("rsp_cd", ""))
                     failure_msg = str(data.get("rsp_msg", ""))
                     break
                 rows = data.get("t8411OutBlock1") or []
@@ -500,9 +511,14 @@ class LsApiClient(SharedTokenClientMixin):
                 "continuation": metadata,
             }
         if termination == "vendor_failure":
+            logger.warning(
+                "[DATA] stage=ls_chart status=VENDOR_FAILURE endpoint=t8411 code=%s rsp_cd=%s pages=%d rsp_msg=%s",
+                code, failure_code, pages_fetched, redact_for_egress(failure_msg)[:200],
+            )
             return {
                 "rt_cd": "1",
                 "msg1": failure_msg,
+                "vendor_error_code": failure_code,
                 "output2": [],
                 "vendor": "ls",
                 "truncated": True,
