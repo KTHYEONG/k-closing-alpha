@@ -382,6 +382,8 @@ def attach_eod_labels(
         out = merged.copy()
         out["gross_return"] = pd.Series(dtype="float64")
         out["net_pit"] = pd.Series(dtype="float64")
+        # Callers select exit_date unconditionally; an all-unusable range must not fail on schema.
+        out["exit_date"] = pd.Series(dtype="datetime64[ns]")
         return out
     with_exits = attach_forward_exit_paths(merged, ph, market_dates, d_to_idx)
     return attach_pit_net_label(with_exits, cost=cost)

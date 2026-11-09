@@ -337,6 +337,20 @@ def test_attach_eod_labels_enter_at_final_close() -> None:
         assert row["gross_return"] == next_open[sym] / eod_close[sym] - 1.0
 
 
+def test_attach_eod_labels_empty_keys_keep_label_schema() -> None:
+    from src.ml.research.pit_certification import attach_eod_labels
+    from src.ml.topk_ranker_research import demean_label_by_date
+    from src.strategy.contract import AA_COST
+
+    ph, market_dates, d_to_idx, _panel, _days, _hist = _synth_inputs(n_days=6, n_symbols=3, auction=True)
+    keys = pd.DataFrame({"date": pd.to_datetime([]), "symbol": pd.Series([], dtype=str)})
+
+    out = demean_label_by_date(attach_eod_labels(keys, ph, market_dates, d_to_idx, cost=AA_COST), label_clip=0.1)
+
+    assert out.empty
+    assert {"net_pit", "train_label", "exit_date"} <= set(out.columns)
+
+
 def test_run_pit_certification_insufficient_days_status() -> None:
     synth = _synth_inputs(n_days=120, n_symbols=40)
     ph, market_dates, d_to_idx, panel, panel_days, serving_history = synth
