@@ -1672,3 +1672,185 @@ def test_run_topk_ranker_sleeve_requires_certified_top_k(monkeypatch) -> None:
     assert out.empty
     assert len(failures) == 1
     assert "top_k" in str(failures[0])
+
+
+def _core_history(symbols: list[str]) -> pd.DataFrame:
+    from src.ml.pit_core_features import CORE_HISTORY_COLUMNS
+
+    rng = np.random.default_rng(12)
+    dates = pd.bdate_range("2026-06-01", periods=60)
+    index = pd.DataFrame(
+        {
+            "date": dates,
+            "kospi_pct": rng.normal(0, 0.01, len(dates)),
+            "kosdaq_pct": rng.normal(0, 0.01, len(dates)),
+            "v_kospi": 20 + rng.normal(0, 1, len(dates)),
+        }
+    )
+    frames = []
+    for symbol in symbols:
+        close = 10_000 * np.exp(np.cumsum(rng.normal(0, 0.02, len(dates))))
+        frames.append(
+            index.assign(
+                symbol=symbol,
+                close=close,
+                prev_close=np.concatenate([[close[0]], close[:-1]]),
+                trade_value_100m=rng.uniform(50, 500, len(dates)),
+                market_cap_100m=rng.uniform(1000, 5000, len(dates)),
+            )
+        )
+    return pd.concat(frames, ignore_index=True)[list(CORE_HISTORY_COLUMNS)]
+
+
+def _pool_bars(symbols: list[str]) -> pd.DataFrame:
+    from src.daily.decision_bars import DECISION_BARS_COLUMNS
+
+    rng = np.random.default_rng(13)
+    end = np.arange(541, 921)
+    frames = []
+    for symbol in symbols:
+        close = 10_000 + np.cumsum(rng.integers(-20, 21, size=len(end)))
+        frames.append(
+            pd.DataFrame(
+                {
+                    "symbol": symbol,
+                    "end_min": end,
+                    "open": close,
+                    "high": close + 10,
+                    "low": close - 10,
+                    "close": close,
+                    "volume": rng.integers(1, 1000, size=len(end)).astype(float),
+                    "vendor": "toss",
+                    "fetched_at": pd.Timestamp("2026-09-09 15:21", tz="Asia/Seoul"),
+                }
+            )[list(DECISION_BARS_COLUMNS)]
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
+def _core_sleeve_patches(monkeypatch, *, fetch, persist=None):
+    import src.daily.decision_bars as decision_bars
+    import src.daily.predict as predict_mod
+    import src.ml.topk_history_features as thf
+    from src.ml.topk_contract import PIT_CORE_FEATURE_COLS
+    from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
+
+    wide, hist, decision = _sleeve_wide_and_history()
+    bundle = build_fixed_serving_bundle(list(PIT_CORE_FEATURE_COLS))
+    bundle["top_k"] = 3
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, **_kw: wide)
+    monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
+    from src.ml.pit_core_features import CORE_HISTORY_COLUMNS
+
+    def _load(_d, *, columns=None, **_kw):
+        if tuple(columns or ()) == CORE_HISTORY_COLUMNS:
+            return _core_history(wide["종목코드"].tolist())
+        return hist
+
+    monkeypatch.setattr(thf, "load_serving_price_history", _load)
+    monkeypatch.setattr(predict_mod, "fetch_pool_decision_bars", fetch)
+    monkeypatch.setattr(decision_bars, "persist_decision_bars", persist or (lambda *_a, **_k: None))
+    return predict_mod, wide, decision
+
+
+def test_run_topk_ranker_sleeve_core_bundle_fetches_bars_and_attaches_features(monkeypatch) -> None:
+    import src.ml.topk_contract as contract
+
+    fetched = []
+
+    def _fetch(symbols, d):
+        fetched.append((list(symbols), d))
+        return _pool_bars(symbols)
+
+    predict_mod, wide, decision = _core_sleeve_patches(monkeypatch, fetch=_fetch)
+    seen = {}
+    real_select = contract.select_topk_equal_weight
+
+    def _spy_select(features_df, bundle, *, top_k):
+        seen["columns"] = list(features_df.columns)
+        return real_select(features_df, bundle, top_k=top_k)
+
+    monkeypatch.setattr(contract, "select_topk_equal_weight", _spy_select)
+
+    out = predict_mod.run_topk_ranker_sleeve(decision)
+
+    assert fetched == [(wide["종목코드"].astype(str).tolist(), decision)]
+    assert set(contract.PIT_CORE_EXTRA_FEATURE_COLS) <= set(seen["columns"])
+    assert len(out) == 3
+
+
+def test_run_topk_ranker_sleeve_core_bundle_low_bar_coverage_is_no_decision(monkeypatch) -> None:
+    from src.daily.decision_bars import DECISION_BARS_COLUMNS
+
+    predict_mod, _wide, decision = _core_sleeve_patches(
+        monkeypatch,
+        fetch=lambda _symbols, _d: pd.DataFrame(columns=list(DECISION_BARS_COLUMNS)),
+    )
+    failures: list[Exception] = []
+
+    out = predict_mod.run_topk_ranker_sleeve(decision, on_failure=failures.append)
+
+    assert out.empty
+    assert len(failures) == 1
+    assert isinstance(failures[0], ValueError)
+
+
+def test_run_topk_ranker_sleeve_base_bundle_never_fetches_bars(monkeypatch) -> None:
+    import src.daily.predict as predict_mod
+    import src.ml.topk_history_features as thf
+    from src.ml.topk_contract import FEATURE_COLS
+    from tests.unit.serving.realtime.fixtures import build_fixed_serving_bundle
+
+    wide, _hist, decision = _sleeve_wide_and_history()
+    bundle = build_fixed_serving_bundle(list(FEATURE_COLS))
+    bundle["top_k"] = 3
+
+    def _must_not_fetch(_symbols, _d):
+        raise AssertionError("base bundle must not fetch decision bars")
+
+    monkeypatch.setattr(predict_mod, "load_daily_snapshot", lambda _d, **_kw: wide)
+    monkeypatch.setattr(predict_mod, "load_model_bundle", lambda import_dir=None: bundle)
+    monkeypatch.setattr(thf, "load_serving_price_history", lambda _d, **_kw: pytest.fail("no history read"))
+    monkeypatch.setattr(predict_mod, "fetch_pool_decision_bars", _must_not_fetch)
+
+    out = predict_mod.run_topk_ranker_sleeve(decision)
+
+    assert len(out) == 3
+
+
+def test_run_topk_ranker_sleeve_persist_failure_does_not_block_decision(monkeypatch) -> None:
+    def _broken_persist(*_a, **_k):
+        raise OSError("disk full")
+
+    predict_mod, _wide, decision = _core_sleeve_patches(
+        monkeypatch,
+        fetch=lambda symbols, _d: _pool_bars(symbols),
+        persist=_broken_persist,
+    )
+
+    out = predict_mod.run_topk_ranker_sleeve(decision)
+
+    assert len(out) == 3
+
+
+def test_fetch_pool_decision_bars_runs_fetch_over_one_session(monkeypatch) -> None:
+    import src.daily.decision_bars as decision_bars
+    import src.daily.predict as predict_mod
+
+    client = object()
+    recorded = {}
+
+    async def _fake_fetch(c, session, symbols, d):
+        recorded.update(client=c, session=session, symbols=list(symbols), decision=d)
+        return _pool_bars(list(symbols))
+
+    monkeypatch.setattr(decision_bars, "build_decision_bars_client", lambda: client)
+    monkeypatch.setattr(decision_bars, "fetch_decision_bars", _fake_fetch)
+    decision = pd.Timestamp("2026-09-09")
+
+    out = predict_mod.fetch_pool_decision_bars(["000001", "000002"], decision)
+
+    assert recorded["client"] is client
+    assert recorded["symbols"] == ["000001", "000002"]
+    assert recorded["decision"] == decision
+    assert set(out["symbol"]) == {"000001", "000002"}

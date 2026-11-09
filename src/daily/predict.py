@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import logging
 import subprocess
@@ -238,6 +239,21 @@ def validate_index_inputs(wide: pd.DataFrame) -> None:
         raise ValueError(f"index value invalid: v_kospi non-finite or <= 0 n_bad={bad_value} n_rows={len(wide)}")
 
 
+def fetch_pool_decision_bars(symbols: list[str], decision_date: pd.Timestamp) -> pd.DataFrame:
+    """Fetch the 15:20 decision-session bars for the rank pool over one HTTP session."""
+    import aiohttp
+
+    from src.daily.decision_bars import build_decision_bars_client, fetch_decision_bars
+
+    client = build_decision_bars_client()
+
+    async def _run() -> pd.DataFrame:
+        async with aiohttp.ClientSession() as session:
+            return await fetch_decision_bars(client, session, symbols, decision_date)
+
+    return asyncio.run(_run())
+
+
 def run_topk_ranker_sleeve(decision_date: pd.Timestamp, *, on_failure: Callable[[Exception], None] | None = None, on_rank_pool: Callable[[pd.DataFrame], None] | None = None) -> pd.DataFrame:
     """자동 top-3 리랭커 슬리브를 실행한다.
 
@@ -255,8 +271,14 @@ def run_topk_ranker_sleeve(decision_date: pd.Timestamp, *, on_failure: Callable[
     """
     try:
         from src.ml import topk_history_features
-        from src.ml.topk_contract import TOPK_RANKER_BUNDLE_DIR, score_topk_candidates, select_topk_equal_weight
-        from src.serving.realtime.features import build_topk_ranker_features
+        from src.ml.pit_core_features import CORE_HISTORY_COLUMNS
+        from src.ml.topk_contract import (
+            PIT_CORE_EXTRA_FEATURE_COLS,
+            TOPK_RANKER_BUNDLE_DIR,
+            score_topk_candidates,
+            select_topk_equal_weight,
+        )
+        from src.serving.realtime.features import attach_pit_core_features, build_topk_ranker_features
         from src.strategy.store import require_production_store
 
         require_production_store()
@@ -269,6 +291,16 @@ def run_topk_ranker_sleeve(decision_date: pd.Timestamp, *, on_failure: Callable[
         if set(bundle.get("feature_cols", [])) & (set(topk_history_features.TOPK_HISTORY_FEATURE_COLS) | set(topk_history_features.TOPK_FLOW_FEATURE_COLS)):
             price_history = topk_history_features.load_serving_price_history(decision_date)
         features_df = build_topk_ranker_features(wide, decision_date, price_history=price_history)
+        if set(bundle.get("feature_cols", [])) & set(PIT_CORE_EXTRA_FEATURE_COLS):
+            core_history = topk_history_features.load_serving_price_history(decision_date, columns=CORE_HISTORY_COLUMNS)
+            bars = fetch_pool_decision_bars(wide["종목코드"].astype(str).tolist(), decision_date)
+            try:
+                from src.daily.decision_bars import persist_decision_bars
+
+                persist_decision_bars(decision_date, bars)
+            except OSError as exc:
+                logger.warning("[DATA] stage=decision_bars status=PERSIST_FAILED reason=%s", type(exc).__name__)
+            features_df = attach_pit_core_features(features_df, bars=bars, history=core_history)
         features_df["admitted"] = wide["admitted"].to_numpy()
         if "top_k" not in bundle:
             raise ValueError("bundle is missing the certified top_k")
