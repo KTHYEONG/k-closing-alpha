@@ -1182,3 +1182,140 @@ def test_retrain_recon_certification_dispatches(tmp_path, monkeypatch) -> None:
     assert calls[0]["export_dir"] == str(tmp_path)
     assert str(calls[0]["recon_panel_dir"]).endswith("recon")
     assert calls[0]["train_start"] == pd.Timestamp("2024-01-02")
+
+
+class _RowSumModel:
+    def predict(self, features):
+        import numpy as np
+
+        return np.nan_to_num(np.asarray(features, dtype=np.float64)).sum(axis=1)
+
+
+def _core_candidate() -> dict:
+    import dataclasses
+
+    from src.ml.topk_contract import FEATURE_CONTRACT_VERSION_KEY, PIT_CORE_CONTRACT_VERSION_KEY, PIT_CORE_FEATURE_COLS
+    from src.strategy.contract import PRODUCTION_STRATEGY
+
+    return {"strategy_id": "KCA-TOPK-COSTAWARE-002", "training_cutoff": "2026-11-06 00:00:00", "train_start": "2023-01-25",
+            "feature_cols": list(PIT_CORE_FEATURE_COLS), "return_model": _RowSumModel(), "quantile_models": {}, "calibrators": {},
+            "top_k": 3, FEATURE_CONTRACT_VERSION_KEY: "1", PIT_CORE_CONTRACT_VERSION_KEY: "1", "model_recipe": "pit_core_v1",
+            "select_universe": dataclasses.asdict(PRODUCTION_STRATEGY.universe)}
+
+
+def _core_gate_frame():
+    import numpy as np
+    import pandas as pd
+
+    from src.ml.topk_contract import PIT_CORE_FEATURE_COLS
+
+    rng = np.random.default_rng(5)
+    rows = [{"date": pd.Timestamp(day), "symbol": f"{i:06d}", **{c: rng.normal() for c in PIT_CORE_FEATURE_COLS}}
+            for day in ("2026-10-01", "2026-10-02") for i in range(5)]
+    return pd.DataFrame(rows)
+
+
+def _stage_core_branch(tmp_path, monkeypatch, *, live: dict | None):
+    import os
+
+    import numpy as np
+    import pandas as pd
+
+    import src.ml.pit_core_train as core
+    import src.ml.retrain as mod
+    from src.ml.research import v3_engine
+
+    ph_path = tmp_path / "price_history.parquet"
+    _price_history_file(ph_path)
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", ph_path)
+    monkeypatch.setenv("KCA_CODE_COMMIT", "abc123")
+    dates = pd.bdate_range("2023-01-02", periods=20)
+    market_dates = np.array(dates)
+    monkeypatch.setattr(
+        v3_engine, "load_and_prepare_price_history",
+        lambda path, **kwargs: (pd.DataFrame({"date": dates}), market_dates, {pd.Timestamp(d): i for i, d in enumerate(dates)}),
+    )
+    monkeypatch.setattr(core, "extend_pit_store", lambda *args, **kwargs: [])
+    monkeypatch.setattr(core, "read_pit_store", lambda store_dir: pd.DataFrame({"date": dates[:1], "symbol": ["000001"]}))
+    monkeypatch.setattr(core, "build_core_training_frame", lambda *args, **kwargs: "frame")
+    monkeypatch.setattr(core, "build_core_gate_eval_frame", lambda frame, **kwargs: _core_gate_frame())
+    monkeypatch.setattr(core, "train_core_bundle", lambda frame, **kwargs: _core_candidate())
+    monkeypatch.setattr(mod, "load_current_bundle", lambda export_dir: live)
+    saved: list[str] = []
+
+    def _fake_save(bundle, export_dir):
+        saved.append(export_dir)
+        os.makedirs(export_dir, exist_ok=True)
+        path = os.path.join(export_dir, "sizing_pipeline_bundle.joblib")
+        with open(path, "wb") as fh:
+            fh.write(repr(sorted(bundle)).encode())
+        return path
+
+    monkeypatch.setattr(mod, "save_production_bundle", _fake_save)
+    return mod, saved
+
+
+def test_retrain_train_core_bundle_flag_parses() -> None:
+    from src.ml.retrain import build_arg_parser
+
+    assert build_arg_parser().parse_args(["--train-core-bundle"]).train_core_bundle is True
+
+
+def test_core_branch_gate_rejects_feature_change_vs_live_a(tmp_path, monkeypatch) -> None:
+    import json
+
+    import pytest
+
+    from src.ml.topk_contract import FEATURE_CONTRACT_VERSION_KEY, RANKER_FEATURE_COLS
+
+    import dataclasses
+
+    from src.strategy.contract import PRODUCTION_STRATEGY
+
+    live_a = {"strategy_id": "KCA-TOPK-COSTAWARE-002", "training_cutoff": "2026-09-18 00:00:00", "train_start": "2016-01-04",
+              "feature_cols": list(RANKER_FEATURE_COLS), "return_model": _RowSumModel(), "quantile_models": {}, "calibrators": {},
+              "top_k": 3, FEATURE_CONTRACT_VERSION_KEY: "1",
+              "select_universe": dataclasses.asdict(PRODUCTION_STRATEGY.universe)}
+    mod, saved = _stage_core_branch(tmp_path, monkeypatch, live=live_a)
+    live_file = tmp_path / "topk_ranker" / "sizing_pipeline_bundle.joblib"
+    live_file.parent.mkdir(parents=True)
+    live_file.write_bytes(b"live-a")
+
+    with pytest.raises(RuntimeError, match="promotion gate rejected"):
+        mod.main(["--train-core-bundle", "--export-dir", str(tmp_path)])
+
+    assert saved == [str(tmp_path / "topk_ranker" / "rejected")]
+    assert live_file.read_bytes() == b"live-a"
+    rows = [json.loads(line) for line in (tmp_path / "topk_ranker" / "retrain_registry.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "REJECTED"
+    assert any("feature contract changed vs live bundle" in reason for reason in rows[0]["reasons"])
+
+
+def test_core_branch_skip_gate_publishes(tmp_path, monkeypatch) -> None:
+    import json
+
+    import src.ml.retrain as mod
+
+    mod_, saved = _stage_core_branch(tmp_path, monkeypatch, live=None)
+    evaluated: list[object] = []
+    monkeypatch.setattr(mod_, "evaluate_retrain_promotion", lambda *args, **kwargs: evaluated.append(args))
+
+    mod_.main(["--train-core-bundle", "--skip-promotion-gate", "--export-dir", str(tmp_path)])
+
+    assert evaluated == []
+    assert saved == [str(tmp_path / "topk_ranker")]
+    rows = [json.loads(line) for line in (tmp_path / "topk_ranker" / "retrain_registry.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [row["outcome"] for row in rows] == ["PROMOTED_UNGATED"]
+
+
+def test_retrain_train_core_bundle_missing_price_history_raises(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    import src.ml.retrain as mod
+    from src.ml.retrain import main
+
+    monkeypatch.setattr(mod.settings, "PRICE_HISTORY_PARQUET_PATH", tmp_path / "missing.parquet")
+
+    with pytest.raises(ValueError, match="price_history not found"):
+        main(["--train-core-bundle", "--export-dir", str(tmp_path)])

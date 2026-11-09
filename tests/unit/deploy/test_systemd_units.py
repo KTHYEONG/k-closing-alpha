@@ -202,7 +202,7 @@ def test_retrain_timer_exists_and_install_script_enables_it() -> None:
     assert "Persistent=true" in timer
 
     # And: 서비스가 재학습 커맨드 + 실패 얼러트 훅을 가짐
-    assert "src.ml.retrain --train-ranker-bundle" in service
+    assert "src.ml.retrain --train-core-bundle" in service
     assert "OnFailure=kca-alert@%n.service" in service
 
     # And: install_systemd.sh 가 이 타이머를 활성화 목록에 포함
@@ -219,7 +219,7 @@ def test_retrain_service_runs_containerized_with_measured_resource_limits() -> N
     assert "--memory=6g" in text
     assert "--cpus=1.8" in text
     assert "OnFailure=kca-alert@%n.service" in text
-    assert "src.ml.retrain --train-ranker-bundle" in text
+    assert "src.ml.retrain --train-core-bundle" in text
 
 
 def test_containerized_units_use_shared_image_and_new_env_file() -> None:
