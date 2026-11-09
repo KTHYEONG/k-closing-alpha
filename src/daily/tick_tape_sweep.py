@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -44,6 +44,7 @@ class TapeSweepReport:
     unrecoverable: tuple[str, ...] = ()
     lookback_days: int = 0
     expired_recoverable: tuple[str, ...] = ()
+    terminations: dict[str, int] = field(default_factory=dict)
 
 
 def _now() -> datetime:
@@ -127,6 +128,7 @@ def _write_report(root: Path, run_date: str, report: TapeSweepReport) -> None:
         "unrecoverable": list(report.unrecoverable),
         "lookback_days": report.lookback_days,
         "expired_recoverable": list(report.expired_recoverable),
+        "terminations": dict(report.terminations),
     }
     try:
         target = _report_path(root)
@@ -297,7 +299,7 @@ async def run_tick_tape_sweep(
     if expired_recoverable:
         logger.info("[DATA] stage=tape_sweep status=EXPIRED_RECOVERABLE n=%d", len(expired_recoverable))
     logger.info(
-        "[DATA] stage=tape_sweep_report needs=%d pages=%d rows=%d recovered=%d unresolved=%d expired=%d remaining=%s skipped_unclosed=%d",
+        "[DATA] stage=tape_sweep_report needs=%d pages=%d rows=%d recovered=%d unresolved=%d expired=%d remaining=%s skipped_unclosed=%d terminations=%s",
         len(active_keys),
         summary.pages,
         summary.rows,
@@ -306,6 +308,7 @@ async def run_tick_tape_sweep(
         len(expired),
         summary.remaining,
         int(summary.skipped_unclosed),
+        ",".join(f"{reason}:{count}" for reason, count in summary.terminations),
     )
     report = TapeSweepReport(
         days_checked=tuple(window),
@@ -322,6 +325,7 @@ async def run_tick_tape_sweep(
         unrecoverable=tuple(terminalized_keys),
         lookback_days=int(lookback_days),
         expired_recoverable=tuple(expired_recoverable),
+        terminations=dict(summary.terminations),
     )
     _write_report(root, today.isoformat(), report)
     return report

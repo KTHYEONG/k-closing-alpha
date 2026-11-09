@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 _MIN_START_MARGIN_SECONDS = 180
 _MAX_VENDOR_FAILURE_STREAK = 3
+_CLEAN_TERMINATIONS = frozenset({"tape_end", "crossed_stop_day"})
 
 SETTLED_TAPE_STATUSES: frozenset[str] = frozenset({CaptureStatus.COMPLETE.value, CaptureStatus.NO_TRADES.value})
 
@@ -95,6 +96,7 @@ class TapeRunSummary:
     stopped: bool
     stopped_reason: str
     skipped_unclosed: int = 0
+    terminations: tuple[tuple[str, int], ...] = ()
 
 
 def parse_walk_deadline(value: str | None) -> datetime | None:
@@ -758,6 +760,7 @@ async def run_walk_tasks(
     expected: dict[tuple[str, str, str], int] = {}
     pending_ledger: list[dict[str, Any]] = []
     pages = rows = unresolved = skipped_unclosed = failure_streak = 0
+    terminations: dict[str, int] = {}
     remaining: list[str] = []
     started = time.monotonic()
     stopped_reason = ""
@@ -816,6 +819,16 @@ async def run_walk_tasks(
             raise RuntimeError(f"Tape backfill evidence failed symbol={task.symbol}: {exc}") from exc
         pages += int(outcome.pages_fetched)
         skipped_unclosed += len(outcome.skipped_unclosed)
+        terminations[outcome.termination_reason] = terminations.get(outcome.termination_reason, 0) + 1
+        if outcome.unresolved_days or outcome.termination_reason not in _CLEAN_TERMINATIONS:
+            logger.warning(
+                "[DATA] stage=tape_walk_end symbol=%s venue=%s termination=%s pages=%d unresolved=%s",
+                task.symbol,
+                task.venue,
+                outcome.termination_reason,
+                int(outcome.pages_fetched),
+                ",".join(outcome.unresolved_days),
+            )
         if outcome.unresolved_days:
             logger.info(
                 "[DATA] stage=tape_backfill symbol=%s venue=%s status=GUARD_STOP remaining_days=%d",
@@ -844,6 +857,7 @@ async def run_walk_tasks(
                         "session": result.session,
                         "status": result.entry.status.value,
                         "reason": result.entry.reason,
+                        "termination": outcome.termination_reason,
                         "run_id": run_id,
                         "run_date": run_date,
                     }
@@ -881,4 +895,5 @@ async def run_walk_tasks(
         stopped=bool(remaining),
         stopped_reason=stopped_reason,
         skipped_unclosed=skipped_unclosed,
+        terminations=tuple(sorted(terminations.items())),
     )

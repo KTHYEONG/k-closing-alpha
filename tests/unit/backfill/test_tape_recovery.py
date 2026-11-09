@@ -599,3 +599,148 @@ def test_legacy_same_day_marker_excluded(tmp_path) -> None:
           "run_id": "tape-2026-10-02-0001"}],
     )
     assert tr.read_tape_attempts(ledger)[("A", "2026-10-02", "krx_aftermarket")].attempts == 0
+
+
+class _TokenClient:
+    def reset_token(self) -> None:
+        return None
+
+
+def _krx_walk_tasks(*codes: str) -> list[tr.WalkTask]:
+    sessions = tuple(s for s in TAPE_SESSIONS if s.venue == "KRX")
+    return [tr.WalkTask(symbol=code, venue="KRX", days=(_DAY,), sessions=sessions) for code in codes]
+
+
+def _outcome_by_symbol(outcomes: dict[str, TapeWalkOutcome]):
+    async def _fake(client, http_session, code, days, **kwargs):
+        return outcomes[code]
+
+    return _fake
+
+
+def _dry_run(tmp_path, monkeypatch, tasks: list[tr.WalkTask], outcomes: dict[str, TapeWalkOutcome]):
+    _patch_roots(tmp_path, monkeypatch)
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _outcome_by_symbol(outcomes))
+    return asyncio.run(
+        tr.run_walk_tasks(
+            tasks,
+            client=_TokenClient(),
+            http_session=object(),
+            store=CaptureStore(tmp_path / "capture"),
+            profile=_profile(tmp_path),
+            apply=False,
+            ledger=tmp_path / "l.jsonl",
+            deadline=None,
+            blackouts=[],
+            run_date="2026-09-20",
+        )
+    )
+
+
+def _walk_end_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "stage=tape_walk_end" in r.getMessage()]
+
+
+def test_walk_end_logged_for_truncated_walk(tmp_path, monkeypatch, caplog) -> None:
+    caplog.set_level("WARNING", logger=tr.logger.name)
+    outcomes = {
+        "000001": TapeWalkOutcome(termination_reason="page_budget", pages_fetched=5, unresolved_days=(_DAY,)),
+        "000002": TapeWalkOutcome(termination_reason="tape_end", pages_fetched=2, unresolved_days=()),
+    }
+    _dry_run(tmp_path, monkeypatch, _krx_walk_tasks("000001", "000002"), outcomes)
+    lines = _walk_end_lines(caplog)
+    assert len(lines) == 1
+    assert "symbol=000001" in lines[0] and "termination=page_budget" in lines[0] and f"unresolved={_DAY}" in lines[0]
+
+
+def test_clean_walk_not_logged(tmp_path, monkeypatch, caplog) -> None:
+    caplog.set_level("WARNING", logger=tr.logger.name)
+    outcomes = {
+        "000001": TapeWalkOutcome(termination_reason="tape_end", pages_fetched=2, unresolved_days=()),
+        "000002": TapeWalkOutcome(termination_reason="crossed_stop_day", pages_fetched=1, unresolved_days=()),
+    }
+    _dry_run(tmp_path, monkeypatch, _krx_walk_tasks("000001", "000002"), outcomes)
+    assert _walk_end_lines(caplog) == []
+
+
+def test_terminations_counted_in_summary(tmp_path, monkeypatch) -> None:
+    outcomes = {
+        "000001": TapeWalkOutcome(termination_reason="tape_end", pages_fetched=1, unresolved_days=()),
+        "000002": TapeWalkOutcome(termination_reason="tape_end", pages_fetched=1, unresolved_days=()),
+        "000003": TapeWalkOutcome(termination_reason="page_budget", pages_fetched=3, unresolved_days=()),
+        "000004": TapeWalkOutcome(termination_reason="tape_end", pages_fetched=1, unresolved_days=()),
+        "000005": TapeWalkOutcome(termination_reason="vendor_failure", pages_fetched=0, unresolved_days=()),
+    }
+    summary = _dry_run(tmp_path, monkeypatch, _krx_walk_tasks(*sorted(outcomes)), outcomes)
+    assert summary.terminations == (("page_budget", 1), ("tape_end", 3), ("vendor_failure", 1))
+
+
+def test_ledger_record_has_termination_and_old_rows_load(tmp_path, monkeypatch) -> None:
+    import json
+
+    from src.backfill.intraday.tape_harvest import TapeDayResult
+
+    _patch_roots(tmp_path, monkeypatch)
+    store = CaptureStore(tmp_path / "capture")
+    sessions = tuple(s for s in TAPE_SESSIONS if s.venue == "KRX")
+    tasks = [tr.WalkTask(symbol="000001", venue="KRX", days=(_DAY,), sessions=sessions)]
+
+    async def _fake(client, http_session, code, days, **kwargs):
+        for spec in kwargs.get("sessions", ()):
+            kwargs["on_result"](
+                TapeDayResult(
+                    symbol=code,
+                    day=_DAY,
+                    session=spec.session,
+                    frame=pd.DataFrame(),
+                    entry=CoverageEntry(
+                        symbol=code,
+                        dataset=CaptureDataset.TRADE_TICKS,
+                        venue="KRX",
+                        session=spec.session,
+                        scheduled_at=None,
+                        status=CaptureStatus.UNKNOWN,
+                        rows=0,
+                        first_event_time=None,
+                        last_event_time=None,
+                        reason="day_not_on_tape",
+                        raw_refs=(),
+                    ),
+                )
+            )
+        return TapeWalkOutcome(termination_reason="page_budget", pages_fetched=1, unresolved_days=())
+
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _fake)
+    ledger = tmp_path / "ledger.jsonl"
+    asyncio.run(
+        tr.run_walk_tasks(
+            tasks,
+            client=_TokenClient(),
+            http_session=object(),
+            store=store,
+            profile=_profile(tmp_path),
+            apply=True,
+            ledger=ledger,
+            deadline=None,
+            blackouts=[],
+            run_date="2026-09-20",
+        )
+    )
+    records = _ledger_lines(ledger)
+    assert records and all(r.get("termination") == "page_budget" for r in records)
+
+    legacy = {
+        "symbol": "000009",
+        "day": _DAY,
+        "session": "regular",
+        "status": CaptureStatus.UNKNOWN.value,
+        "reason": "day_not_on_tape",
+        "run_id": "tape-2026-09-20-0000",
+        "run_date": "2026-09-20",
+    }
+    with ledger.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(legacy, sort_keys=True) + "\n")
+    settled = tr.read_settled_ledger(ledger)
+    assert settled[("000009", _DAY, "regular")] == CaptureStatus.UNKNOWN.value
+    attempts = tr.read_tape_attempts(ledger)
+    assert attempts[("000009", _DAY, "regular")].latest_reason == "day_not_on_tape"

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -776,3 +778,55 @@ def test_ceiling_bar_does_not_create_a_sweep_need(tmp_path, monkeypatch) -> None
 
     assert report.needs == 0
     assert report.remaining == ()
+
+
+_LEGACY_REPORT_KEYS = {
+    "run_date",
+    "days_checked",
+    "needs",
+    "recovered",
+    "unresolved",
+    "expired",
+    "expiring",
+    "remaining",
+    "disk_guard",
+    "pages",
+    "rows",
+    "expiring_needs",
+    "unrecoverable",
+    "lookback_days",
+    "expired_recoverable",
+}
+
+
+def test_report_json_gains_terminations_additively(tmp_path, monkeypatch, caplog) -> None:
+    from src.tools import daily_audit
+
+    caplog.set_level(logging.INFO, logger=sweep.logger.name)
+    _patch_sweep(monkeypatch, tmp_path)
+    _patch_universe(monkeypatch, {_DAY})
+    monkeypatch.setattr(sweep, "_open_kiwoom", lambda: _stub_kiwoom())
+    calls: list[dict[str, Any]] = []
+    inner = _fake_harvest_ok(calls)
+
+    async def _page_budget(client: Any, http_session: Any, code: str, days: Any, **kwargs: Any) -> Any:
+        result = await inner(client, http_session, code, days, **kwargs)
+        return TapeWalkOutcome(
+            termination_reason="page_budget", pages_fetched=result.pages_fetched, unresolved_days=()
+        )
+
+    monkeypatch.setattr(tr, "harvest_symbol_tape", _page_budget)
+    _seed_bars(_DAY, "regular", "005930", ["090000"], "100")
+
+    report = _run(_profile(tmp_path))
+
+    assert calls and set(report.terminations) == {"page_budget"}
+    assert report.terminations == {"page_budget": len(calls)}
+    payload = json.loads((tmp_path / "capture" / "staging" / "tape_sweep" / "last_report.json").read_text("utf-8"))
+    assert set(payload).issuperset(_LEGACY_REPORT_KEYS)
+    assert payload["terminations"] == {"page_budget": len(calls)}
+    assert isinstance(payload["needs"], int) and isinstance(payload["remaining"], list)
+    assert daily_audit.tape_sweep_residual_line(date(2026, 10, 1), report=payload) is not None
+    summary_lines = [r.getMessage() for r in caplog.records if "stage=tape_sweep_report" in r.getMessage()]
+    assert len(summary_lines) == 1
+    assert summary_lines[0].endswith(f"terminations=page_budget:{len(calls)}")
