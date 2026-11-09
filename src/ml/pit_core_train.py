@@ -24,7 +24,11 @@ from src.ml.pit_core_features import (
     index_table_from_price_history,
     path_features,
 )
-from src.ml.research.pit_certification import attach_eod_labels
+from src.ml.research.pit_certification import (
+    PitCertificationConfig,
+    attach_eod_labels,
+    select_usable_panel_days,
+)
 from src.ml.research.v3_engine import FORWARD_EXIT_MAX_DAYS
 from src.ml.retrain_gate import RETRAIN_GATE_EVAL_DAYS
 from src.ml.topk_contract import (
@@ -161,6 +165,17 @@ def extend_pit_store(store_dir: Path, *, through: pd.Timestamp) -> list[pd.Times
     )
     panel = pd.read_parquet(build_dir / "pit1520_panel.parquet")
     panel_days = pd.read_parquet(build_dir / "pit1520_panel_days.parquet")
+    usable = select_usable_panel_days(
+        panel_days,
+        cert_dates=list(pd.to_datetime(panel_days["date"])),
+        config=PitCertificationConfig(min_day_coverage=PIT_STORE_MIN_DAY_COVERAGE),
+    )
+    if not usable:
+        # The dataset builder cannot run on an empty panel; an all-unusable range simply adds no days
+        # and is retried from the same last stored day next time.
+        _retire_build_dir(store_dir, build_dir)
+        logger.info("[DATA] stage=pit_store extend days_written=0 reason=no_usable_days through=%s", _day_key(end))
+        return []
     dataset = build_dataset(
         panel=panel,
         panel_days=panel_days,
@@ -183,11 +198,15 @@ def extend_pit_store(store_dir: Path, *, through: pd.Timestamp) -> list[pd.Times
         )
         write_store_day(store_dir, day, day_rows[list(PIT_STORE_COLUMNS)])
         written.append(pd.Timestamp(day))
+    _retire_build_dir(store_dir, build_dir)
+    logger.info("[DATA] stage=pit_store extend days_written=%d through=%s", len(written), _day_key(end))
+    return written
+
+
+def _retire_build_dir(store_dir: Path, build_dir: Path) -> None:
     done_dir = store_dir / _BUILD_DONE_DIRNAME
     done_dir.mkdir(parents=True, exist_ok=True)
     shutil.move(str(build_dir), str(done_dir / build_dir.name))
-    logger.info("[DATA] stage=pit_store extend days_written=%d through=%s", len(written), _day_key(end))
-    return written
 
 
 def build_core_training_frame(

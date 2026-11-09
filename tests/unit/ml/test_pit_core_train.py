@@ -347,3 +347,28 @@ def test_main_dispatches_seed_and_extend(tmp_path, monkeypatch) -> None:
 
     assert len(core.read_pit_store(store_dir)) == 1
     assert extended == [pd.Timestamp("2026-03-03")]
+
+
+def test_extend_skips_range_without_usable_days(tmp_path, monkeypatch) -> None:
+    from src.ml.research import pit_walkforward
+
+    core.write_store_day(tmp_path, pd.Timestamp("2026-11-05"), _store_day_rows("2026-11-05", ["000001"]))
+
+    def fake_panel(*, start, end, out_dir, **_kwargs):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"date": pd.to_datetime([]), "symbol": pd.Series([], dtype=str)}).to_parquet(
+            out_dir / "pit1520_panel.parquet"
+        )
+        pd.DataFrame({
+            "date": [pd.Timestamp(start)], "source": ["bars"], "superset_coverage": [0.45], "index_basis": ["eod"],
+        }).to_parquet(out_dir / "pit1520_panel_days.parquet")
+
+    def no_dataset(**_kwargs):
+        raise AssertionError("build_dataset must not run on an all-unusable range")
+
+    monkeypatch.setattr(pit_walkforward, "build_research_panel", fake_panel)
+    monkeypatch.setattr(pit_walkforward, "build_dataset", no_dataset)
+
+    assert core.extend_pit_store(tmp_path, through=pd.Timestamp("2026-11-06")) == []
+    assert sorted(core.read_pit_store(tmp_path)["date"].unique()) == [pd.Timestamp("2026-11-05")]
+    assert not any((tmp_path / "_build").iterdir())
