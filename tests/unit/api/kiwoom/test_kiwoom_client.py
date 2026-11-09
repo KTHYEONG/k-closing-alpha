@@ -1308,6 +1308,226 @@ def test_kiwoom_tape_vendor_failure_logs_return_msg(caplog) -> None:
     assert "token invalid" in caplog.text
 
 
+def _scripted(script: list[Any]) -> tuple[KiwoomApiClient, list[tuple[str, str, dict]]]:
+    client = _kiwoom_client()
+    calls: list[tuple[str, str, dict]] = []
+
+    async def fake_post_tr(session: Any, api_id: str, path: str, body: dict, cont_yn: str = "N", next_key: str = "", max_retries: int = 3) -> Any:
+        calls.append((cont_yn, next_key, dict(body)))
+        assert len(calls) <= len(script), "unexpected extra request"
+        item = script[len(calls) - 1]
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    client._post_tr = fake_post_tr
+    return client, calls
+
+
+def _transient_page(code: int = 7) -> tuple[dict, dict]:
+    return ({"return_code": code, "return_msg": "[1631] 조회 실패"}, {"cont-yn": "N", "next-key": ""})
+
+
+def _two_day_pages() -> list[tuple[dict, dict]]:
+    return [
+        _tick_page([_tape_row("20260904", "150003"), _tape_row("20260904", "150002")], "Y", _tape_key("20260904", 2)),
+        _tick_page([_tape_row("20260904", "150001"), _tape_row("20260903", "150003")], "Y", _tape_key("20260903", 3)),
+        _tick_page([_tape_row("20260903", "150002"), _tape_row("20260903", "150001")], "Y", _tape_key("20260903", 1)),
+        _tick_page([_tape_row("20260902", "150001")], "N", ""),
+    ]
+
+
+def _run_tape(client: KiwoomApiClient, **kwargs: Any) -> tuple[dict, list[tuple[str, list[dict], Any]]]:
+    delivered: list[tuple[str, list[dict], Any]] = []
+    if "budget" not in kwargs:
+        kwargs.setdefault("max_pages", 10)
+    res = asyncio.run(
+        client.walk_tick_tape(
+            object(), "005930", stop_before_day="2026-09-03",
+            on_day_complete=lambda day, rows, cert: delivered.append((day, rows, cert)), **kwargs,
+        )
+    )
+    return res, delivered
+
+
+@pytest.mark.parametrize("position", [1, 2, 3])
+def test_walk_tick_tape_retry_matches_uninterrupted_walk(position: int) -> None:
+    clean = _two_day_pages()
+    clean_client, _ = _scripted(clean)
+    clean_res, clean_delivered = _run_tape(clean_client)
+    client, _ = _scripted([*clean[:position], _transient_page(), *clean[position:]])
+    res, delivered = _run_tape(client, page_retries=3, transient_return_codes=(7,))
+    assert delivered == clean_delivered
+    assert res["certificates"] == clean_res["certificates"]
+    assert res["termination_reason"] == clean_res["termination_reason"]
+    assert res["page_retries_used"] == 1
+
+
+def test_walk_tick_tape_retry_resends_the_identical_request() -> None:
+    clean = _two_day_pages()
+    client, calls = _scripted([clean[0], clean[1], _transient_page(), clean[2], clean[3]])
+    _run_tape(client, page_retries=3, transient_return_codes=(7,))
+    assert calls[2] == calls[3]
+    assert calls[2][:2] == ("Y", _tape_key("20260903", 3))
+
+
+def test_walk_tick_tape_exhausted_retries_report_vendor_failure_with_details() -> None:
+    first = _tick_page(
+        [_tape_row("20260905", "150002"), _tape_row("20260905", "150001"), _tape_row("20260904", "150001")],
+        "Y", _tape_key("20260904", 1),
+    )
+    client, calls = _scripted([first, _transient_page(), _transient_page(), _transient_page(), _transient_page()])
+    res, delivered = _run_tape(client, page_retries=3, transient_return_codes=(7,))
+    assert len(calls) == 5
+    assert res["termination_reason"] == "vendor_failure"
+    assert res["vendor_return_code"] == 7 and res["transport_error"] is None
+    assert res["page_retries_used"] == 3
+    assert res["failure_request_key"] == _tape_key("20260904", 1)
+    assert res["failure_remaining"] == 1
+    assert res["msg1"] == "[1631] 조회 실패"
+    assert [day for day, _, _ in delivered] == ["2026-09-05"]
+    pending = [c for c in res["certificates"] if not c.complete]
+    assert [(c.day, c.basis) for c in pending] == [("2026-09-04", "walk_truncated")]
+
+
+def test_walk_tick_tape_non_transient_code_is_not_retried() -> None:
+    client, calls = _scripted([_transient_page(3)])
+    res, _ = _run_tape(client, page_retries=3, transient_return_codes=(7,))
+    assert len(calls) == 1
+    assert res["termination_reason"] == "vendor_failure"
+    assert res["vendor_return_code"] == 3
+    assert res["page_retries_used"] == 0
+
+
+def test_walk_tick_tape_defaults_reproduce_single_request_failure() -> None:
+    client, calls = _scripted([_transient_page(7)])
+    res, _ = _run_tape(client)
+    assert len(calls) == 1
+    assert res["termination_reason"] == "vendor_failure"
+    assert res["page_retries_used"] == 0
+
+
+def test_walk_tick_tape_retry_budget_is_per_walk_not_per_page() -> None:
+    first = _tick_page([_tape_row("20260905", "150001")], "Y", _tape_key("20260905", 3))
+    second = _tick_page([_tape_row("20260905", "150002")], "Y", _tape_key("20260905", 2))
+    client, calls = _scripted([first, _transient_page(), second, _transient_page()])
+    res, _ = _run_tape(client, page_retries=1, transient_return_codes=(7,))
+    assert len(calls) == 4
+    assert res["termination_reason"] == "vendor_failure"
+    assert res["page_retries_used"] == 1
+
+
+def test_walk_tick_tape_transport_error_is_retried_in_place() -> None:
+    import aiohttp
+
+    clean = _two_day_pages()
+    clean_client, _ = _scripted(clean)
+    clean_res, clean_delivered = _run_tape(clean_client)
+    client, _ = _scripted([clean[0], aiohttp.ClientConnectionError(), clean[1], clean[2], clean[3]])
+    res, delivered = _run_tape(client, page_retries=3, transient_return_codes=(7,))
+    assert delivered == clean_delivered
+    assert res["certificates"] == clean_res["certificates"]
+    assert res["termination_reason"] == clean_res["termination_reason"]
+    assert res["page_retries_used"] == 1
+
+
+def test_walk_tick_tape_exhausted_transport_error_reports_transport_name() -> None:
+    import aiohttp
+
+    client, calls = _scripted([aiohttp.ClientConnectionError() for _ in range(4)])
+    res, _ = _run_tape(client, page_retries=3, transient_return_codes=(7,))
+    assert len(calls) == 4
+    assert res["termination_reason"] == "vendor_failure"
+    assert res["transport_error"] == "ClientConnectionError"
+    assert res["vendor_return_code"] is None
+    assert res["page_retries_used"] == 3
+
+
+def test_walk_tick_tape_timeout_without_deadline_is_vendor_failure() -> None:
+    client, _ = _scripted([TimeoutError()])
+    res, _ = _run_tape(client)
+    assert res["termination_reason"] == "vendor_failure"
+    assert res["transport_error"] == "TimeoutError"
+
+
+def test_walk_tick_tape_retry_skipped_when_deadline_is_closer_than_backoff(monkeypatch) -> None:
+    sleeps: list[float] = []
+
+    async def _record(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("src.api.kiwoom.client.asyncio.sleep", _record)
+    client, calls = _scripted([_transient_page(7), _transient_page(7)])
+    budget = _budget(max_pages=10, deadline=datetime.now(ZoneInfo("Asia/Seoul")) + timedelta(seconds=0.5))
+    res, _ = _run_tape(client, budget=budget, page_retries=3, transient_return_codes=(7,), retry_backoff_seconds=10.0)
+    assert sleeps == []
+    assert len(calls) == 1
+    assert res["termination_reason"] == "vendor_failure"
+
+
+def test_walk_tick_tape_backoff_doubles_per_retry(monkeypatch) -> None:
+    sleeps: list[float] = []
+
+    async def _record(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("src.api.kiwoom.client.asyncio.sleep", _record)
+    client, calls = _scripted([_transient_page(7) for _ in range(4)])
+    _run_tape(client, page_retries=3, transient_return_codes=(7,), retry_backoff_seconds=3.0)
+    assert len(calls) == 4
+    assert sleeps == [3.0, 6.0, 12.0]
+
+
+def test_walk_tick_tape_observer_receives_page_attempt_and_failed_body() -> None:
+    seen: list[tuple] = []
+    clean = _two_day_pages()
+    client, _ = _scripted([clean[0], _transient_page(), clean[1], clean[2], clean[3]])
+    _run_tape(client, page_retries=3, transient_return_codes=(7,), on_page=lambda *a: seen.append(a))
+    assert [(a[4], a[5], a[0].get("return_code")) for a in seen] == [(0, 0, 0), (1, 0, 7), (1, 1, 0), (2, 0, 0), (3, 0, 0)]
+
+
+def test_walk_tick_tape_retried_page_with_inconsistent_total_still_stops() -> None:
+    first = _tick_page([_tape_row("20260904", "150003"), _tape_row("20260904", "150002")], "Y", _tape_key("20260904", 3))
+    retried = _tick_page([_tape_row("20260904", "150001")], "Y", _tape_key("20260904", 9))
+    client, _ = _scripted([first, _transient_page(), retried])
+    res, delivered = _run_tape(client, page_retries=1, transient_return_codes=(7,))
+    assert res["termination_reason"] == "cursor_inconsistent"
+    assert delivered == []
+    assert not any(c.complete for c in res["certificates"])
+
+
+def test_walk_tick_tape_retry_and_failure_logs_carry_identifiers(caplog) -> None:
+    client, _ = _scripted([_transient_page(7), _transient_page(7)])
+    with caplog.at_level("WARNING"):
+        _run_tape(client, page_retries=1, transient_return_codes=(7,))
+    retries = [m for m in caplog.messages if "status=PAGE_RETRY" in m]
+    failures = [m for m in caplog.messages if "status=VENDOR_FAILURE" in m]
+    assert len(retries) == 1 and len(failures) == 1
+    assert "rc=7" in retries[0] and "retry=1/1" in retries[0]
+    for field in ("code=005930", "venue=KRX", "rc=7", "retries=1", "request_key=-", "return_msg=[1631] 조회 실패"):
+        assert field in failures[0]
+
+
+def test_walk_tick_tape_parse_bug_is_logged_with_traceback(caplog) -> None:
+    client, _ = _scripted([(None, {})])
+    with caplog.at_level("WARNING"):
+        res, _ = _run_tape(client)
+    assert res["rt_cd"] == "1" and res["error_type"] == "AttributeError"
+    records = [r for r in caplog.records if "status=ERROR" in r.getMessage()]
+    assert records and records[0].exc_info is not None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"page_retries": -1}, {"retry_backoff_seconds": -1.0}, {"retry_backoff_seconds": float("inf")}, {"retry_backoff_seconds": float("nan")}],
+)
+def test_walk_tick_tape_rejects_invalid_retry_bounds_before_any_request(kwargs) -> None:
+    client, calls = _scripted([])
+    with pytest.raises(ValueError, match="invalid tape retry bounds"):
+        _run_tape(client, **kwargs)
+    assert calls == []
+
+
 class _FakeResp:
     def __init__(self, body: dict, status: int = 200) -> None:
         self._body = body

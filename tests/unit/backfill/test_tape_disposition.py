@@ -26,6 +26,12 @@ def test_substring_trap() -> None:
     assert is_uncertifiable_reason("walk_incomplete:total=None") is False
 
 
+def test_walk_incomplete_vendor_failure_is_never_uncertifiable() -> None:
+    reason = "walk_incomplete:vendor_failure:transient:rc7-1631:pages=13:received=10800:remaining=11976"
+    assert is_uncertifiable_reason(reason) is False
+    assert decide_tape_disposition(attempts=99, latest_reason=reason, min_attempts=3) is TapeDisposition.RETRYABLE
+
+
 def test_attempt_threshold() -> None:
     assert (
         decide_tape_disposition(attempts=2, latest_reason="day_not_on_tape", min_attempts=3)

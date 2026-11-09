@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final, Literal
@@ -62,6 +63,10 @@ def _is_deadline_timeout(exc: BaseException, deadline: datetime | None) -> bool:
     return remaining is not None and remaining <= _DEADLINE_TIMEOUT_SLACK_SECONDS
 
 
+def _is_transient_body_code(code: object, transient_codes: Collection[int]) -> bool:
+    return isinstance(code, int) and not isinstance(code, bool) and code in transient_codes
+
+
 @dataclass(frozen=True)
 class TickCursor:
     """Opaque continuation of a newest-first ka10079 pagination.
@@ -88,7 +93,8 @@ class TapeDayCertificate:
         complete: True only when the walk moved past the date and the date is proven whole, either by the vendor
             total (received + 1 == vendor_total) or, when no key ever carried that date, by being bracketed by rows
             of a newer date (or the closed tape head) and an older date inside one unbroken cursor chain.
-        basis: "vendor_total", "bracketed" or "none" (the proof used when complete).
+        basis: "vendor_total", "bracketed" or "none" (the proof used when complete; "none" also when the total check
+            failed), or "walk_truncated" for a date still unsettled when the walk ended on a vendor failure.
     """
 
     day: str
@@ -801,6 +807,9 @@ class KiwoomApiClient:
         max_pages: int | None = None,
         on_page: PageObserver | None = None,
         on_day_complete: Callable[[str, list[dict[str, Any]], TapeDayCertificate], None] | None = None,
+        page_retries: int = 0,
+        transient_return_codes: Collection[int] = (),
+        retry_backoff_seconds: float = 0.0,
     ) -> BrokerPayload:
         """Walk the newest-first tape back to a stop date, certifying every fully traversed date.
 
@@ -811,9 +820,12 @@ class KiwoomApiClient:
             stop_before_day: Oldest date that must be fully traversed (YYYY-MM-DD); the walk ends once a page's oldest row
                 belongs to an earlier date or the tape ends.
             budget / max_pages: Page bound; mutually consistent like get_tick_chart.
-            on_page: Raw page observer called before filtering (evidence persistence).
+            on_page: Raw page observer called before filtering (evidence persistence), once per response with its attempt.
             on_day_complete: Called once per date, in newest-to-oldest order, as soon as the date is certified complete,
                 with that date's rows (unfiltered by session window) and its certificate. Rows are NOT retained afterwards.
+            page_retries: Re-requests of an identical page per walk for transient body codes and transport errors.
+            transient_return_codes: Body return codes that are retried; any other body failure ends the walk.
+            retry_backoff_seconds: Delay before the first retry, doubled per retry.
 
         Returns:
             rt_cd/vendor/termination metadata plus `certificates` (every date seen, complete or not) and `pages_fetched`;
@@ -829,6 +841,8 @@ class KiwoomApiClient:
         stop_ymd = validate_target_ymd(stop_before_day)
         if venue not in ("KRX", "NXT"):
             raise ValueError(f"unknown tick venue: {venue!r}")
+        if int(page_retries) < 0 or not math.isfinite(float(retry_backoff_seconds)) or retry_backoff_seconds < 0:
+            raise ValueError("invalid tape retry bounds")
         if max_pages is not None and budget is not None and int(max_pages) != int(budget.max_pages):
             raise ValueError("conflicting tick acquisition limits")
         if max_pages is not None and int(max_pages) <= 0:
@@ -847,6 +861,10 @@ class KiwoomApiClient:
         truncated = False
         pages_fetched = 0
         failure_msg = ""
+        failure_code: int | None = None
+        failure_transport: str | None = None
+        failure_request_key: str | None = None
+        retries_used = 0
         prev_identity: tuple[Any, ...] | None = None
         stalls = 0
         in_observer = False
@@ -883,39 +901,98 @@ class KiwoomApiClient:
             if ok and on_day_complete is not None:
                 on_day_complete(cert.day, rows, cert)
 
+        def _pending_certs(basis: str = "none") -> list[TapeDayCertificate]:
+            return [
+                TapeDayCertificate(
+                    day=_dash_day(d),
+                    received=int(received.get(d, 0)),
+                    vendor_total=vendor_totals.get(d),
+                    complete=False,
+                    basis=basis,
+                )
+                for d in day_order
+                if d not in certs
+            ]
+
         try:
             for page_index in range(max(1, int(page_budget))):
-                deadline_left = deadline_remaining(deadline)
-                if deadline_left is not None and deadline_left <= 0:
-                    termination = "deadline"
-                    truncated = True
-                    break
-                started = now_seoul()
-                call = self._post_tr(
-                    session,
-                    "ka10079",
-                    "/api/dostk/chart",
-                    {"stk_cd": request_code, "tic_scope": "1", "upd_stkpc_tp": "1", "base_dt": stop_ymd},
-                    cont_yn=cont_yn,
-                    next_key=next_key,
-                )
-                if deadline_left is None:
-                    data, resp_headers = await call
-                else:
-                    data, resp_headers = await asyncio.wait_for(call, timeout=deadline_left)
-                received_at = now_seoul()
-                header_cont = str(resp_headers.get("cont-yn", "N") or "N")
-                header_key = str(resp_headers.get("next-key", "") or "")
-                metadata = {"cont-yn": header_cont, "next-key": header_key}
-                in_observer = True
-                if on_page is not None:
-                    on_page(dict(data), metadata, started, received_at, page_index, 0)
-                in_observer = False
-                pages_fetched += 1
-                if data.get("return_code") != 0:
+                page_attempt = 0
+                while True:
+                    deadline_left = deadline_remaining(deadline)
+                    if deadline_left is not None and deadline_left <= 0:
+                        termination = "deadline"
+                        truncated = True
+                        break
+                    started = now_seoul()
+                    failed = False
+                    transient = False
+                    try:
+                        call = self._post_tr(
+                            session,
+                            "ka10079",
+                            "/api/dostk/chart",
+                            {"stk_cd": request_code, "tic_scope": "1", "upd_stkpc_tp": "1", "base_dt": stop_ymd},
+                            cont_yn=cont_yn,
+                            next_key=next_key,
+                        )
+                        if deadline_left is None:
+                            data, resp_headers = await call
+                        else:
+                            data, resp_headers = await asyncio.wait_for(call, timeout=deadline_left)
+                    except Exception as exc:
+                        transport_name = _transport_error_name(exc)
+                        if transport_name is None or _is_deadline_timeout(exc, deadline):
+                            raise
+                        failed = transient = True
+                        failure_code = None
+                        failure_transport = transport_name
+                        failure_msg = f"transport:{transport_name}"
+                        failure_request_key = next_key if cont_yn == "Y" and next_key else None
+                    else:
+                        received_at = now_seoul()
+                        header_cont = str(resp_headers.get("cont-yn", "N") or "N")
+                        header_key = str(resp_headers.get("next-key", "") or "")
+                        metadata = {"cont-yn": header_cont, "next-key": header_key}
+                        in_observer = True
+                        if on_page is not None:
+                            on_page(dict(data), metadata, started, received_at, page_index, page_attempt)
+                        in_observer = False
+                        pages_fetched += 1
+                        if data.get("return_code") != 0:
+                            body_code = data.get("return_code")
+                            failed = True
+                            transient = _is_transient_body_code(body_code, transient_return_codes)
+                            failure_code = body_code if isinstance(body_code, int) else None
+                            failure_transport = None
+                            failure_msg = str(data.get("return_msg", ""))
+                            failure_request_key = next_key if cont_yn == "Y" and next_key else None
+                    if not failed:
+                        break
+                    retry_delay = float(retry_backoff_seconds) * (2**retries_used)
+                    remaining_now = deadline_remaining(deadline)
+                    if transient and retries_used < int(page_retries) and (
+                        remaining_now is None or remaining_now > retry_delay
+                    ):
+                        retries_used += 1
+                        logger.warning(
+                            "[DATA] stage=kiwoom_tape_walk status=PAGE_RETRY code=%s venue=%s page=%d rc=%s transport=%s retry=%d/%d request_key=%s",
+                            code,
+                            venue,
+                            page_index,
+                            failure_code if failure_code is not None else "-",
+                            failure_transport or "-",
+                            retries_used,
+                            int(page_retries),
+                            failure_request_key or "-",
+                        )
+                        page_attempt += 1
+                        if retry_delay > 0:
+                            await asyncio.sleep(retry_delay)
+                        continue
                     termination = "vendor_failure"
                     truncated = True
-                    failure_msg = str(data.get("return_msg", ""))
+                    break
+                if termination in ("deadline", "vendor_failure"):
                     break
                 raw_rows = data.get("stk_tic_chart_qry") or []
                 valid_rows: list[dict[str, Any]] = []
@@ -999,50 +1076,50 @@ class KiwoomApiClient:
             else:
                 termination = "page_budget"
                 truncated = True
-        except TimeoutError:
-            termination = "deadline"
-            truncated = True
         except Exception as e:
             if in_observer:
                 raise
-            logger.warning("Kiwoom tape walk failed code=%s: %s", code, e)
-            pending_certs = [
-                TapeDayCertificate(
-                    day=_dash_day(d),
-                    received=int(received.get(d, 0)),
-                    vendor_total=vendor_totals.get(d),
-                    complete=False,
+            if _is_deadline_timeout(e, deadline):
+                termination = "deadline"
+                truncated = True
+            else:
+                logger.warning(
+                    "[DATA] stage=kiwoom_tape_walk status=ERROR code=%s venue=%s pages=%d error=%s",
+                    code,
+                    venue,
+                    pages_fetched,
+                    type(e).__name__,
+                    exc_info=True,
                 )
-                for d in day_order
-                if d not in certs
-            ]
-            return {
-                "rt_cd": "1",
-                "msg1": str(e),
-                "vendor": "kiwoom",
-                "truncated": True,
-                "termination_reason": "vendor_failure",
-                "pages_fetched": pages_fetched,
-                "continuation": metadata,
-                "certificates": [certs[d] for d in certified_order] + pending_certs,
-            }
+                return {
+                    "rt_cd": "1",
+                    "msg1": str(e),
+                    "vendor": "kiwoom",
+                    "truncated": True,
+                    "termination_reason": "vendor_failure",
+                    "pages_fetched": pages_fetched,
+                    "continuation": metadata,
+                    "certificates": [certs[d] for d in certified_order] + _pending_certs("walk_truncated"),
+                    "vendor_return_code": None,
+                    "transport_error": None,
+                    "page_retries_used": retries_used,
+                    "failure_request_key": None,
+                    "failure_remaining": None,
+                    "error_type": type(e).__name__,
+                }
         if termination == "vendor_failure":
+            failure_parsed = _parse_tape_key(failure_request_key, request_code) if failure_request_key else None
+            failure_remaining = failure_parsed[1] if failure_parsed is not None else None
             logger.warning(
-                "[DATA] stage=kiwoom_tape_walk status=VENDOR_FAILURE code=%s pages=%d return_msg=%s",
+                "[DATA] stage=kiwoom_tape_walk status=VENDOR_FAILURE code=%s pages=%d venue=%s rc=%s transport=%s retries=%d request_key=%s return_msg=%s",
                 code,
                 pages_fetched,
+                venue,
+                failure_code if failure_code is not None else "-",
+                failure_transport or "-",
+                retries_used,
+                failure_request_key or "-",
                 failure_msg,
-            )
-            certificates: list[TapeDayCertificate] = [certs[d] for d in certified_order]
-            certificates.extend(
-                TapeDayCertificate(
-                    day=_dash_day(d),
-                    received=int(received.get(d, 0)),
-                    vendor_total=vendor_totals.get(d),
-                    complete=False,
-                )
-                for d in day_order
-                if d not in certs
             )
             payload: BrokerPayload = {
                 "rt_cd": "1",
@@ -1052,17 +1129,14 @@ class KiwoomApiClient:
                 "termination_reason": termination,
                 "pages_fetched": pages_fetched,
                 "continuation": metadata,
-                "certificates": certificates,
+                "certificates": [certs[d] for d in certified_order] + _pending_certs("walk_truncated"),
+                "vendor_return_code": failure_code,
+                "transport_error": failure_transport,
+                "page_retries_used": retries_used,
+                "failure_request_key": failure_request_key,
+                "failure_remaining": failure_remaining,
             }
             return payload
-        certificates = [certs[d] for d in certified_order]
-        certificates.extend(
-            TapeDayCertificate(
-                day=_dash_day(d), received=int(received.get(d, 0)), vendor_total=vendor_totals.get(d), complete=False
-            )
-            for d in day_order
-            if d not in certs
-        )
         return {
             "rt_cd": "0",
             "vendor": "kiwoom",
@@ -1070,7 +1144,12 @@ class KiwoomApiClient:
             "termination_reason": termination,
             "pages_fetched": pages_fetched,
             "continuation": metadata,
-            "certificates": certificates,
+            "certificates": [certs[d] for d in certified_order] + _pending_certs(),
+            "vendor_return_code": None,
+            "transport_error": None,
+            "page_retries_used": retries_used,
+            "failure_request_key": None,
+            "failure_remaining": None,
         }
 
     async def get_nxt_premarket_chart(

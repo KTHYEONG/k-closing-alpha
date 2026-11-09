@@ -80,7 +80,8 @@ class CollectionSettings(EnvSettings):
         COLLECTION_AFTERMARKET_BOOK_FLUSH_ROUNDS: Rounds buffered before a normalized flush, default 15.
         COLLECTION_TRANSPORT_RETRIES: Extra tries after a transient transport error, default 2.
         COLLECTION_TRANSPORT_BACKOFF_SECONDS: Delay before the first retry, doubled per retry, default 3.0.
-        COLLECTION_TICK_VENDOR_RETRIES: Extra passes after a transient Kiwoom tick body or transport failure, default 3; 0 disables.
+        COLLECTION_TICK_VENDOR_RETRIES: Extra passes after a transient Kiwoom tick body or transport failure, default 3; 0 disables;
+            also the per-walk page retry budget of the Kiwoom tape walk.
         COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES: Kiwoom body return codes treated as transient, default (7,);
             empty disables the retry.
         COLLECTION_TAPE_FLUSH_ROWS: Tape publisher row bound before a partition flush, default 2000000.

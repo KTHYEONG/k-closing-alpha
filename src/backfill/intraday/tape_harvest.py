@@ -15,6 +15,7 @@ import pandas as pd
 
 from src.backfill.intraday.collector import (
     _call_with_transport_retry,
+    _classify_kiwoom_vendor_failure,
     _empty_tick_frame,
     _has_nonpositive_tick_price,
     _split_session_window,
@@ -91,6 +92,25 @@ class TapeWalkOutcome:
     pages_fetched: int
     unresolved_days: tuple[str, ...]
     skipped_unclosed: tuple[tuple[str, str], ...] = ()
+    failure: str = ""
+    page_retries_used: int = 0
+
+
+def _vendor_failure_tag(payload: Mapping[str, Any], *, profile: CollectionSettings) -> str:
+    code = payload.get("vendor_return_code")
+    transport = payload.get("transport_error")
+    if isinstance(code, int) or (isinstance(transport, str) and transport):
+        return _classify_kiwoom_vendor_failure(payload, profile.COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES)
+    return "vendor_failure"
+
+
+def _vendor_failure_reason(payload: Mapping[str, Any], *, received: int, profile: CollectionSettings) -> str:
+    remaining = payload.get("failure_remaining")
+    remaining_text = str(int(remaining)) if isinstance(remaining, int) else "na"
+    return (
+        f"walk_incomplete:{_vendor_failure_tag(payload, profile=profile)}"
+        f":pages={int(payload.get('pages_fetched', 0) or 0)}:received={int(received)}:remaining={remaining_text}"
+    )
 
 
 @dataclass(frozen=True)
@@ -370,7 +390,7 @@ async def harvest_symbol_tape(
             started: datetime,
             received: datetime,
             page_index: int,
-            _retry: int,
+            page_attempt: int,
         ) -> None:
             page_days: frozenset[str] = frozenset()
             if payload is not None:
@@ -389,7 +409,8 @@ async def harvest_symbol_tape(
                 payload=dict(payload) if payload is not None else None,
                 status=_Status.COMPLETE if payload is not None else _Status.FAILED,
                 source_timestamp=None, source_published_at=None,
-                page_index=int(page_index), attempt_index=int(slot),
+                page_index=int(page_index),
+                attempt_index=int(slot) + int(page_attempt) * (1 + int(profile.COLLECTION_TRANSPORT_RETRIES)),
                 continuation={str(k): str(v) for k, v in dict(metadata).items()},
                 error_type=None,
             )
@@ -417,6 +438,9 @@ async def harvest_symbol_tape(
         payload = await client.walk_tick_tape(
             http_session, str(code), venue=venue, stop_before_day=oldest,
             budget=budget, on_page=_observer_for(slot), on_day_complete=_on_day,
+            page_retries=int(profile.COLLECTION_TICK_VENDOR_RETRIES),
+            transient_return_codes=tuple(int(c) for c in profile.COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES),
+            retry_backoff_seconds=float(profile.COLLECTION_TRANSPORT_BACKOFF_SECONDS),
         )
         attempt_buffer["latest"] = buffered
         return payload
@@ -449,7 +473,8 @@ async def harvest_symbol_tape(
         if not day_sessions:
             continue
         cert = cert_by_day.get(day)
-        if cert is not None:
+        failed = payload.get("termination_reason") == "vendor_failure"
+        if cert is not None and not (failed and getattr(cert, "basis", "") == "walk_truncated"):
             _settle_uncertified_day(
                 code=str(code), day=day, status=CaptureStatus.PARTIAL,
                 reason=f"tape_total_mismatch:received={cert.received}:total={cert.vendor_total}",
@@ -496,17 +521,26 @@ async def harvest_symbol_tape(
                 sessions=day_sessions, venue=resolved_venue, refs=[], on_result=on_result,
             )
         else:
+            if failed:
+                reason = _vendor_failure_reason(
+                    payload, received=int(cert.received) if cert is not None else 0, profile=profile,
+                )
+            else:
+                reason = f"walk_incomplete:{payload.get('termination_reason', '')}"
             _settle_uncertified_day(
                 code=str(code), day=day, status=CaptureStatus.PARTIAL,
-                reason=f"walk_incomplete:{payload.get('termination_reason', '')}",
-                sessions=day_sessions, venue=resolved_venue, refs=[], on_result=on_result,
+                reason=reason, sessions=day_sessions, venue=resolved_venue,
+                refs=_refs_for(day) if cert is not None else [], on_result=on_result,
             )
     unresolved = tuple(sorted(d for d in wanted if d not in settled and _day_sessions(d)))
+    walk_failed = payload.get("termination_reason") == "vendor_failure"
     return TapeWalkOutcome(
         termination_reason=str(payload.get("termination_reason", "")),
         pages_fetched=int(payload.get("pages_fetched", 0)),
         unresolved_days=unresolved,
         skipped_unclosed=skipped_unclosed,
+        failure=_vendor_failure_tag(payload, profile=profile) if walk_failed else "",
+        page_retries_used=int(payload.get("page_retries_used", 0) or 0),
     )
 
 

@@ -822,12 +822,14 @@ async def run_walk_tasks(
         terminations[outcome.termination_reason] = terminations.get(outcome.termination_reason, 0) + 1
         if outcome.unresolved_days or outcome.termination_reason not in _CLEAN_TERMINATIONS:
             logger.warning(
-                "[DATA] stage=tape_walk_end symbol=%s venue=%s termination=%s pages=%d unresolved=%s",
+                "[DATA] stage=tape_walk_end symbol=%s venue=%s termination=%s pages=%d unresolved=%s failure=%s retries=%d",
                 task.symbol,
                 task.venue,
                 outcome.termination_reason,
                 int(outcome.pages_fetched),
                 ",".join(outcome.unresolved_days),
+                outcome.failure or "-",
+                int(outcome.page_retries_used),
             )
         if outcome.unresolved_days:
             logger.info(

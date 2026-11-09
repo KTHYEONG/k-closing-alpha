@@ -54,11 +54,13 @@ class _StubTape:
         delivered: list[tuple[str, list[dict], TapeDayCertificate]],
         certificates: list[TapeDayCertificate],
         termination: str = "crossed_stop_day",
+        extras: dict[str, Any] | None = None,
     ) -> None:
         self.pages = pages
         self.delivered = delivered
         self.certificates = certificates
         self.termination = termination
+        self.extras = dict(extras or {})
         self.calls = 0
         self.seen: dict[str, Any] = {}
 
@@ -74,10 +76,12 @@ class _StubTape:
         if on_day is not None:
             for day, rows, cert in self.delivered:
                 on_day(day, rows, cert)
-        return {
+        payload = {
             "rt_cd": "0", "termination_reason": self.termination,
             "pages_fetched": len(self.pages), "certificates": list(self.certificates),
         }
+        payload.update(self.extras)
+        return payload
 
 
 def _krx_sessions() -> list:
@@ -974,3 +978,147 @@ def test_publish_rejection_is_ledgered_failed_and_other_symbol_proceeds(tmp_path
     settled = tr.read_settled_ledger(ledger)
     assert settled[("005930", _DAY, "regular")] == CaptureStatus.COMPLETE.value
     assert settled[("000660", _DAY, "regular")] == CaptureStatus.FAILED.value
+
+
+_FAILED_WALK = {
+    "vendor_return_code": 7, "msg1": "[1631] 조회 실패", "pages_fetched": 13,
+    "failure_remaining": 11976, "transport_error": None, "page_retries_used": 2,
+}
+_TRUNCATED_CERT_REASON = "walk_incomplete:vendor_failure:transient:rc7-1631:pages=13:received=10800:remaining=11976"
+
+
+def _failed_walk_out(tmp_path, certificates, extras, *, pages=None, run_id="tape-2020-01-04-031") -> tuple[list[TapeDayResult], Any]:
+    store = CaptureStore(tmp_path / "capture")
+    out: list[TapeDayResult] = []
+    stub = _StubTape(
+        pages if pages is not None else [([_tick("093000")], {"cont-yn": "Y", "next-key": "k"})],
+        [], certificates, termination="vendor_failure", extras=extras,
+    )
+    res = asyncio.run(
+        harvest_symbol_tape(
+            stub, object(), "005930", [_DAY], venue="KRX", sessions=_krx_sessions(),
+            store=store, run_id=run_id, profile=_profile(tmp_path), on_result=out.append,
+        )
+    )
+    return out, res
+
+
+def test_vendor_failure_pending_day_reports_walk_incomplete_with_evidence(tmp_path) -> None:
+    from src.backfill.intraday.tape_disposition import is_uncertifiable_reason
+
+    pending = TapeDayCertificate(day=_DAY, received=10800, vendor_total=None, complete=False, basis="walk_truncated")
+    out, res = _failed_walk_out(tmp_path, [pending], _FAILED_WALK)
+    assert out and {r.entry.status for r in out} == {CaptureStatus.PARTIAL}
+    assert {r.entry.reason for r in out} == {_TRUNCATED_CERT_REASON}
+    assert is_uncertifiable_reason(_TRUNCATED_CERT_REASON) is False
+    assert all(r.entry.raw_refs for r in out)
+    assert "total=" not in _TRUNCATED_CERT_REASON
+    assert res.failure == "vendor_failure:transient:rc7-1631" and res.page_retries_used == 2
+
+
+def test_genuine_mismatch_before_failure_keeps_mismatch_reason(tmp_path) -> None:
+    genuine = TapeDayCertificate(day=_DAY, received=1, vendor_total=10, complete=False, basis="none")
+    out, _ = _failed_walk_out(tmp_path, [genuine], _FAILED_WALK)
+    assert {r.entry.reason for r in out} == {"tape_total_mismatch:received=1:total=10"}
+
+
+def test_vendor_failure_unreached_day_gets_detail_not_bare_form(tmp_path) -> None:
+    extras = {k: v for k, v in _FAILED_WALK.items() if k != "failure_remaining"}
+    out, _ = _failed_walk_out(tmp_path, [], extras)
+    assert {r.entry.reason for r in out} == {"walk_incomplete:vendor_failure:transient:rc7-1631:pages=13:received=0:remaining=na"}
+    assert all(r.entry.raw_refs == () for r in out)
+
+
+def test_legacy_failure_payload_keeps_bare_reason(tmp_path) -> None:
+    out, res = _failed_walk_out(tmp_path, [], {"pages_fetched": 3})
+    reasons = {r.entry.reason for r in out}
+    assert reasons == {"walk_incomplete:vendor_failure:pages=3:received=0:remaining=na"}
+    assert res.failure == "vendor_failure" and res.page_retries_used == 0
+
+
+def test_transport_failure_reason_names_the_exception(tmp_path) -> None:
+    extras = {"transport_error": "ClientConnectionError", "pages_fetched": 2, "msg1": "transport:ClientConnectionError"}
+    out, res = _failed_walk_out(tmp_path, [], extras)
+    reasons = {r.entry.reason for r in out}
+    assert all("vendor_failure:transient:transport-ClientConnectionError" in reason for reason in reasons)
+    assert res.failure == "vendor_failure:transient:transport-ClientConnectionError"
+
+
+def test_page_budget_mismatch_reason_is_unchanged(tmp_path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    out: list[TapeDayResult] = []
+    stub = _StubTape(
+        [([_tick("093000")], {"cont-yn": "Y", "next-key": "k"})], [],
+        [TapeDayCertificate(day=_DAY, received=5, vendor_total=None, complete=False, basis="none")],
+        termination="page_budget",
+    )
+    asyncio.run(
+        harvest_symbol_tape(
+            stub, object(), "005930", [_DAY], venue="KRX", sessions=_krx_sessions(),
+            store=store, run_id="tape-2020-01-04-032", profile=_profile(tmp_path), on_result=out.append,
+        )
+    )
+    assert {r.entry.reason for r in out} == {"tape_total_mismatch:received=5:total=None"}
+
+
+def test_retry_settings_are_forwarded_to_the_walk(tmp_path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    stub = _StubTape([], [], [], termination="crossed_stop_day")
+    asyncio.run(
+        harvest_symbol_tape(
+            stub, object(), "005930", [_DAY], venue="KRX", sessions=_krx_sessions(),
+            store=store, run_id="tape-2020-01-04-033",
+            profile=_profile(tmp_path, COLLECTION_TICK_VENDOR_RETRIES=5, COLLECTION_KIWOOM_TRANSIENT_RETURN_CODES=(7,), COLLECTION_TRANSPORT_BACKOFF_SECONDS=3.0),
+            on_result=lambda _r: None,
+        )
+    )
+    assert stub.seen["page_retries"] == 5
+    assert stub.seen["transient_return_codes"] == (7,)
+    assert stub.seen["retry_backoff_seconds"] == 3.0
+
+
+class _RetriedPageTape:
+    async def walk_tick_tape(self, session, code, **kwargs: Any) -> dict:
+        now = datetime.now(_SEOUL)
+        on_page, on_day = kwargs["on_page"], kwargs["on_day_complete"]
+        rows = [_tick("093000")]
+        meta = {"cont-yn": "N", "next-key": ""}
+        on_page({"return_code": 7, "return_msg": "[1631]"}, meta, now, now, 0, 0)
+        on_page({"return_code": 0, "stk_tic_chart_qry": rows}, meta, now, now, 0, 1)
+        cert = _cert(_DAY, 1, 1, True)
+        on_day(_DAY, rows, cert)
+        return {"rt_cd": "0", "termination_reason": "tape_end", "pages_fetched": 2, "certificates": [cert]}
+
+
+def test_retried_page_evidence_has_distinct_attempt_index(tmp_path) -> None:
+    import gzip
+
+    store = CaptureStore(tmp_path / "capture")
+    asyncio.run(
+        harvest_symbol_tape(
+            _RetriedPageTape(), object(), "005930", [_DAY], venue="KRX", sessions=_krx_sessions(),
+            store=store, run_id="tape-2020-01-04-034", profile=_profile(tmp_path), on_result=lambda _r: None,
+        )
+    )
+    files = sorted(store.root.rglob("*-p0000-a0*.json.gz"))
+    names = [p.name for p in files]
+    assert len(files) == 2
+    assert any(n.endswith("-p0000-a00.json.gz") for n in names)
+    good = gzip.decompress(next(p for p in files if p.name.endswith("-p0000-a03.json.gz")).read_bytes()).decode("utf-8")
+    failed = gzip.decompress(next(p for p in files if p.name.endswith("-p0000-a00.json.gz")).read_bytes()).decode("utf-8")
+    assert "stk_tic_chart_qry" in good and "[1631]" not in good
+    assert "[1631]" in failed and "stk_tic_chart_qry" not in failed
+
+
+def test_outcome_carries_failure_and_retries_and_clean_walk_has_none(tmp_path) -> None:
+    _, failed = _failed_walk_out(tmp_path, [], dict(_FAILED_WALK))
+    assert failed.failure == "vendor_failure:transient:rc7-1631" and failed.page_retries_used == 2
+    store = CaptureStore(tmp_path / "capture")
+    clean = asyncio.run(
+        harvest_symbol_tape(
+            _StubTape([], [], [], termination="crossed_stop_day"), object(), "005930", [_DAY], venue="KRX",
+            sessions=_krx_sessions(), store=store, run_id="tape-2020-01-04-035", profile=_profile(tmp_path),
+            on_result=lambda _r: None,
+        )
+    )
+    assert clean.failure == "" and clean.page_retries_used == 0

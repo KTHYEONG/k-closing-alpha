@@ -663,6 +663,21 @@ def test_clean_walk_not_logged(tmp_path, monkeypatch, caplog) -> None:
     assert _walk_end_lines(caplog) == []
 
 
+def test_walk_end_log_ends_with_failure_and_retries(tmp_path, monkeypatch, caplog) -> None:
+    caplog.set_level("WARNING", logger=tr.logger.name)
+    outcomes = {
+        "000001": TapeWalkOutcome(
+            termination_reason="vendor_failure", pages_fetched=13, unresolved_days=(_DAY,),
+            failure="vendor_failure:transient:rc7-1631", page_retries_used=3,
+        ),
+    }
+    _dry_run(tmp_path, monkeypatch, _krx_walk_tasks("000001"), outcomes)
+    lines = _walk_end_lines(caplog)
+    assert len(lines) == 1
+    assert lines[0].endswith("failure=vendor_failure:transient:rc7-1631 retries=3")
+    assert f"termination=vendor_failure pages=13 unresolved={_DAY} failure=" in lines[0]
+
+
 def test_terminations_counted_in_summary(tmp_path, monkeypatch) -> None:
     outcomes = {
         "000001": TapeWalkOutcome(termination_reason="tape_end", pages_fetched=1, unresolved_days=()),
