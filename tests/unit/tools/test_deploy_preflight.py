@@ -169,3 +169,20 @@ def test_check_bundle_serving_compat_rejects_uncertified_class_drift() -> None:
     assert len(issues) == 1
     assert "bundle screen drift" in issues[0]
     assert "exclude_non_screenable_class" in issues[0]
+
+
+def test_preflight_accepts_pit_core_feature_cols() -> None:
+    from src.ml.topk_contract import (
+        PIT_CORE_CONTRACT_VERSION_KEY,
+        PIT_CORE_FEATURE_COLS,
+        PIT_CORE_FEATURE_CONTRACT_VERSION,
+    )
+    from src.tools.deploy_preflight import check_bundle_serving_compat
+
+    bundle = _compatible_bundle()
+    bundle["feature_cols"] = list(PIT_CORE_FEATURE_COLS)
+    bundle[PIT_CORE_CONTRACT_VERSION_KEY] = PIT_CORE_FEATURE_CONTRACT_VERSION
+
+    issues = check_bundle_serving_compat(bundle)
+
+    assert not any("unknown to serving contract" in issue for issue in issues)

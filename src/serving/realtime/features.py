@@ -12,6 +12,14 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from src.ml.pit_core_features import (
+    CORE_HISTORY_COLUMNS,
+    PIT_CORE_PATH_FEATURES,
+    PitCoreServingConfig,
+    latest_core_history,
+    latest_index_lag,
+    path_features,
+)
 from src.ml.topk_contract import compute_derived_features
 from src.strategy.contract import derive_chg_ratio, tick_cost_bp
 
@@ -59,6 +67,9 @@ _WEEKDAY_INDICATOR_FEATURES: tuple[str, ...] = (
     "weekday_is_thursday",
     "weekday_is_friday",
 )
+
+DEFAULT_PIT_CORE_SERVING_CONFIG = PitCoreServingConfig()
+_PATH_BAR_COLUMNS: tuple[str, ...] = ("symbol", "end_min", "open", "high", "low", "close", "volume")
 
 # flow_consensus / flow_alignment_direction 의 원천이 되는 단일 소스 밀도 컬럼.
 _FLOW_SOURCE_COLUMNS: tuple[str, ...] = (
@@ -298,3 +309,46 @@ def build_topk_ranker_features(
     live_rows = base[["symbol", "open", "close", "prev_close", "volume", "inst_netbuy", "foreign_netbuy"]]
     panel = stitch_live_panel(price_history, live_rows, decision_date)
     return attach_topk_features(base, panel)
+
+
+def attach_pit_core_features(
+    base: pd.DataFrame,
+    *,
+    bars: pd.DataFrame,
+    history: pd.DataFrame,
+    config: PitCoreServingConfig = DEFAULT_PIT_CORE_SERVING_CONFIG,
+) -> pd.DataFrame:
+    """Return base with the nine PIT-CORE columns added; base row order is preserved.
+
+    Args:
+        base: Output of build_topk_ranker_features with a symbol column.
+        bars: 1m bars of the decision session with _PATH_BAR_COLUMNS; bars ending after DECISION_MIN are ignored.
+        history: Daily rows with CORE_HISTORY_COLUMNS, all dated before the decision.
+        config: Path coverage tolerance.
+
+    Returns:
+        Copy of base with PIT_CORE_INDEX_LAG_FEATURES, PIT_CORE_HISTORY_FEATURES and PIT_CORE_PATH_FEATURES.
+
+    Raises:
+        ValueError: When bars or history miss required columns, or finite x_r30 covers less than
+            config.min_path_coverage of the base rows.
+    """
+    missing_bars = [c for c in _PATH_BAR_COLUMNS if c not in bars.columns]
+    if missing_bars:
+        raise ValueError(f"bars missing PIT-CORE columns: {missing_bars}")
+    missing_history = [c for c in CORE_HISTORY_COLUMNS if c not in history.columns]
+    if missing_history:
+        raise ValueError(f"history missing PIT-CORE columns: {missing_history}")
+    out = base.copy()
+    for name, value in latest_index_lag(history).items():
+        out[name] = value
+    out = out.merge(latest_core_history(history), on="symbol", how="left", validate="many_to_one")
+    path = path_features(bars.assign(symbol=bars["symbol"].astype(str)))
+    out = out.merge(path[["symbol", *PIT_CORE_PATH_FEATURES]], on="symbol", how="left", validate="many_to_one")
+    covered = int(np.isfinite(out["x_r30"].to_numpy(dtype=np.float64)).sum())
+    total = len(out)
+    if covered < config.min_path_coverage * total:
+        raise ValueError(
+            f"finite x_r30 covers {covered} of {total} rows, below min_path_coverage {config.min_path_coverage}"
+        )
+    return out

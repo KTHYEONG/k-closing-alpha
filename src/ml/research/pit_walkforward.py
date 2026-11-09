@@ -27,6 +27,12 @@ import numpy as np
 import pandas as pd
 
 from src.data.nxt_decomposition import BASIS_KRX_RECONSTRUCTED
+from src.ml.pit_core_features import (
+    INDEX_FEATURE_COLS,
+    LAG1_SUFFIX,
+    attach_lagged_index,
+    index_table_from_price_history,
+)
 from src.ml.topk_contract import RANKER_FEATURE_COLS
 
 logger = logging.getLogger(__name__)
@@ -39,7 +45,6 @@ TIER_RECONSTRUCTED: str = "reconstructed"
 TIER_EOD: str = "eod"
 PIT_TIERS: tuple[str, ...] = (TIER_EXACT, TIER_RECOVERED, TIER_RECONSTRUCTED)
 
-INDEX_FEATURE_COLS: tuple[str, ...] = ("kospi_pct", "kosdaq_pct", "v_kospi")
 FEATURE_SET_BASE: str = "base"
 FEATURE_SET_INDEX_LAG1: str = "idx_lag1"
 FEATURE_SET_INDEX_DROP: str = "idx_drop"
@@ -68,7 +73,6 @@ WEIGHTINGS: tuple[str, ...] = (WEIGHT_EQUAL, WEIGHT_INV_TICK)
 
 DATASET_KEY_COLS: tuple[str, ...] = ("date", "symbol")
 DATASET_LABEL_COLS: tuple[str, ...] = ("net_pit", "train_label", "exit_date")
-LAG1_SUFFIX: str = "_lag1"
 NEWEY_WEST_LAGS: int = 5
 TRADING_DAYS_PER_YEAR: int = 252
 DEFAULT_RESEARCH_DIRNAME: str = "research/pit_walkforward"
@@ -203,45 +207,6 @@ def feature_columns(feature_set: str) -> list[str]:
     if feature_set == FEATURE_SET_INDEX_DROP:
         return [c for c in RANKER_FEATURE_COLS if c not in INDEX_FEATURE_COLS]
     raise ValueError(f"unknown feature_set {feature_set!r}")
-
-
-def attach_lagged_index(frame: pd.DataFrame, index_by_date: pd.DataFrame) -> pd.DataFrame:
-    """Attach T-1 market index columns (`<col>_lag1`) from a per-date index table.
-
-    Args:
-        frame: Rows with a date column.
-        index_by_date: One row per trading date with date and INDEX_FEATURE_COLS (EOD values of that date).
-
-    Returns:
-        Copy of frame with INDEX_FEATURE_COLS + LAG1_SUFFIX taken from the previous trading date.
-
-    Raises:
-        ValueError: Missing columns or duplicate dates in index_by_date.
-    """
-    missing = [c for c in ("date", *INDEX_FEATURE_COLS) if c not in index_by_date.columns]
-    if missing:
-        raise ValueError(f"index_by_date missing columns: {missing}")
-    table = index_by_date[["date", *INDEX_FEATURE_COLS]].copy()
-    table["date"] = pd.to_datetime(table["date"]).dt.normalize()
-    if table["date"].duplicated().any():
-        raise ValueError("index_by_date carries duplicate dates")
-    table = table.sort_values("date").reset_index(drop=True)
-    lagged = table[list(INDEX_FEATURE_COLS)].shift(1)
-    lagged.columns = [f"{c}{LAG1_SUFFIX}" for c in INDEX_FEATURE_COLS]
-    lagged["date"] = table["date"]
-    out = frame.copy()
-    out["date"] = pd.to_datetime(out["date"]).dt.normalize()
-    return out.merge(lagged, on="date", how="left", validate="many_to_one")
-
-
-def index_table_from_price_history(ph: pd.DataFrame) -> pd.DataFrame:
-    """One row per date with the market-wide EOD index columns carried on every price_history row."""
-    missing = [c for c in ("date", *INDEX_FEATURE_COLS) if c not in ph.columns]
-    if missing:
-        raise ValueError(f"price_history missing index columns: {missing}")
-    work = ph[["date", *INDEX_FEATURE_COLS]].copy()
-    work["date"] = pd.to_datetime(work["date"]).dt.normalize()
-    return work.groupby("date", sort=True)[list(INDEX_FEATURE_COLS)].median().reset_index()
 
 
 def train_tier_mask(tiers: pd.Series, train_source: str) -> np.ndarray:

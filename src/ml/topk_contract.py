@@ -3,8 +3,8 @@
 Owns everything the live 15:20 decision path and the production bundle trainer must agree on:
 the ordered feature list, the base decision-time feature definitions, the bundle directory and
 atomic persistence, the certified-screen parity check, and the scoring/selection rules applied to
-a loaded bundle. It is deliberately a leaf module (stdlib, numpy, pandas, src.strategy.contract
-only) so that serving never imports research harnesses, CLIs, or scipy. Research modules re-export
+a loaded bundle. It is deliberately a leaf module (stdlib, numpy, pandas, src.ml.pit_core_features,
+src.strategy.contract only) so that serving never imports research harnesses, CLIs, or scipy. Research modules re-export
 these names for backward compatibility.
 """
 
@@ -20,6 +20,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.ml.pit_core_features import (
+    INDEX_FEATURE_COLS,
+    LAG1_SUFFIX,
+    PIT_CORE_HISTORY_FEATURES,
+    PIT_CORE_PATH_FEATURES,
+)
 from src.strategy.contract import MIN_TOP_K, PRODUCTION_STRATEGY, UniverseSpec
 
 logger = logging.getLogger(__name__)
@@ -138,6 +144,42 @@ LEGACY_FEATURE_CONTRACT_VERSION: str = "1"
 FEATURE_CONTRACT_VERSION_KEY: str = "feature_contract_version"
 
 
+PIT_CORE_EXTRA_FEATURE_COLS: tuple[str, ...] = (*PIT_CORE_PATH_FEATURES, *PIT_CORE_HISTORY_FEATURES)
+PIT_CORE_FEATURE_COLS: list[str] = [
+    *(f"{c}{LAG1_SUFFIX}" if c in INDEX_FEATURE_COLS else c for c in RANKER_FEATURE_COLS),
+    *PIT_CORE_EXTRA_FEATURE_COLS,
+]
+
+_PIT_CORE_LAG_SPECS: tuple[TopkFeatureSpec, ...] = tuple(
+    TopkFeatureSpec(
+        f"{spec.name}{LAG1_SUFFIX}",
+        spec.unit,
+        FeatureTiming.PRIOR_CONFIRMED,
+        f"T-1 EOD value of {spec.name}",
+    )
+    for spec in TOPK_FEATURE_SPECS
+    if spec.name in INDEX_FEATURE_COLS
+)
+PIT_CORE_FEATURE_SPECS: tuple[TopkFeatureSpec, ...] = (
+    *_PIT_CORE_LAG_SPECS,
+    TopkFeatureSpec("x_rv_late", FeatureUnit.DECIMAL_RATIO, FeatureTiming.DECISION_SNAPSHOT, "std of 1m log returns with bar end in (15:20-60m, 15:20]; NaN with 5 or fewer returns"),
+    TopkFeatureSpec("x_rv1m", FeatureUnit.DECIMAL_RATIO, FeatureTiming.DECISION_SNAPSHOT, "std of 1m log returns with bar end in (09:00, 15:20] times sqrt(number of returns)"),
+    TopkFeatureSpec("x_r30", FeatureUnit.DECIMAL_RETURN, FeatureTiming.DECISION_SNAPSHOT, "close at 15:20 / close at 14:50 - 1, last bar ending at or before each time"),
+    TopkFeatureSpec("x_r_pm", FeatureUnit.DECIMAL_RETURN, FeatureTiming.DECISION_SNAPSHOT, "close at 15:20 / close at 12:00 - 1, last bar ending at or before each time"),
+    TopkFeatureSpec("h_amihud20", FeatureUnit.DECIMAL_RATIO, FeatureTiming.PRIOR_CONFIRMED, "mean over 20 rows of abs(close/prev_close - 1) / trade value, shifted one row, min 10 rows"),
+    TopkFeatureSpec("h_turnover20", FeatureUnit.DECIMAL_RATIO, FeatureTiming.PRIOR_CONFIRMED, "mean over 20 rows of trade value / market cap, shifted one row, min 10 rows"),
+)
+SERVING_FEATURE_SPECS: tuple[TopkFeatureSpec, ...] = (*TOPK_FEATURE_SPECS, *PIT_CORE_FEATURE_SPECS)
+SERVING_FEATURE_COLS: list[str] = [
+    *RANKER_FEATURE_COLS,
+    *(c for c in PIT_CORE_FEATURE_COLS if c not in RANKER_FEATURE_COLS),
+]
+# Bump only when a PIT-CORE definition, unit, timing or input semantics change; the v1 top-k
+# table and its version above stay frozen so the live bundle keeps serving.
+PIT_CORE_FEATURE_CONTRACT_VERSION: str = "1"
+PIT_CORE_CONTRACT_VERSION_KEY: str = "pit_core_feature_contract_version"
+
+
 def build_topk_feature_manifest(feature_cols: Sequence[str]) -> pd.DataFrame:
     """Render the declared feature table for a bundle's feature list.
 
@@ -158,7 +200,7 @@ def build_topk_feature_manifest(feature_cols: Sequence[str]) -> pd.DataFrame:
     """
     if isinstance(feature_cols, str):
         raise TypeError("feature_cols must be a sequence of feature names, not a string")
-    by_name = {spec.name: spec for spec in TOPK_FEATURE_SPECS}
+    by_name = {spec.name: spec for spec in SERVING_FEATURE_SPECS}
     unknown = [name for name in feature_cols if name not in by_name]
     if unknown:
         raise ValueError(f"features unknown to the top-k contract: {unknown}")
@@ -204,8 +246,16 @@ def bundle_feature_contract_version(bundle: Mapping[str, Any]) -> str:
     return value
 
 
+def _pit_core_features_in(bundle: Mapping[str, Any]) -> bool:
+    names = set(bundle.get("feature_cols", []))
+    return bool(names & (set(PIT_CORE_FEATURE_COLS) - set(RANKER_FEATURE_COLS)))
+
+
 def feature_contract_issue(bundle: Mapping[str, Any]) -> str | None:
     """Describe why a bundle's feature contract is incompatible with this code, if it is.
+
+    A bundle carrying PIT-CORE-only feature names must also carry PIT_CORE_CONTRACT_VERSION_KEY
+    equal to PIT_CORE_FEATURE_CONTRACT_VERSION; base-only bundles are judged by the top-k version alone.
 
     Args:
         bundle: Loaded or freshly trained bundle.
@@ -215,6 +265,19 @@ def feature_contract_issue(bundle: Mapping[str, Any]) -> str | None:
         acceptable (TOPK_FEATURE_CONTRACT_VERSION == LEGACY_FEATURE_CONTRACT_VERSION); otherwise a
         one-line message naming the bundle version (or "missing") and the code version.
     """
+    base_issue = _base_feature_contract_issue(bundle)
+    if base_issue is not None or not _pit_core_features_in(bundle):
+        return base_issue
+    found = bundle.get(PIT_CORE_CONTRACT_VERSION_KEY, "missing")
+    if found != PIT_CORE_FEATURE_CONTRACT_VERSION:
+        return (
+            f"bundle {PIT_CORE_CONTRACT_VERSION_KEY} {found!r} != "
+            f"PIT-CORE code version {PIT_CORE_FEATURE_CONTRACT_VERSION!r}"
+        )
+    return None
+
+
+def _base_feature_contract_issue(bundle: Mapping[str, Any]) -> str | None:
     try:
         resolved = bundle_feature_contract_version(bundle)
     except ValueError as exc:

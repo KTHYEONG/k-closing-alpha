@@ -9,7 +9,7 @@ prev_close); institutional flow features use [t-5, t-1] confirmed values only (2
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -315,6 +315,7 @@ def load_serving_price_history(
     *,
     path: str | os.PathLike[str] | None = None,
     is_trading_day: Callable[[pd.Timestamp], bool] | None = None,
+    columns: Sequence[str] = HISTORY_REQUIRED_COLUMNS,
 ) -> pd.DataFrame:
     """Read the serving lookback window of price_history and verify freshness.
 
@@ -323,9 +324,10 @@ def load_serving_price_history(
         path: Parquet path; None selects settings.PRICE_HISTORY_PARQUET_PATH.
         is_trading_day: Trading-day oracle; None selects is_krx_trading_day,
             whose network failures propagate unchanged.
+        columns: Columns to read; must include date, which the window filter and freshness check use.
 
     Returns:
-        HISTORY_REQUIRED_COLUMNS rows dated in
+        Rows with the requested columns dated in
         [decision_date - HISTORY_LOOKBACK_CALENDAR_DAYS, decision_date).
 
     Raises:
@@ -345,7 +347,7 @@ def load_serving_price_history(
     start = d - pd.Timedelta(days=HISTORY_LOOKBACK_CALENDAR_DAYS)
     # 열 가지치기 + 날짜 조건 푸시다운으로 546만행 전체 적재 회피
     df = pd.read_parquet(
-        src_path, columns=list(HISTORY_REQUIRED_COLUMNS), filters=[("date", ">=", start), ("date", "<", d)]
+        src_path, columns=list(columns), filters=[("date", ">=", start), ("date", "<", d)]
     )
     prev = resolve_prev_trading_day(d, is_trading_day)
     assert_history_fresh(df, prev)

@@ -220,3 +220,129 @@ def test_build_topk_ranker_features_inst_density_uses_price_history_not_live_flo
     assert out["inst_density"].iloc[0] == pytest.approx(expected)
     assert out["inst_density"].iloc[0] != pytest.approx(999_999_999.0 / (70500.0 * 900_000.0))
     assert "inst_rank" in out.columns
+
+
+def _pit_bars(symbol: str, seed: int) -> pd.DataFrame:
+    from src.ml.pit_core_features import DECISION_MIN, SESSION_OPEN_MIN
+
+    rng = np.random.default_rng(seed)
+    end = np.arange(SESSION_OPEN_MIN + 1, DECISION_MIN + 1)
+    close = 10_000 + np.cumsum(rng.integers(-20, 21, size=len(end)))
+    return pd.DataFrame(
+        {
+            "symbol": symbol,
+            "end_min": end,
+            "open": close,
+            "high": close + 10,
+            "low": close - 10,
+            "close": close,
+            "volume": rng.integers(1, 1000, size=len(end)).astype(float),
+        }
+    )
+
+
+def _pit_history(symbols: tuple[str, ...], n_dates: int = 40) -> pd.DataFrame:
+    from src.ml.pit_core_features import CORE_HISTORY_COLUMNS
+
+    rng = np.random.default_rng(11)
+    dates = pd.bdate_range("2026-06-01", periods=n_dates)
+    index = pd.DataFrame(
+        {
+            "date": dates,
+            "kospi_pct": rng.normal(0, 0.01, n_dates),
+            "kosdaq_pct": rng.normal(0, 0.01, n_dates),
+            "v_kospi": 20 + rng.normal(0, 1, n_dates),
+        }
+    )
+    frames = []
+    for symbol in symbols:
+        close = 10_000 * np.exp(np.cumsum(rng.normal(0, 0.02, n_dates)))
+        frames.append(
+            index.assign(
+                symbol=symbol,
+                close=close,
+                prev_close=np.concatenate([[close[0]], close[:-1]]),
+                trade_value_100m=rng.uniform(50, 500, n_dates),
+                market_cap_100m=rng.uniform(1000, 5000, n_dates),
+            )
+        )
+    return pd.concat(frames, ignore_index=True)[list(CORE_HISTORY_COLUMNS)]
+
+
+_PIT_SYMBOLS = ("000003", "000001", "000002")
+
+
+def _pit_base() -> pd.DataFrame:
+    return pd.DataFrame({"symbol": list(_PIT_SYMBOLS), "pred_seed": [0.3, 0.1, 0.2]})
+
+
+def test_attach_pit_core_features_adds_columns_preserving_order() -> None:
+    from src.ml.pit_core_features import (
+        PIT_CORE_HISTORY_FEATURES,
+        PIT_CORE_INDEX_LAG_FEATURES,
+        PIT_CORE_PATH_FEATURES,
+        latest_core_history,
+        latest_index_lag,
+        path_features,
+    )
+    from src.serving.realtime.features import attach_pit_core_features
+
+    base = _pit_base()
+    bars = pd.concat([_pit_bars(s, i) for i, s in enumerate(_PIT_SYMBOLS)], ignore_index=True)
+    history = _pit_history(_PIT_SYMBOLS)
+
+    out = attach_pit_core_features(base, bars=bars, history=history)
+
+    new_cols = [*PIT_CORE_INDEX_LAG_FEATURES, *PIT_CORE_HISTORY_FEATURES, *PIT_CORE_PATH_FEATURES]
+    assert len(new_cols) == 9
+    assert list(out.columns) == [*base.columns, *new_cols]
+    assert out["symbol"].tolist() == list(_PIT_SYMBOLS)
+    for name, value in latest_index_lag(history).items():
+        assert np.all(out[name].to_numpy() == value)
+    expected_h = latest_core_history(history).set_index("symbol")
+    for name in PIT_CORE_HISTORY_FEATURES:
+        np.testing.assert_array_equal(out[name].to_numpy(), expected_h.loc[out["symbol"], name].to_numpy())
+    expected_x = path_features(bars).set_index("symbol")
+    for name in PIT_CORE_PATH_FEATURES:
+        np.testing.assert_array_equal(out[name].to_numpy(), expected_x.loc[out["symbol"], name].to_numpy())
+
+
+def test_attach_pit_core_features_fails_closed_on_low_coverage() -> None:
+    from src.serving.realtime.features import attach_pit_core_features
+
+    base = _pit_base()
+    bars = _pit_bars(_PIT_SYMBOLS[0], 0)
+    history = _pit_history(_PIT_SYMBOLS)
+
+    with pytest.raises(ValueError, match="min_path_coverage"):
+        attach_pit_core_features(base, bars=bars, history=history)
+
+
+def test_attach_pit_core_features_ignores_post_decision_bars() -> None:
+    from src.ml.pit_core_features import DECISION_MIN
+    from src.serving.realtime.features import attach_pit_core_features
+
+    base = _pit_base()
+    bars = pd.concat([_pit_bars(s, i) for i, s in enumerate(_PIT_SYMBOLS)], ignore_index=True)
+    history = _pit_history(_PIT_SYMBOLS)
+    late = bars.groupby("symbol", sort=False).tail(10).copy()
+    late["end_min"] = DECISION_MIN + 1 + late.groupby("symbol").cumcount()
+    late[["close", "high", "low", "volume"]] = [1.0, 1e9, 1.0, 1e9]
+
+    before = attach_pit_core_features(base, bars=bars, history=history)
+    after = attach_pit_core_features(base, bars=pd.concat([bars, late], ignore_index=True), history=history)
+
+    pd.testing.assert_frame_equal(before, after)
+
+
+def test_attach_pit_core_features_rejects_missing_columns() -> None:
+    from src.serving.realtime.features import attach_pit_core_features
+
+    base = _pit_base()
+    bars = pd.concat([_pit_bars(s, i) for i, s in enumerate(_PIT_SYMBOLS)], ignore_index=True)
+    history = _pit_history(_PIT_SYMBOLS)
+
+    with pytest.raises(ValueError, match="bars missing PIT-CORE columns"):
+        attach_pit_core_features(base, bars=bars.drop(columns=["end_min"]), history=history)
+    with pytest.raises(ValueError, match="history missing PIT-CORE columns"):
+        attach_pit_core_features(base, bars=bars, history=history.drop(columns=["v_kospi"]))

@@ -493,3 +493,25 @@ def test_certified_screen_rejects_non_dict_and_unknown_fields() -> None:
         contract.certified_screen({})
     with pytest.raises(ValueError, match="unknown to live screen"):
         contract.certified_screen({"select_universe": {"future_field": True}})
+
+
+def test_pit_core_specs_cover_extra_names() -> None:
+    import src.ml.topk_contract as contract
+
+    names = [s.name for s in contract.PIT_CORE_FEATURE_SPECS]
+    assert len(set(names)) == len(names)
+    assert set(names) == set(contract.PIT_CORE_FEATURE_COLS) - set(contract.RANKER_FEATURE_COLS)
+    assert len(names) == 9
+    assert contract.build_topk_feature_manifest(contract.PIT_CORE_FEATURE_COLS) is not None
+
+
+def test_pit_core_bundle_requires_core_contract_version() -> None:
+    import src.ml.topk_contract as contract
+
+    bundle = {"feature_cols": list(contract.PIT_CORE_FEATURE_COLS)}
+    issue = contract.feature_contract_issue(bundle)
+    assert issue is not None
+    assert "missing" in issue
+    bundle[contract.PIT_CORE_CONTRACT_VERSION_KEY] = contract.PIT_CORE_FEATURE_CONTRACT_VERSION
+    assert contract.feature_contract_issue(bundle) is None
+    assert contract.feature_contract_issue({"feature_cols": list(contract.RANKER_FEATURE_COLS)}) is None

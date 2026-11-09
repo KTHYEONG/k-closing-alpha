@@ -17,24 +17,42 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from src.ml.pit_core_features import (
+    DECISION_MIN as DECISION_MIN,
+)
+from src.ml.pit_core_features import (
+    HISTORY_WINDOW as HISTORY_WINDOW,
+)
+from src.ml.pit_core_features import (
+    HISTORY_WINDOW_SHORT as HISTORY_WINDOW_SHORT,
+)
+from src.ml.pit_core_features import (
+    INTRADAY_FEATURES as INTRADAY_FEATURES,
+)
+from src.ml.pit_core_features import (
+    MIN_BARS_FOR_PATH as MIN_BARS_FOR_PATH,
+)
+from src.ml.pit_core_features import (
+    SESSION_MINUTES_TO_DECISION as SESSION_MINUTES_TO_DECISION,
+)
+from src.ml.pit_core_features import (
+    SESSION_OPEN_MIN as SESSION_OPEN_MIN,
+)
+from src.ml.pit_core_features import (
+    bar_end_minutes as bar_end_minutes,
+)
+from src.ml.pit_core_features import (
+    path_features as path_features,
+)
+
 logger = logging.getLogger(__name__)
 
-SESSION_OPEN_MIN: int = 9 * 60
-DECISION_MIN: int = 15 * 60 + 20
-SESSION_MINUTES_TO_DECISION: float = float(DECISION_MIN - SESSION_OPEN_MIN)
-MIN_BARS_FOR_PATH: int = 30
 MAX_ABS_DAILY_CHANGE: float = 0.31
-HISTORY_WINDOW_SHORT: int = 5
-HISTORY_WINDOW: int = 20
 INDEX_Z_WINDOW: int = 60
 EXPIRY_DAY_FIRST: int = 8
 EXPIRY_DAY_LAST: int = 14
 THURSDAY: int = 3
 
-INTRADAY_FEATURES: tuple[str, ...] = (
-    "x_rv_late", "x_rv1m", "x_r30", "x_r60", "x_r_pm", "x_r_am", "x_r_open30", "x_vwap_dev",
-    "x_vol_last60", "x_vol_last30", "x_hi_time", "x_lo_time", "x_zero_vol",
-)  # fmt: skip
 HISTORY_FEATURES: tuple[str, ...] = (
     "h_amihud20", "h_turnover20", "h_rv20", "h_vol_surge", "h_prog_dens", "h_prog_cum5", "h_prev_ret",
 )  # fmt: skip
@@ -43,66 +61,6 @@ MARKET_FEATURES: tuple[str, ...] = (
     "i_kospi_sma20", "i_kosdaq_r5", "c_gap_days", "c_dow", "c_expiry",
 )  # fmt: skip
 EXT_FEATURES: tuple[str, ...] = (*INTRADAY_FEATURES, *HISTORY_FEATURES, *MARKET_FEATURES)
-
-
-def bar_end_minutes(ts_hms: pd.Series, vendor: pd.Series) -> np.ndarray:
-    """Minute-of-day at which each bar's interval ends, honouring the vendor stamp convention."""
-    from src.config.market_session import BAR_STAMP_START, INTRADAY_BAR_STAMP_CONVENTION
-
-    hms = ts_hms.astype(int).to_numpy()
-    minutes = (hms // 10000) * 60 + (hms // 100) % 100
-    starts = vendor.astype(str).map(
-        lambda v: INTRADAY_BAR_STAMP_CONVENTION.get(v.removesuffix("_cons"), "end") == BAR_STAMP_START
-    )
-    return np.asarray(minutes + starts.to_numpy().astype(int), dtype=np.int64)
-
-
-def path_features(bars: pd.DataFrame) -> pd.DataFrame:
-    """Intraday path features per symbol from 1m bars carrying symbol, end_min, open, high, low, close, volume.
-
-    Only bars with SESSION_OPEN_MIN < end_min <= DECISION_MIN are used; symbols with fewer than
-    MIN_BARS_FOR_PATH bars or a non-positive last close are dropped.
-    """
-    work = bars[(bars["end_min"] > SESSION_OPEN_MIN) & (bars["end_min"] <= DECISION_MIN)]
-    rows = []
-    for symbol, g in work.sort_values(["symbol", "end_min"]).groupby("symbol", sort=False):
-        t = g["end_min"].to_numpy()
-        c = g["close"].to_numpy(dtype=np.float64)
-        if len(c) < MIN_BARS_FOR_PATH or c[-1] <= 0:
-            continue
-        h = g["high"].to_numpy(dtype=np.float64)
-        lo = g["low"].to_numpy(dtype=np.float64)
-        v = g["volume"].to_numpy(dtype=np.float64)
-        first_open = float(g["open"].iloc[0])
-
-        def close_at(minute: int, t: np.ndarray = t, c: np.ndarray = c) -> float:
-            k = int(np.searchsorted(t, minute, side="right")) - 1
-            return float(c[k]) if k >= 0 else np.nan
-
-        last = float(c[-1])
-        vol_total = float(v.sum())
-        log_ret = np.diff(np.log(np.maximum(c, 1e-9)))
-        late = t > DECISION_MIN - 60
-        late_ret = log_ret[late[1:]]
-        rows.append(
-            {
-                "symbol": symbol,
-                "x_r30": last / close_at(DECISION_MIN - 30) - 1,
-                "x_r60": last / close_at(DECISION_MIN - 60) - 1,
-                "x_r_pm": last / close_at(12 * 60) - 1,
-                "x_r_am": close_at(12 * 60) / first_open - 1 if first_open > 0 else np.nan,
-                "x_r_open30": close_at(SESSION_OPEN_MIN + 30) / first_open - 1 if first_open > 0 else np.nan,
-                "x_vwap_dev": last / (((h + lo + c) / 3.0 * v).sum() / vol_total) - 1 if vol_total > 0 else np.nan,
-                "x_vol_last60": float(v[late].sum()) / vol_total if vol_total > 0 else np.nan,
-                "x_vol_last30": float(v[t > DECISION_MIN - 30].sum()) / vol_total if vol_total > 0 else np.nan,
-                "x_hi_time": (t[int(np.argmax(h))] - SESSION_OPEN_MIN) / SESSION_MINUTES_TO_DECISION,
-                "x_lo_time": (t[int(np.argmin(lo))] - SESSION_OPEN_MIN) / SESSION_MINUTES_TO_DECISION,
-                "x_rv1m": float(np.std(log_ret)) * np.sqrt(len(log_ret)),
-                "x_rv_late": float(np.std(late_ret)) if len(late_ret) > HISTORY_WINDOW_SHORT else np.nan,
-                "x_zero_vol": float((v <= 0).mean()),
-            }
-        )
-    return pd.DataFrame(rows, columns=["symbol", *INTRADAY_FEATURES])
 
 
 def market_state(panel: pd.DataFrame) -> pd.DataFrame:

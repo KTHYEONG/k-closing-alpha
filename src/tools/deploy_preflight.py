@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from src.ml.topk_contract import (
-    RANKER_FEATURE_COLS,
+    SERVING_FEATURE_COLS,
     TOPK_RANKER_BUNDLE_DIR,
     assert_bundle_screen_parity,
     feature_contract_issue,
@@ -35,7 +35,7 @@ def check_bundle_serving_compat(bundle: Mapping[str, Any]) -> list[str]:
         Human-readable issues; empty when compatible. Checks: screen parity with
         PRODUCTION_STRATEGY.universe (001 bundles grandfathered for the class filter only),
         feature_cols non-empty and a subset of
-        RANKER_FEATURE_COLS, feature-contract version equal to TOPK_FEATURE_CONTRACT_VERSION
+        SERVING_FEATURE_COLS, feature-contract version equal to TOPK_FEATURE_CONTRACT_VERSION
         (keyless = legacy baseline), and bundle top_k equal to MIN_TOP_K.
     """
     issues: list[str] = []
@@ -47,7 +47,7 @@ def check_bundle_serving_compat(bundle: Mapping[str, Any]) -> list[str]:
     if not feature_cols:
         issues.append("bundle feature_cols is empty; refusing to serve inference")
     else:
-        unknown = [col for col in feature_cols if col not in RANKER_FEATURE_COLS]
+        unknown = [col for col in feature_cols if col not in SERVING_FEATURE_COLS]
         if unknown:
             issues.append(f"bundle feature_cols unknown to serving contract: {unknown}")
     contract_issue = feature_contract_issue(bundle)
