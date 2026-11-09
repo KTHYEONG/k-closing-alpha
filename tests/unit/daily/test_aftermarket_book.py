@@ -1053,3 +1053,213 @@ def test_empty_research_symbols_is_identity(tmp_path: Path) -> None:
 
     assert _signature(explicit_empty) == _signature(baseline)
     assert not [m for m in explicit_empty if m.context.capture_reason.endswith("-research")]
+
+
+def _failure_messages(caplog: Any) -> list[str]:
+    return [record.getMessage() for record in caplog.records if "status=REQUEST_FAILED" in record.getMessage()]
+
+
+def _venue_of(message: str) -> str:
+    return message.split("venue=", 1)[1].split(" ", 1)[0]
+
+
+def _book_run(
+    tmp_path: Path,
+    client: Any,
+    *,
+    symbols: tuple[str, ...] = ("000001", "000002"),
+    flush_rounds: int = 15,
+    clock: list[dt.datetime] | None = None,
+    sleep_fn: Any = None,
+    clients: list[Any] | None = None,
+) -> tuple[Any, ...]:
+    from src.daily.aftermarket_book import run_aftermarket_book_capture
+
+    profile = _profile(tmp_path, COLLECTION_AFTERMARKET_BOOK_FLUSH_ROUNDS=flush_rounds)
+    now = clock if clock is not None else [_seoul(2026, 9, 29, 15, 30)]
+    return _run(
+        run_aftermarket_book_capture(
+            "2026-09-29",
+            profile=profile,
+            store=_store(tmp_path),
+            clients=clients or [client],
+            dense_symbols=symbols,
+            sparse_symbols=symbols,
+            now_fn=lambda: now[0],
+            sleep_fn=sleep_fn,
+        )
+    )
+
+
+def _raise_boom(div: str | None, code: str) -> dict[str, Any]:
+    raise RuntimeError("boom")
+
+
+def test_exception_failure_logged_once_per_cause_with_traceback(tmp_path: Path, caplog: Any) -> None:
+    """A repeated exception cause logs once per venue and key, with its traceback, and stays PARTIAL."""
+    import logging
+
+    from src.data.capture_contracts import CaptureStatus
+
+    caplog.set_level(logging.WARNING, logger="src.daily.aftermarket_book")
+    client = _StubClient(handler=lambda div, code: _raise_boom(div, code) if code == "000002" else dict(_listed_book()))
+    manifests = _book_run(tmp_path, client)
+
+    failures = _failure_messages(caplog)
+    assert failures
+    assert all("symbol=000002" in line and "error=RuntimeError" in line for line in failures)
+    assert all("Traceback (most recent call last)" in line for line in failures)
+    venues = [_venue_of(line) for line in failures]
+    assert len(venues) == len(set(venues))
+    entries = [e for m in manifests for e in m.entries if e.symbol == "000002"]
+    assert entries
+    assert all(e.status == CaptureStatus.PARTIAL and e.reason == "vendor_failure" for e in entries)
+
+
+def test_distinct_symbols_same_cause_do_not_multiply_logs(tmp_path: Path, caplog: Any) -> None:
+    """Many symbols failing with one cause log once per venue; the block line counts every failure."""
+    import logging
+
+    from src.config.market_session import KRX_CLOSE_MARKET_DIV_CODE, NXT_MARKET_DIV_CODE
+
+    caplog.set_level(logging.INFO, logger="src.daily.aftermarket_book")
+    client = _StubClient(handler=_raise_boom)
+    _book_run(tmp_path, client, symbols=("000001", "000002", "000003", "000004", "000005"))
+
+    failures = _failure_messages(caplog)
+    venues = [_venue_of(line) for line in failures]
+    assert len(venues) == len(set(venues)) >= 1
+    counts: dict[str, int] = {}
+    for div, _code in client.calls:
+        venue = "KRX" if div == KRX_CLOSE_MARKET_DIV_CODE else "NXT" if div == NXT_MARKET_DIV_CODE else "?"
+        counts[venue] = counts.get(venue, 0) + 1
+    expected = ",".join(f"{venue}/RuntimeError={n}" for venue, n in sorted(counts.items()))
+    block_lines = [r.getMessage() for r in caplog.records if "stage=aftermarket_book block=" in r.getMessage()]
+    assert len(block_lines) == 1
+    assert block_lines[0].endswith(f"request_errors={expected}")
+
+
+def test_payload_failure_logged_with_msg_cd(tmp_path: Path, caplog: Any) -> None:
+    """A non-zero rt_cd payload logs its vendor code without a traceback and stays vendor_failure."""
+    import logging
+
+    from src.data.capture_contracts import CaptureStatus
+
+    caplog.set_level(logging.WARNING, logger="src.daily.aftermarket_book")
+    coded = _StubClient(handler=lambda div, code: {"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "busy"})
+    manifests = _book_run(tmp_path, coded, symbols=("000001",))
+    failures = _failure_messages(caplog)
+    assert failures
+    assert all("error=msg_cd:EGW00201" in line and "msg_cd=EGW00201" in line for line in failures)
+    assert all("Traceback" not in line for line in failures)
+    entries = [e for m in manifests for e in m.entries]
+    assert all(e.status == CaptureStatus.PARTIAL and e.reason == "vendor_failure" for e in entries)
+
+    caplog.clear()
+    bare = _StubClient(handler=lambda div, code: {"rt_cd": "1", "msg1": "busy"})
+    _book_run(tmp_path / "bare", bare, symbols=("000001",))
+    failures = _failure_messages(caplog)
+    assert failures
+    assert all("error=msg_cd:none" in line for line in failures)
+
+
+def test_different_venues_or_keys_log_separately(tmp_path: Path, caplog: Any) -> None:
+    """Failures of one cause log once per (venue, key_id) pair."""
+    import logging
+
+    from src.api.kis.key_pool import kis_key_id
+
+    caplog.set_level(logging.WARNING, logger="src.daily.aftermarket_book")
+    first = _StubClient(handler=_raise_boom)
+    first.app_key = "AK-FIRST"
+    second = _StubClient(handler=_raise_boom)
+    second.app_key = "AK-SECOND"
+    _book_run(tmp_path, first, symbols=("000001", "000002"), clients=[first, second])
+
+    failures = _failure_messages(caplog)
+    pairs = [(_venue_of(line), line.split("key_id=", 1)[1].split(" ", 1)[0]) for line in failures]
+    assert len(pairs) == len(set(pairs))
+    assert {key for _venue, key in pairs} == {kis_key_id("AK-FIRST"), kis_key_id("AK-SECOND")}
+
+
+def test_block_line_appends_request_errors_and_resets(tmp_path: Path, caplog: Any) -> None:
+    """Block counts report only that block's failures, then reset for the next block."""
+    import logging
+
+    from src.config.market_session import KRX_CLOSE_MARKET_DIV_CODE, NXT_MARKET_DIV_CODE
+
+    caplog.set_level(logging.INFO, logger="src.daily.aftermarket_book")
+    clock = [_seoul(2026, 9, 29, 15, 30)]
+    failed: list[str] = []
+
+    def handler(div: str | None, code: str) -> dict[str, Any]:
+        if clock[0] < _seoul(2026, 9, 29, 17, 0):
+            failed.append(div or "")
+            raise RuntimeError("boom")
+        return dict(_listed_book())
+
+    async def advance(seconds: float) -> None:
+        clock[0] = clock[0] + dt.timedelta(seconds=seconds)
+
+    client = _StubClient(handler=handler)
+    _book_run(tmp_path, client, symbols=("000001",), flush_rounds=2, clock=clock, sleep_fn=advance)
+
+    names = {KRX_CLOSE_MARKET_DIV_CODE: "KRX", NXT_MARKET_DIV_CODE: "NXT"}
+    counts: dict[str, int] = {}
+    for div in failed:
+        counts[names[div]] = counts.get(names[div], 0) + 1
+    expected = ",".join(f"{venue}/RuntimeError={n}" for venue, n in sorted(counts.items()))
+    block_lines = [r.getMessage() for r in caplog.records if "stage=aftermarket_book block=" in r.getMessage()]
+    assert len(block_lines) >= 2
+    assert block_lines[0].startswith("[DATA] stage=aftermarket_book block=0 rounds=2 ")
+    assert block_lines[0].endswith(f"request_errors={expected}")
+    assert block_lines[1].endswith("request_errors=-")
+
+
+def test_no_failure_no_extra_log(tmp_path: Path, caplog: Any) -> None:
+    """A clean run emits no request-failure record and a `-` block count."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="src.daily.aftermarket_book")
+    _book_run(tmp_path, _StubClient())
+    assert _failure_messages(caplog) == []
+    block_lines = [r.getMessage() for r in caplog.records if "stage=aftermarket_book block=" in r.getMessage()]
+    assert block_lines and all(line.endswith("request_errors=-") for line in block_lines)
+
+
+def test_log_contains_no_secrets(tmp_path: Path, caplog: Any, monkeypatch: Any) -> None:
+    """Credentials never reach the failure record; the key appears only as its digest."""
+    import logging
+
+    from src.api.kis.key_pool import kis_key_id
+    from src.tools import alerts
+
+    caplog.set_level(logging.INFO, logger="src.daily.aftermarket_book")
+    monkeypatch.setattr(alerts, "_alert_secret_values", lambda env=None: frozenset({"TOKEN-SECRET-XYZ"}))
+
+    def handler(div: str | None, code: str) -> dict[str, Any]:
+        raise RuntimeError("rejected token=TOKEN-SECRET-XYZ")
+
+    client = _StubClient(handler=handler)
+    client.app_key = "AK-SECRET-VALUE"
+    _book_run(tmp_path, client, symbols=("000001",))
+
+    failures = _failure_messages(caplog)
+    assert failures
+    assert all(kis_key_id("AK-SECRET-VALUE") in line for line in failures)
+    for record in caplog.records:
+        assert "AK-SECRET-VALUE" not in record.getMessage()
+        assert "TOKEN-SECRET-XYZ" not in record.getMessage()
+
+
+def test_second_run_in_same_process_logs_again(tmp_path: Path, caplog: Any) -> None:
+    """Dedupe state is per run: an identical failure in a second run logs again."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="src.daily.aftermarket_book")
+    _book_run(tmp_path / "one", _StubClient(handler=_raise_boom), symbols=("000001",))
+    first = len(_failure_messages(caplog))
+    _book_run(tmp_path / "two", _StubClient(handler=_raise_boom), symbols=("000001",))
+    second = len(_failure_messages(caplog)) - first
+    assert first >= 1
+    assert second == first

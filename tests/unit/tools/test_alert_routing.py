@@ -242,3 +242,74 @@ def test_alerts_main_survives_drain_failure_and_pages_critical(monkeypatch: pyte
 
     assert sent == ["[긴급][kca] 오늘 매수 결정 생성 실패"]
     assert any("DRAIN_FAILED" in rec.message for rec in caplog.records)
+
+
+_TRACEBACK_JOURNAL = (
+    "Traceback (most recent call last):\n"
+    '  File "/app/src/daily/auction_capture.py", line 96, in _resolve_roster\n'
+    "    cohort = store.read_cohort(snapshot_date, available_by=now)\n"
+    "FileNotFoundError: no qualifying cohort: '2026-09-24'\n"
+)
+
+
+def _journal_diag(journal: str):
+    def _diag(unit: str) -> tuple[dict[str, str], str]:
+        return ({"Result": "exit-code", "ExecMainStatus": "1"}, journal)
+
+    return _diag
+
+
+def test_handle_unit_failure_silent_record_keeps_location_and_context(tmp_path: Path) -> None:
+    sent: list[tuple[str, str]] = []
+
+    status = alerts.handle_unit_failure(
+        "kca-retrain.service",
+        now=_kst(8, 31),
+        pager=_capture_pager(tmp_path, sent),
+        pending=_no_remediation,
+        auto_action=_no_action,
+        diagnostics=_journal_diag(_TRACEBACK_JOURNAL),
+    )
+
+    assert status == "SILENT"
+    row = _silent_rows()[-1]
+    assert row["status"] == "SILENT"
+    assert "auction_capture.py" in row["location"]
+    assert "_resolve_roster" in row["location"]
+    assert "FileNotFoundError" in row["context"]
+
+
+def test_handle_unit_failure_deferred_record_keeps_location_and_context(tmp_path: Path) -> None:
+    status = alerts.handle_unit_failure(
+        "kca-kis-token-warmup.service",
+        now=_kst(7, 25),
+        pager=_capture_pager(tmp_path, []),
+        pending=lambda key, first_seen, now: True,
+        auto_action=_no_action,
+        diagnostics=_journal_diag(_TRACEBACK_JOURNAL),
+    )
+
+    assert status == "DEFERRED"
+    row = _silent_rows()[-1]
+    assert row["status"] == "DEFERRED"
+    assert "auction_capture.py" in row["location"]
+    assert "FileNotFoundError" in row["context"]
+
+
+def test_handle_unit_failure_redacts_persisted_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(alerts, "_alert_secret_values", lambda env=None: frozenset({"SECRET-LEAK-VALUE"}))
+    journal = _TRACEBACK_JOURNAL.replace("'2026-09-24'", "'SECRET-LEAK-VALUE'")
+
+    alerts.handle_unit_failure(
+        "kca-retrain.service",
+        now=_kst(8, 31),
+        pager=_capture_pager(tmp_path, []),
+        pending=_no_remediation,
+        auto_action=_no_action,
+        diagnostics=_journal_diag(journal),
+    )
+
+    row = _silent_rows()[-1]
+    assert "SECRET-LEAK-VALUE" not in row["context"]
+    assert "SECRET-LEAK-VALUE" not in row["location"]
+    assert "***" in row["context"]

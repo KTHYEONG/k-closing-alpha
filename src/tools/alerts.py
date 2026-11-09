@@ -573,16 +573,21 @@ def handle_unit_failure(
     kind = classify_unit(unit)
     source = f"{FAILED_UNIT_PREFIX}{unit_base_name(unit)}.service"
     unit_status, journal_text = diagnostics(unit)
-    reason = extract_failure_summary(journal_text, unit_status)["reason"]
+    summary = extract_failure_summary(journal_text, unit_status)
+    reason = summary["reason"]
+    location = redact_for_egress(summary["location"])
+    context = redact_for_egress(summary["context"])
     if kind is None:
-        record_silent(source, reason=reason, now=now)
+        record_silent(source, reason=reason, now=now, location=location, context=context)
         return "SILENT"
     scope = incident_scope(kind)
     first_seen = pager.observe(kind, source, scope=scope, now=now)
     if pending(source, first_seen, now):
-        record_silent(source, reason=reason, now=now, status="DEFERRED")
+        record_silent(source, reason=reason, now=now, status="DEFERRED", location=location, context=context)
         return "DEFERRED"
-    logger.warning("[SYS] stage=alert status=CRITICAL unit=%s kind=%s reason=%s", unit, kind.value, reason)
+    logger.warning(
+        "[SYS] stage=alert status=CRITICAL unit=%s kind=%s reason=%s location=%s", unit, kind.value, reason, location or "-"
+    )
     return pager.page(kind, source, scope=scope, now=now, auto_action=auto_action(source)).value
 
 

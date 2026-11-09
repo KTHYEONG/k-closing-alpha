@@ -59,14 +59,27 @@ def incident_ledger_path() -> Path:
     return Path(settings.DATA_DIR) / INCIDENT_LEDGER_RELPATH
 
 
-def record_silent(source: str, *, reason: str, now: datetime, status: str = "SILENT", root: Path | None = None) -> None:
+def record_silent(
+    source: str,
+    *,
+    reason: str,
+    now: datetime,
+    status: str = "SILENT",
+    root: Path | None = None,
+    location: str = "",
+    context: str = "",
+) -> None:
     """Log and append one non-paging alert record to DATA_DIR/logs/alerts/silent/<KST date>.jsonl.
 
-    `reason` must already be credential-redacted. A write failure only logs.
+    `reason`, `location` and `context` must already be credential-redacted. A write failure only logs.
     """
-    logger.info("[SYS] stage=alert status=%s source=%s reason=%s", status, source, reason)
+    logger.info("[SYS] stage=alert status=%s source=%s reason=%s location=%s", status, source, reason, location or "-")
     box = Path(root) if root is not None else Path(settings.DATA_DIR) / SILENT_RECORD_RELDIR
-    record = {"ts": now.isoformat(timespec="seconds"), "status": status, "source": source, "reason": reason}
+    record: dict[str, str] = {"ts": now.isoformat(timespec="seconds"), "status": status, "source": source, "reason": reason}
+    if location:
+        record["location"] = location
+    if context:
+        record["context"] = context
     try:
         box.mkdir(parents=True, exist_ok=True)
         with (box / f"{now.astimezone(ALERT_POLICY_TZ).date().isoformat()}.jsonl").open("a", encoding="utf-8") as fh:

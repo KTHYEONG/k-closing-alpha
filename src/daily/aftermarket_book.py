@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import logging
 import os
+import traceback
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -14,7 +15,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 from src import settings
-from src.api.kis.key_pool import prewarm_healthy_clients, resolve_research_credentials, token_cache_path
+from src.api.kis.key_pool import (
+    kis_key_id,
+    kis_msg_cd,
+    prewarm_healthy_clients,
+    resolve_research_credentials,
+    token_cache_path,
+)
 from src.config.collection import CollectionSettings
 from src.config.market_session import (
     INTRADAY_SESSION_KRX_AFTERMARKET,
@@ -42,6 +49,7 @@ from src.data.research_roster import research_extras, research_manifest, split_r
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day
 from src.execution.paper_broker import HeldRoster, load_held_roster
+from src.tools.alerts import redact_for_egress
 from src.tools.run_outcome import RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.utils.cli_logging import configure_cli_logging
 
@@ -297,7 +305,28 @@ async def run_aftermarket_book_capture(
     manifests: list[CaptureManifest] = []
     buffer: list[dict[str, Any]] = []
     rows_total = 0
+    seen_failure_kinds: set[tuple[str, str, str]] = set()
+    block_failure_counts: dict[tuple[str, str], int] = {}
     sem = asyncio.Semaphore(int(profile.COLLECTION_CONCURRENCY_PER_KEY) * len(clients))
+
+    def _note_request_failure(
+        client: Any, symbol: str, venue: str, kind: str, *, exc: BaseException | None = None, msg_cd: str = ""
+    ) -> None:
+        key_id = kis_key_id(str(getattr(client, "app_key", "") or ""))
+        block_failure_counts[(venue, kind)] = block_failure_counts.get((venue, kind), 0) + 1
+        if (venue, kind, key_id) in seen_failure_kinds:
+            return
+        seen_failure_kinds.add((venue, kind, key_id))
+        trace = "\n" + redact_for_egress("".join(traceback.format_exception(exc))) if exc is not None else ""
+        logger.warning(
+            "[DATA] stage=aftermarket_book status=REQUEST_FAILED symbol=%s venue=%s key_id=%s error=%s msg_cd=%s%s",
+            symbol,
+            venue,
+            key_id,
+            kind,
+            msg_cd or "-",
+            trace,
+        )
 
     async def _send(
         broker_session: Any,
@@ -346,7 +375,8 @@ async def run_aftermarket_book_capture(
                 payload = await client.get_orderbook_snapshot(
                     broker_session, symbol, market_div_code=_VENUE_DIV_CODE[venue]
                 )
-            except Exception:
+            except Exception as exc:
+                _note_request_failure(client, symbol, venue, type(exc).__name__, exc=exc, msg_cd=kis_msg_cd(exc))
                 received = now_clock()
                 return CoverageEntry(
                     symbol=symbol,
@@ -364,6 +394,9 @@ async def run_aftermarket_book_capture(
             received = now_clock()
         body: dict[str, Any] | None = dict(payload) if isinstance(payload, dict) else None
         ok = isinstance(body, dict) and body.get("rt_cd") == "0"
+        if not ok:
+            payload_msg_cd = redact_for_egress(str(body.get("msg_cd", "") or "")) if body else ""
+            _note_request_failure(client, symbol, venue, f"msg_cd:{payload_msg_cd or 'none'}", msg_cd=payload_msg_cd)
         if ok and body is not None and venue == "NXT" and not _is_nxt_listed(body):
             nx_unlisted.add(symbol)
         context = CaptureContext(
@@ -566,8 +599,12 @@ async def run_aftermarket_book_capture(
                     )
                     store.publish_manifest(research_sibling)
                     manifests.append(research_sibling)
+            request_errors = (
+                ",".join(f"{venue}/{kind}={count}" for (venue, kind), count in sorted(block_failure_counts.items())) or "-"
+            )
+            block_failure_counts.clear()
             logger.info(
-                "[DATA] stage=aftermarket_book block=%d rounds=%d ok=%d late=%d failed=%d nx_unlisted=%d rows_total=%d",
+                "[DATA] stage=aftermarket_book block=%d rounds=%d ok=%d late=%d failed=%d nx_unlisted=%d rows_total=%d request_errors=%s",
                 block,
                 len(block_rounds),
                 ok,
@@ -575,6 +612,7 @@ async def run_aftermarket_book_capture(
                 failed,
                 unlisted,
                 rows_total,
+                request_errors,
             )
     append_orderbook_snapshots(buffer, snapshot_date, session="aftermarket")
     return tuple(manifests)

@@ -188,3 +188,26 @@ def test_page_audit_issues_reads_remediation_ledger(tmp_path: Path) -> None:
 
     assert statuses == {"failed_unit:kca-kis-token-warmup.service": "HELD"}
     assert sent == []
+
+
+def test_record_silent_old_call_shape_unchanged(tmp_path: Path) -> None:
+    incident_pager.record_silent("failed_unit:x.service", reason="r", now=_kst(9), root=tmp_path)
+
+    rows = [json.loads(line) for line in (tmp_path / "2026-11-03.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert list(rows[0]) == ["ts", "status", "source", "reason"]
+
+
+def test_record_silent_writes_location_and_context_when_given(tmp_path: Path) -> None:
+    incident_pager.record_silent("failed_unit:x.service", reason="r", now=_kst(9), root=tmp_path, context="tail line")
+
+    row = json.loads((tmp_path / "2026-11-03.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert "location" not in row
+    assert row["context"] == "tail line"
+
+    incident_pager.record_silent(
+        "failed_unit:x.service", reason="r", now=_kst(9), root=tmp_path, location="src/a.py:3 in f", context="c"
+    )
+    row = json.loads((tmp_path / "2026-11-03.jsonl").read_text(encoding="utf-8").splitlines()[1])
+    assert row["location"] == "src/a.py:3 in f"
+    assert row["context"] == "c"
