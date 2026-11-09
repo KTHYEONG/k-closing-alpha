@@ -301,7 +301,8 @@ def attach_screenable_class(
     if len(proxy_idx):
         proxy_vals = proxy_screenable(pd.Series(syms[proxy_idx]))
         verdict[proxy_idx] = np.asarray(proxy_vals, dtype=bool)
-    out = panel.copy()
+    # Copy-on-Write: only new columns are set, so a shallow copy leaves the caller's panel intact.
+    out = panel.copy(deep=False)
     out[SCREENABLE_CLASS_COL] = np.asarray(verdict, dtype=bool)
     out[SCREENABLE_SOURCE_COL] = np.asarray(source, dtype=object)
     n_real = int(is_real.sum())

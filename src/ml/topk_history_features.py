@@ -79,7 +79,7 @@ def attach_lagged_flow_features(cands: pd.DataFrame, panel: pd.DataFrame) -> pd.
     missing_p = [c for c in required_p if c not in panel.columns]
     if missing_p:
         raise ValueError(f"panel missing required columns: {missing_p}")
-    p = panel[[*required_p, *(["close_raw"] if "close_raw" in panel.columns else [])]].copy()
+    p = panel[[*required_p, *(["close_raw"] if "close_raw" in panel.columns else [])]]
     p["date"] = pd.to_datetime(p["date"])
     p["symbol"] = p["symbol"].astype(str)
     dup = int(p.duplicated(["date", "symbol"]).sum())
@@ -124,7 +124,8 @@ def compute_topk_history_features(panel: pd.DataFrame) -> pd.DataFrame:
     missing = [c for c in HISTORY_REQUIRED_COLUMNS if c not in panel.columns]
     if missing:
         raise ValueError(f"panel missing required columns: {missing}")
-    p = panel[[*HISTORY_REQUIRED_COLUMNS, *(["close_raw"] if "close_raw" in panel.columns else [])]].copy()
+    # Copy-on-Write: the column selection is already an independent frame; .copy() would duplicate it eagerly.
+    p = panel[[*HISTORY_REQUIRED_COLUMNS, *(["close_raw"] if "close_raw" in panel.columns else [])]]
     p["date"] = pd.to_datetime(p["date"])
     p["symbol"] = p["symbol"].astype(str)
     dup = int(p.duplicated(["date", "symbol"]).sum())
@@ -133,7 +134,11 @@ def compute_topk_history_features(panel: pd.DataFrame) -> pd.DataFrame:
     p = p.sort_values(["symbol", "date"], kind="stable").reset_index(drop=True)
     for c in ("open", "close", "prev_close", "volume", "inst_netbuy", "foreign_netbuy"):
         p[c] = pd.to_numeric(p[c], errors="coerce").astype("float64")
-    labels = p["symbol"]
+    # Integer group codes (first-appearance order, same partition as the symbols) avoid re-hashing
+    # millions of strings in every grouped rolling call.
+    codes = pd.factorize(p["symbol"])[0].astype(np.float64)
+    codes[codes < 0] = np.nan  # missing symbols stay dropped by groupby, exactly as with string keys
+    labels = pd.Series(codes, index=p.index)
     op = p["open"].to_numpy()
     cl = p["close"].to_numpy()
     pc = p["prev_close"].to_numpy()
@@ -182,7 +187,10 @@ def compute_topk_history_features(panel: pd.DataFrame) -> pd.DataFrame:
     out["f_inst_cum5"] = (_lag_roll(p["inst_netbuy"], labels, 5, "sum") / den).clip(-1.0, 1.0)
     out["f_foreign_cum5"] = (_lag_roll(p["foreign_netbuy"], labels, 5, "sum") / den).clip(-1.0, 1.0)
     cols = list(TOPK_HISTORY_FEATURE_COLS)
-    out[cols] = out[cols].replace([np.inf, -np.inf], np.nan)
+    # Column-wise: a frame-wide replace materializes a second copy of every feature column.
+    for c in cols:
+        values = out[c].to_numpy(dtype=np.float64)
+        out[c] = np.where(np.isinf(values), np.nan, values)
     return out[["date", "symbol", *cols]]
 
 

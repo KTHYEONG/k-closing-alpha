@@ -25,6 +25,7 @@ from src.ml.pit_core_features import (
     path_features,
 )
 from src.ml.research.pit_certification import attach_eod_labels
+from src.ml.research.v3_engine import FORWARD_EXIT_MAX_DAYS
 from src.ml.retrain_gate import RETRAIN_GATE_EVAL_DAYS
 from src.ml.topk_contract import (
     FEATURE_CONTRACT_VERSION_KEY,
@@ -207,7 +208,11 @@ def build_core_training_frame(
     store_start = pd.Timestamp(store_norm["date"].min()).normalize()
 
     pool, _sel_mask = build_dual_pool(
-        ph, market_dates, d_to_idx, train_spec=training_universe(spec.universe), select_spec=spec.universe
+        _pool_source_rows(ph, market_dates, d_to_idx, store_start),
+        market_dates,
+        d_to_idx,
+        train_spec=training_universe(spec.universe),
+        select_spec=spec.universe,
     )
     pool = demean_label_by_date(attach_pit_net_label(pool, cost=spec.cost), label_clip=label_clip)
     pool = _normalize_keys(pool)
@@ -230,6 +235,18 @@ def build_core_training_frame(
     frame = pd.concat([eod_rows, store_part], ignore_index=True)
     frame = attach_lagged_index(frame, index_table_from_price_history(ph))
     return frame[["date", "symbol", "tier", *PIT_CORE_FEATURE_COLS, "net_pit", "train_label", "exit_date"]]
+
+
+def _pool_source_rows(
+    ph: pd.DataFrame, market_dates: np.ndarray, d_to_idx: dict[pd.Timestamp, int], store_start: pd.Timestamp
+) -> pd.DataFrame:
+    # Only pool rows before the store survive, and their features and exits read at most
+    # FORWARD_EXIT_MAX_DAYS trading days past the last such date, so later rows are pure peak memory.
+    before = int(np.searchsorted(market_dates, np.datetime64(store_start), side="left"))
+    if before == 0:
+        return ph.iloc[:0]
+    cut_idx = min(before - 1 + FORWARD_EXIT_MAX_DAYS, len(market_dates) - 1)
+    return ph[ph["date"] <= market_dates[cut_idx]]
 
 
 def train_core_bundle(

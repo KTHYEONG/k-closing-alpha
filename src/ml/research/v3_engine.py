@@ -27,6 +27,8 @@ logger = logging.getLogger("research_v3_engine")
 
 # 실측 왕복비용 상단 시나리오(bp). 라벨이 아니라 스트레스 시나리오 전용이므로 PIT 스케줄과 독립이다.
 STRESS_COST_BP: float = 46.0
+# Trading days a suspended exit may wait before it resolves as UNRESOLVED_EXIT.
+FORWARD_EXIT_MAX_DAYS: int = 20
 
 
 def load_and_prepare_price_history(
@@ -149,7 +151,7 @@ def attach_forward_exit_paths(
         sym = syms[idx]
         cur_d_idx = date_indices[idx]
         found = False
-        for step in range(2, 21):
+        for step in range(2, FORWARD_EXIT_MAX_DAYS + 1):
             if cur_d_idx + step >= n_market_dates:
                 break
             nxt_date = market_dates[cur_d_idx + step]
@@ -169,7 +171,7 @@ def attach_forward_exit_paths(
         if not found:
             # If never resumes in 20 days, mark as unresolved exit
             exit_prices[idx] = cands.iloc[idx]["close"] * 0.50  # Conservative haircut
-            holding_days[idx] = 20
+            holding_days[idx] = FORWARD_EXIT_MAX_DAYS
             exit_status[idx] = "UNRESOLVED_EXIT"
 
     cands["d1_tradable"] = tradable_d1

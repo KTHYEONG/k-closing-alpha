@@ -106,7 +106,8 @@ def prepare_price_panel(
         raise ValueError(
             f"prepare_price_panel is missing required columns: {missing}"
         )
-    out = price_history_df.copy()
+    # Copy-on-Write: a shallow copy keeps the input unmutated without duplicating every column.
+    out = price_history_df.copy(deep=False)
     # 캘린더 정규화: 날짜는 datetime, 심볼은 6자리 문자열.
     out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
     out[symbol_col] = out[symbol_col].astype(str).str.zfill(6)
