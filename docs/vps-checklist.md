@@ -42,7 +42,7 @@
 |---|---|---|---|---|
 | **M** next-morning (mandatory) | business day 07:30–08:20 (Monday covers Fri + weekend nights) | 22:15 backup and 23:05 backfill are done; `last_run.json` is not yet overwritten; D's shrink backups still exist; ends before the 08:30 blackout | `kca_probe M` | H01 R01 R02 R03 R05 C01 C03 C04 C05 C11 Q08 P01–P04 B01 B02 B04 B05 A01 A03 A04 X01 |
 | **O** post-exit (mandatory) | business day 09:45–11:00 | exit window closed 09:30; price-ingest D-1 landed (a failed 08:30 run is auto-rerun at 09:40) | `kca_probe O` | R01 R02 C05 C07 Q05 P02 P03 P06 A01 A03 X01 |
-| **E** post-decision (mandatory) | business day 15:45–16:30 | entry chain ends 15:45; the archive row is still the decision snapshot | `kca_probe E` | R01 R02 C01 C05 C12 C13 C14 Q01 P01 P03 P04 P06 A01 A03 X01 |
+| **E** post-decision (mandatory) | business day 15:45–16:30 | entry chain ends 15:45; the archive row is still the decision snapshot | `kca_probe E` | R01 R02 C01 C05 C12 C13 C14 C16 Q01 P01 P03 P04 P06 A01 A03 X01 |
 | **L** liveness (optional) | 16:30–19:50 | aftermarket-book is the only long live capture (runs to ~19:59) | §5.2 `R06` | R06 |
 | **N** evening (mandatory; M re-checks if missed) | business day 21:50–22:10 | archive 20:05, tape 20:35, prune 21:00 and audit 21:20 are done; must finish before the 22:15 backup takes the Drive lock | `kca_probe N` | R01 R03 C03 C04 C06 C08 C13 C15 C11 Q06 Q07 Q08 Q09 Q10 B05 A01 A03 X01 |
 | **W** weekly (mandatory) | Monday 07:30–08:20, after M | Sat 22:00 retrain, Sun 10:00 snapshot, Sun 11:00 verify | `kca_probe W` + §5.1 local | H02 H03 H04 R04 P08 B07 B08 Q11 A05 |
@@ -133,6 +133,7 @@ Optional timers (`OPTIONAL_MANUAL_TIMERS`, `src/tools/code_sync.py:35-37`): auct
 | C13 | EXT | E N | `-research` sibling manifests present for auction-close (E) and auction-path/aftermarket-book (N); deadline/missed-start share of their entries ≤ 10 %. Primary manifests are judged by C03/C05/C06 without them | P2 | sibling `manifest-partial.json` reasons |
 | C14 | EXT | E | postclose manifest present, completed ≤ 15:39, good-entry share ≥ 0.95, `research/postclose_strength/<D>` exists | P2 | postclose journal `stage=postclose_snapshot` |
 | C15 | EXT | N | `research/decision_extras/<D>` rows == decision cohort rows, `kiwoom_cntr_str` filled ≥ 0.9 (Toss-union names have none), investor series partition exists | P2 | `uv run python -m src.daily.extras_extract --date <D>` (idempotent) |
+| C16 | EXT | E | `auction_close` outcome metrics for D: PASS when no close capture entry hit the deadline (`n_deadline == 0`, `rounds_with_deadline == 0`); otherwise WARN with `cause` `overcommit` (plan OVERCOMMIT), `late_start` (`start_lag_s > 5`) or `vendor`; no outcome record = WARN `outcome=absent`; SKIP(timer_off) when the timer is off | P2 | `events/<YYYY-MM>/<D>.jsonl` `auction_close` metrics |
 | C07 | CORE | O | §1; WARN on `flow_shortfall`/`program_flow_shortfall`. A 08:30 `stale_panel_pending_retry` is healthy when 11:30 is OK; an 11:30 DEGRADED `stale_panel` (or a failed 11:30 run with a stale panel) pages `[긴급][kca] 가격 이력 미갱신` | P1 | price-ingest journal |
 | C08 | CORE | N | §1 (report `days_checked[-1] == D`) | P1 | `last_report.json` `unresolved`, `stage=tape_sweep status=WARNING` |
 | C11 | CORE | N M | §1: `audit_daily_completeness(D)` (7 keys) + `intraday_complete` = the daily-audit run for D logged no `step=intraday_complete status=FAIL date=D` (mirrors `daily_audit.py:2308`) | P1 | daily-audit journal for D |
@@ -734,6 +735,25 @@ def _():
     st = manifest_status(D, f"auction-close-{D}-")
     out("C05", lv(not st, "complete" not in st.values()), close=",".join(st.values()) or "missing")
 c_research_e(D)
+@check("C16")
+def _():
+    if not timer_active("auction-close"):
+        out("C16", "SKIP(timer_off)")
+        return
+    rec = o.get("auction_close")
+    if rec is None:
+        out("C16", "WARN", outcome="absent")
+        return
+    if rec["outcome"] == "SKIPPED":
+        out("C16", f"SKIP({rec.get('reason', '')})")
+        return
+    m = rec.get("metrics", {})
+    fields = {k: m.get(k, "-") for k in ("roster", "capacity_per_round", "demand_per_round", "status", "start_lag_s", "rounds_with_deadline", "max_missed_rounds_per_symbol")}
+    if not (m.get("rounds_with_deadline", 0) or m.get("n_deadline", 0)):
+        out("C16", "PASS", **fields)
+        return
+    cause = "overcommit" if m.get("status") == "OVERCOMMIT" else "late_start" if m.get("start_lag_s", 0) > 5 else "vendor"
+    out("C16", "WARN", cause=cause, **fields)
 p_ledger(D, P, morning=False)
 @check("P06")
 def _():

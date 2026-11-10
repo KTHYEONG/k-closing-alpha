@@ -916,7 +916,7 @@ def test_main_skip_and_success(tmp_path, monkeypatch, caplog) -> None:
 
         return _Manifest()
 
-    async def _fake_async(snapshot_date: str, phase: str, profile: Any) -> Any:
+    async def _fake_async(snapshot_date: str, phase: str, profile: Any, stats_sink: Any = None) -> Any:
         return await _fake_run()
 
     monkeypatch.setattr(auction_capture, "CollectionSettings", lambda: _profile(tmp_path))
@@ -956,7 +956,7 @@ def test_main_logs_not_complete_detail_for_partial_manifest(tmp_path, monkeypatc
         status = CaptureStatus.PARTIAL
         entries = (entry,)
 
-    async def _fake_async(snapshot_date: str, phase: str, profile: Any) -> Any:
+    async def _fake_async(snapshot_date: str, phase: str, profile: Any, stats_sink: Any = None) -> Any:
         return _Manifest()
 
     monkeypatch.setattr(auction_capture, "CollectionSettings", lambda: _profile(tmp_path))
@@ -1128,7 +1128,7 @@ def test_main_logs_non_trading_day_skip(tmp_path, monkeypatch, caplog) -> None:
 
     from src.daily import auction_capture
 
-    async def _holiday(snapshot_date: str, phase: str, profile: Any) -> None:
+    async def _holiday(snapshot_date: str, phase: str, profile: Any, stats_sink: Any = None) -> None:
         return None
 
     monkeypatch.setattr(auction_capture, "CollectionSettings", lambda: _profile(tmp_path))
@@ -2267,12 +2267,32 @@ def _stubbed_close_run(
     *,
     n_clients: int = 2,
     status_for: Any = None,
+    stats_sink: dict[str, float | str] | None = None,
 ) -> tuple[Any, list[list[str]]]:
     """Close run whose request layer is replaced by a stub; returns the manifest and each orderbook round's roster."""
     from src.daily import auction_capture
-    from src.data.capture_contracts import CaptureStatus
 
     rosters: list[list[str]] = []
+    monkeypatch.setattr(auction_capture, "_observe_roster", _roster_stub(rosters, status_for))
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-17", symbols)
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="close",
+            profile=_profile(tmp_path),
+            store=store,
+            clients=[_FakeClient() for _ in range(n_clients)],
+            session_clock=_clock("2026-09-17"),
+            now_fn=lambda: _seoul(2026, 9, 17, 15, 20),
+            stats_sink=stats_sink,
+        )
+    )
+    return manifest, rosters
+
+
+def _roster_stub(rosters: list[list[str]], status_for: Any = None) -> Any:
+    from src.data.capture_contracts import CaptureStatus
 
     async def _stub(*, roster: Any, on_deadline: Any, gate: Any = None, **_: Any) -> list[Any]:
         if gate is None:
@@ -2286,21 +2306,207 @@ def _stubbed_close_run(
                 entries.append(status_for(position, base))
         return entries
 
-    monkeypatch.setattr(auction_capture, "_observe_roster", _stub)
-    store = _store(tmp_path)
-    _publish_cohort(store, "2026-09-17", symbols)
-    manifest = _run(
-        auction_capture.run_auction_capture(
-            "2026-09-17",
+    return _stub
+
+
+def _main_close_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    symbols: list[str],
+    *,
+    status_for: Any = None,
+    degraded_slots: tuple[str, ...] = (),
+) -> Any:
+    """Drive the real CLI `main` for a close run with the request layer stubbed; returns the manifest it produced."""
+    from src.daily import auction_capture
+
+    produced: list[Any] = []
+    monkeypatch.setattr(auction_capture, "_observe_roster", _roster_stub([], status_for))
+    _publish_cohort(_store(tmp_path), "2026-09-17", symbols)
+    monkeypatch.setattr(auction_capture, "CollectionSettings", lambda: _profile(tmp_path))
+
+    async def _run_phase(snapshot_date: str, phase: str, profile: Any, stats_sink: Any = None) -> Any:
+        manifest = await auction_capture.run_auction_capture(
+            snapshot_date,
             phase="close",
-            profile=_profile(tmp_path),
-            store=store,
-            clients=[_FakeClient() for _ in range(n_clients)],
-            session_clock=_clock("2026-09-17"),
+            profile=profile,
+            store=_store(tmp_path),
+            clients=[_FakeClient(), _FakeClient()],
+            session_clock=_clock(snapshot_date),
             now_fn=lambda: _seoul(2026, 9, 17, 15, 20),
+            stats_sink=stats_sink,
+            degraded_slots=degraded_slots,
         )
-    )
-    return manifest, rosters
+        produced.append(manifest)
+        return manifest
+
+    monkeypatch.setattr(auction_capture, "_run_async", _run_phase)
+    auction_capture.main(["--phase", "close", "--date", "2026-09-17"])
+    return produced[0]
+
+
+def _auction_close_events(run_date: str) -> list[dict[str, Any]]:
+    import json
+
+    from src.tools.run_outcome import run_events_path
+
+    path = run_events_path(run_date)
+    if not path.exists():
+        return []
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    return [row for row in rows if row.get("job") == "auction_close"]
+
+
+def _complete(base: Any) -> Any:
+    from src.data.capture_contracts import CaptureStatus
+
+    return base.model_copy(update={"status": CaptureStatus.COMPLETE, "rows": 1, "reason": "auction-close", "first_event_time": base.scheduled_at, "last_event_time": base.scheduled_at})
+
+
+def _deadline_miss(base: Any) -> Any:
+    from src.data.capture_contracts import CaptureStatus
+
+    return base.model_copy(update={"status": CaptureStatus.PARTIAL, "reason": "deadline"})
+
+
+def _vendor_miss(base: Any) -> Any:
+    from src.data.capture_contracts import CaptureStatus
+
+    return base.model_copy(update={"status": CaptureStatus.FAILED, "reason": "TimeoutError", "first_event_time": base.scheduled_at, "last_event_time": base.scheduled_at})
+
+
+def _head_deadline(position: int, base: Any) -> Any:
+    return _deadline_miss(base) if position < 3 else _complete(base)
+
+
+def _head_vendor_failure(position: int, base: Any) -> Any:
+    return _vendor_miss(base) if position < 3 else _complete(base)
+
+
+def _head_mixed(position: int, base: Any) -> Any:
+    if position == 0:
+        return _vendor_miss(base)
+    return _deadline_miss(base) if position < 3 else _complete(base)
+
+
+def test_close_run_records_ok_outcome(tmp_path, monkeypatch) -> None:
+    from src.data.capture_contracts import CaptureStatus
+
+    manifest = _main_close_run(tmp_path, monkeypatch, [f"{i:06d}" for i in range(5)])
+
+    assert manifest.status is CaptureStatus.COMPLETE
+    (event,) = _auction_close_events("2026-09-17")
+    assert event["outcome"] == "OK"
+    assert event["reason"] == ""
+    metrics = event["metrics"]
+    assert {
+        "roster", "extras", "clients", "capacity_per_round", "demand_per_round", "status", "start_lag_s",
+        "n_deadline", "n_late", "n_failed", "max_round_duration_s", "rounds_with_deadline",
+        "symbols_missing_any", "max_missed_rounds_per_symbol",
+    } <= set(metrics)
+    assert metrics["n_deadline"] == 0
+    assert metrics["rounds_with_deadline"] == 0
+    assert metrics["status"] == "OK"
+    assert metrics["roster"] == 5 and metrics["clients"] == 2
+
+
+def test_close_run_records_degraded_with_counts(tmp_path, monkeypatch) -> None:
+    manifest = _main_close_run(tmp_path, monkeypatch, [f"{i:06d}" for i in range(10)], status_for=_head_deadline)
+
+    deadline = [entry for entry in manifest.entries if entry.reason == "deadline"]
+    assert deadline
+    missed_rounds: dict[str, set[Any]] = {}
+    for entry in deadline:
+        missed_rounds.setdefault(entry.symbol, set()).add(entry.scheduled_at)
+    (event,) = _auction_close_events("2026-09-17")
+    assert event["outcome"] == "DEGRADED"
+    assert event["reason"] == "deadline"
+    metrics = event["metrics"]
+    assert metrics["n_deadline"] == len(deadline)
+    assert metrics["n_late"] == sum(entry.first_event_time is not None for entry in deadline)
+    assert metrics["n_failed"] == 0
+    assert metrics["rounds_with_deadline"] == len({entry.scheduled_at for entry in deadline})
+    assert metrics["symbols_missing_any"] == len({entry.symbol for entry in deadline})
+    assert metrics["max_missed_rounds_per_symbol"] == max(len(rounds) for rounds in missed_rounds.values())
+
+
+@pytest.mark.parametrize(
+    ("status_for", "reason"),
+    [(_head_deadline, "deadline"), (_head_vendor_failure, "vendor_failure"), (_head_mixed, "mixed")],
+)
+def test_close_outcome_reason_names_dominant_cause(tmp_path, monkeypatch, status_for, reason) -> None:
+    _main_close_run(tmp_path, monkeypatch, [f"{i:06d}" for i in range(10)], status_for=status_for)
+
+    (event,) = _auction_close_events("2026-09-17")
+    assert event["outcome"] == "DEGRADED"
+    assert event["reason"] == reason
+
+
+def test_close_outcome_degraded_without_entry_failures_has_no_reason(tmp_path, monkeypatch) -> None:
+    from src.data.capture_contracts import CaptureStatus
+
+    manifest = _main_close_run(tmp_path, monkeypatch, [f"{i:06d}" for i in range(5)], degraded_slots=("5",))
+
+    assert manifest.status is CaptureStatus.PARTIAL
+    (event,) = _auction_close_events("2026-09-17")
+    assert event["outcome"] == "DEGRADED"
+    assert event["reason"] == ""
+
+
+def test_stats_sink_filled_and_optional(tmp_path, monkeypatch) -> None:
+    symbols = [f"{i:06d}" for i in range(5)]
+    sink: dict[str, float | str] = {}
+    with_sink, _ = _stubbed_close_run(tmp_path / "with", monkeypatch, symbols, stats_sink=sink)
+    without, _ = _stubbed_close_run(tmp_path / "without", monkeypatch, symbols)
+
+    assert {"roster", "extras", "clients", "capacity_per_round", "demand_per_round", "status", "start_lag_s", "max_round_duration_s"} <= set(sink)
+    assert sink["roster"] == 5 and sink["clients"] == 2 and sink["status"] == "OK"
+    assert with_sink.status is without.status
+    assert [(e.symbol, e.dataset, e.status) for e in with_sink.entries] == [(e.symbol, e.dataset, e.status) for e in without.entries]
+
+
+def test_open_phase_records_nothing(tmp_path, monkeypatch) -> None:
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    class _Manifest:
+        status = CaptureStatus.COMPLETE
+        entries: tuple[Any, ...] = ()
+
+    async def _open_run(snapshot_date: str, phase: str, profile: Any, stats_sink: Any = None) -> Any:
+        return _Manifest()
+
+    monkeypatch.setattr(auction_capture, "CollectionSettings", lambda: _profile(tmp_path))
+    monkeypatch.setattr(auction_capture, "_run_async", _open_run)
+    auction_capture.main(["--phase", "open", "--date", "2026-09-17"])
+
+    assert _auction_close_events("2026-09-17") == []
+
+
+def test_outcome_record_failure_is_non_fatal(tmp_path, monkeypatch, caplog) -> None:
+    import logging
+
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    def _raise(*args: Any, **kwargs: Any) -> None:
+        raise OSError("events volume read-only")
+
+    monkeypatch.setattr(auction_capture, "record_run_outcome", _raise)
+    with caplog.at_level(logging.WARNING, logger=auction_capture.logger.name):
+        manifest = _main_close_run(tmp_path, monkeypatch, [f"{i:06d}" for i in range(5)])
+
+    assert manifest.status is CaptureStatus.COMPLETE
+    warnings = [r for r in caplog.records if "OUTCOME_RECORD_FAILED" in r.getMessage()]
+    assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+
+
+def test_auction_close_outcome_is_silent(tmp_path) -> None:
+    from src.tools.alert_policy import classify_run_outcome
+
+    assert classify_run_outcome("auction_close", "DEGRADED", "deadline") is None
+    assert classify_run_outcome("auction_close", "DEGRADED", "mixed") is None
+    assert classify_run_outcome("auction_close", "OK", "") is None
 
 
 def _plan_records(caplog: pytest.LogCaptureFixture) -> list[Any]:

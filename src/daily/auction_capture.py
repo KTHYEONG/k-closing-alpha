@@ -37,7 +37,7 @@ from src.data.research_roster import research_extras, research_manifest, split_r
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day, resolve_prev_trading_day_kis
 from src.execution.paper_broker import load_held_roster
-from src.tools.run_outcome import RUN_OUTCOME_SKIPPED, record_run_outcome
+from src.tools.run_outcome import RUN_OUTCOME_DEGRADED, RUN_OUTCOME_OK, RUN_OUTCOME_SKIPPED, record_run_outcome
 from src.utils.cli_logging import configure_cli_logging
 
 logger = logging.getLogger(__name__)
@@ -300,10 +300,11 @@ def _log_round_line(
     started: datetime,
     ended: datetime,
     capacity_per_round: int,
-) -> None:
+) -> float:
     n_complete = sum(1 for entry in entries if entry.status is CaptureStatus.COMPLETE)
     n_deadline = sum(1 for entry in entries if entry.reason == "deadline")
     n_late = sum(1 for entry in entries if entry.reason == "deadline" and entry.first_event_time is not None)
+    duration_s = max((ended - max(scheduled_at, started)).total_seconds(), 0.0)
     logger.info(
         "[DATA] stage=auction_capture_round phase=close dataset=%s round=%s index=%d n_roster=%d n_requested=%d "
         "n_complete=%d n_deadline=%d n_late=%d n_failed=%d duration_s=%.1f capacity_per_round=%d",
@@ -316,9 +317,10 @@ def _log_round_line(
         n_deadline,
         n_late,
         len(entries) - n_complete - n_deadline,
-        max((ended - max(scheduled_at, started)).total_seconds(), 0.0),
+        duration_s,
         capacity_per_round,
     )
+    return duration_s
 
 
 def _program_deadline_entry(position: int, symbol: str, *, scheduled_at: datetime) -> CoverageEntry:
@@ -826,16 +828,17 @@ def _log_capture_plan(
     interval_seconds: int,
     capacity_per_round: int,
     start_lag_seconds: float,
-) -> None:
-    """Log whether the closing plan fits the key budget; program demand is averaged over the rounds that can carry it."""
+) -> dict[str, float | str]:
+    """Log whether the closing plan fits the key budget and return its numbers; program demand is averaged over the rounds that can carry it."""
     demand_orderbook = n_roster + n_extras
     rounds_after_first_program = sum(1 for moment in rounds if program_instants and moment >= program_instants[0])
     demand_program = math.ceil(demand_orderbook * len(program_instants) / max(rounds_after_first_program, 1))
     overcommit = demand_orderbook + demand_program > capacity_per_round
+    status = "OVERCOMMIT" if overcommit else "OK"
     (logger.warning if overcommit else logger.info)(
         "[DATA] stage=auction_capture_plan phase=close status=%s n_roster=%d n_extras=%d n_priority=%d n_clients=%d "
         "rounds=%d interval_s=%d capacity_per_round=%d demand_orderbook=%d demand_program_per_round=%d start_lag_s=%.1f",
-        "OVERCOMMIT" if overcommit else "OK",
+        status,
         n_roster,
         n_extras,
         n_priority,
@@ -847,6 +850,15 @@ def _log_capture_plan(
         demand_program,
         start_lag_seconds,
     )
+    return {
+        "roster": n_roster,
+        "extras": n_extras,
+        "clients": n_clients,
+        "capacity_per_round": capacity_per_round,
+        "demand_per_round": demand_orderbook + demand_program,
+        "status": status,
+        "start_lag_s": start_lag_seconds,
+    }
 
 
 async def run_auction_capture(
@@ -861,6 +873,7 @@ async def run_auction_capture(
     sleep_fn: Callable[[float], Awaitable[None]] | None = None,
     previous_trading_day: str | None = None,
     degraded_slots: Sequence[str] = (),
+    stats_sink: dict[str, float | str] | None = None,
 ) -> CaptureManifest:
     """Capture the complete project cohort through independently timed auctions.
 
@@ -879,6 +892,7 @@ async def run_auction_capture(
         sleep_fn: Bounded scheduler wait; None uses asyncio.sleep.
         previous_trading_day: Previous actual trading day for the opening population.
         degraded_slots: Slots whose token issuance failed before capture; any makes the manifest PARTIAL.
+        stats_sink: Optional close-phase plan numbers and orderbook round duration, filled in place.
 
     Returns:
         Manifest retaining all expected entries and observed task states.
@@ -951,8 +965,9 @@ async def run_auction_capture(
             ",".join(degraded_slots), len(clients),
         )
     first_client: Any = clients[0]
+    max_round_duration_s = 0.0
     if phase == "close":
-        _log_capture_plan(
+        plan = _log_capture_plan(
             n_roster=len(roster),
             n_extras=len(extras),
             n_priority=len(priority),
@@ -963,6 +978,8 @@ async def run_auction_capture(
             capacity_per_round=capacity_per_round,
             start_lag_seconds=(now_clock() - rounds[0]).total_seconds(),
         )
+        if stats_sink is not None:
+            stats_sink.update(plan)
 
     async with first_client.create_session() as broker_session:
         program_task: asyncio.Task[list[CoverageEntry]] | None = None
@@ -1059,14 +1076,17 @@ async def run_auction_capture(
                 gate.end_round()
             entries.extend(round_entries)
             if phase == "close":
-                _log_round_line(
-                    CaptureDataset.ORDERBOOK,
-                    scheduled_at=scheduled_at,
-                    index=index,
-                    entries=round_entries,
-                    started=round_started,
-                    ended=now_clock(),
-                    capacity_per_round=capacity_per_round,
+                max_round_duration_s = max(
+                    max_round_duration_s,
+                    _log_round_line(
+                        CaptureDataset.ORDERBOOK,
+                        scheduled_at=scheduled_at,
+                        index=index,
+                        entries=round_entries,
+                        started=round_started,
+                        ended=now_clock(),
+                        capacity_per_round=capacity_per_round,
+                    ),
                 )
             if any(symbol not in research_set for symbol in degraded) or any(
                 entry.status is not CaptureStatus.COMPLETE
@@ -1075,6 +1095,8 @@ async def run_auction_capture(
             ):
                 incomplete = True
         if phase == "close":
+            if stats_sink is not None:
+                stats_sink["max_round_duration_s"] = max_round_duration_s
             if program_task is not None:
                 program_entries = await program_task
                 entries.extend(program_entries)
@@ -1212,7 +1234,12 @@ async def run_auction_capture(
     return manifest
 
 
-async def _run_async(snapshot_date: str, phase: str, profile: CollectionSettings) -> CaptureManifest | None:
+async def _run_async(
+    snapshot_date: str,
+    phase: str,
+    profile: CollectionSettings,
+    stats_sink: dict[str, float | str] | None = None,
+) -> CaptureManifest | None:
     """Run one capture phase; ``None`` when KIS reports ``snapshot_date`` as a market holiday."""
     trading_day = date.fromisoformat(snapshot_date)
     session_day = resolve_session_day(trading_day, overrides=profile.COLLECTION_SESSION_OVERRIDES)
@@ -1264,7 +1291,53 @@ async def _run_async(snapshot_date: str, phase: str, profile: CollectionSettings
         session_clock=clock,
         previous_trading_day=previous_trading_day,
         degraded_slots=degraded_slots,
+        stats_sink=stats_sink,
     )
+
+
+def _close_entry_counts(entries: Sequence[CoverageEntry]) -> dict[str, int]:
+    deadline = [entry for entry in entries if entry.reason == "deadline"]
+    rounds_missed: dict[str | None, set[datetime | None]] = collections.defaultdict(set)
+    for entry in deadline:
+        rounds_missed[entry.symbol].add(entry.scheduled_at)
+    return {
+        "n_deadline": len(deadline),
+        "n_late": sum(1 for entry in deadline if entry.first_event_time is not None),
+        "n_failed": sum(1 for entry in entries if entry.status is not CaptureStatus.COMPLETE and entry.reason != "deadline"),
+        "rounds_with_deadline": len({entry.scheduled_at for entry in deadline}),
+        "symbols_missing_any": len(rounds_missed),
+        "max_missed_rounds_per_symbol": max((len(rounds) for rounds in rounds_missed.values()), default=0),
+    }
+
+
+def _close_degraded_reason(counts: dict[str, int]) -> str:
+    if counts["n_deadline"] and counts["n_failed"]:
+        return "mixed"
+    if counts["n_deadline"]:
+        return "deadline"
+    if counts["n_failed"]:
+        return "vendor_failure"
+    return ""
+
+
+def _record_close_outcome(manifest: CaptureManifest, stats: dict[str, float | str], snapshot_date: str) -> None:
+    """Append the close verdict and its numbers to the run event log; a recording fault never fails the capture."""
+    try:
+        complete = manifest.status is CaptureStatus.COMPLETE
+        counts = _close_entry_counts(manifest.entries)
+        record_run_outcome(
+            "auction_close",
+            RUN_OUTCOME_OK if complete else RUN_OUTCOME_DEGRADED,
+            run_date=snapshot_date,
+            reason="" if complete else _close_degraded_reason(counts),
+            metrics={**stats, **counts},
+        )
+    except Exception:
+        logger.warning(
+            "[DATA] stage=auction_capture status=OUTCOME_RECORD_FAILED phase=close date=%s",
+            snapshot_date,
+            exc_info=True,
+        )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1293,7 +1366,8 @@ def main(argv: list[str] | None = None) -> None:
     if trading_day.weekday() >= 5:
         logger.info("[DATA] stage=auction_capture status=SKIP reason=holiday date=%s", snapshot_date)
         return
-    manifest = asyncio.run(_run_async(snapshot_date, args.phase, profile))
+    stats: dict[str, float | str] = {}
+    manifest = asyncio.run(_run_async(snapshot_date, args.phase, profile, stats_sink=stats))
     if manifest is None:
         # 휴장일은 장애가 아니다: 정상 종료해 OnFailure 오탐 알림과 무의미한 캡처를 막는다.
         record_run_outcome(
@@ -1324,6 +1398,8 @@ def main(argv: list[str] | None = None) -> None:
             dict(reasons),
             sample,
         )
+    if args.phase == "close":
+        _record_close_outcome(manifest, stats, snapshot_date)
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
