@@ -82,9 +82,9 @@ Weekday timers also fire on weekday holidays; jobs self-skip through `resolve_se
 | order-reconcile-exit | Mon–Fri 09:00:40 | `order_session --phase reconcile-exit` | journal | outcome `OK reconcile_complete` | 09:33 | HIGH |
 | paper-exit (decision) P | Mon–Fri 09:01 | `src/daily/paper_trade.py --phase exit` (window to 09:30, `src/config/market_session.py:97-103`) | `data/paper/{orders,fills,trades,nav}.parquet` | journal `stage=paper_ledger_refresh as_of=D … n_open=0`; **no OK outcome** | 09:30 | HIGH |
 | collect (decision) | Mon–Fri 15:20 | `src/daily/collect.py:main` :1100 | `archive.parquet` via `src/daily/archive.py:upsert_archive_snapshot` :165; `capture/decision/<D>/<run>/input.parquet` | `stage=realtime_coverage … status=COMPLETE` (min 0.99, :201); **outcome only on SKIPPED** | 15:29 | HIGH |
-| research-roster (standard, Kiwoom ka10032; silent) | Mon–Fri 15:20:30 (inside the blackout) | `src/daily/roster_capture.py:main` | `manifests/<D>/research-roster-<D>-*` + normalized roster frame (members, drop reasons); never carries a cohort | outcome `OK members=…` (`DEGRADED truncated`; `SKIPPED disabled\|non_trading_day`) | 15:21:05 | MED |
+| research-roster (standard, Kiwoom ka10032; silent) | Mon–Fri 15:20:30 (inside the blackout) | `src/daily/roster_capture.py:main` | `manifests/<D>/research-roster-<D>-*` + normalized roster frame (members, drop reasons); never carries a cohort | outcome `OK members=…` (`DEGRADED truncated`; `SKIPPED disabled\|non_trading_day`) | 15:20:55 | MED |
 | predict (After=collect) | Mon–Fri 15:21 | `src/daily/predict.py:main` :455 | `parquet/{rank_pool_predictions,topk_decisions}.parquet` | outcome `OK` | 15:30 | HIGH |
-| auction-close (optional) | Mon–Fri 15:21:05 | `auction_capture --phase close` | raw + manifest `auction-close-<D>-*` (cohort) + sibling `…-research` (roster extras, dispatched after the cohort each round) | `status=COMPLETE phase=close` | 15:36 | MED |
+| auction-close (optional) | Mon–Fri 15:20:25 (not ordered after collect; cohort from `declared/<D>/` until the decision manifest exists, `cohort_source=declared`) | `auction_capture --phase close` | raw + manifest `auction-close-<D>-*` (cohort) + sibling `…-research` (roster extras, dispatched after the cohort each round); early declaration `declared/<D>/<cohort>.json` is not a manifest | `status=COMPLETE phase=close` | 15:36 | MED |
 | order-entry | Mon–Fri 15:21:15 | `order_session --phase entry` | journal | outcome `OK entry_complete` | 15:29 | HIGH |
 | finalize-close (decision; ExecStopPost starts paper-entry) | Mon–Fri 15:30:30 | `src/daily/finalize_close.py:main` :481 | archive `종가_확정`, raw `close_confirmation` | outcome `OK` (DEGRADED `empty_archive\|picks_unconfirmed\|zero_confirmed`, :148-156) | 15:33 | HIGH |
 | order-reconcile-entry | Mon–Fri 15:30:40 | `order_session --phase reconcile-entry` | journal | outcome `OK` | 15:43 | HIGH |
@@ -129,7 +129,7 @@ Optional timers (`OPTIONAL_MANUAL_TIMERS`, `src/tools/code_sync.py:35-37`): auct
 | C04 | CORE | N M | §1; output `streams={…: complete\|tape_healed\|partial(n failed)\|missing}`. Partial bars = WARN; missing = FAIL | P1 | §5.2 `C-manifest`, journal `stage=intraday_archive_stream` |
 | C05 | EXT | O E M | auction open/close primary manifests complete, `-research` siblings excluded (SKIP if timer off) | P2 | auction journal `status=LATE/DEGRADED` |
 | C06 | EXT | N | `auction-path-<D>-*` manifest complete (else WARN; 10-30 PARTIAL) | P2 | outcome metrics |
-| C12 | EXT | E | research roster manifest COMPLETE and completed ≤ 15:21:05, members 150–400 (outcome metrics); SKIP when the outcome is SKIPPED or the timer is off | P2 | roster journal `stage=research_roster` |
+| C12 | EXT | E | research roster manifest COMPLETE and completed ≤ 15:20:55, members 150–400 (outcome metrics); SKIP when the outcome is SKIPPED or the timer is off | P2 | roster journal `stage=research_roster` |
 | C13 | EXT | E N | `-research` sibling manifests present for auction-close (E) and auction-path/aftermarket-book (N); deadline/missed-start share of their entries ≤ 10 %. Primary manifests are judged by C03/C05/C06 without them | P2 | sibling `manifest-partial.json` reasons |
 | C14 | EXT | E | postclose manifest present, completed ≤ 15:39, good-entry share ≥ 0.95, `research/postclose_strength/<D>` exists | P2 | postclose journal `stage=postclose_snapshot` |
 | C15 | EXT | N | `research/decision_extras/<D>` rows == decision cohort rows, `kiwoom_cntr_str` filled ≥ 0.9 (Toss-union names have none), investor series partition exists | P2 | `uv run python -m src.daily.extras_extract --date <D>` (idempotent) |
@@ -365,7 +365,7 @@ def c_research_e(d):
         m = manifest_entries(d, sorted(runs_)[-1].name) if runs_ else {}
         done = datetime.fromisoformat(m["completed_at"]).astimezone(KST) if m else None
         n = (o or {}).get("metrics", {}).get("members")
-        out("C12", lv(not m, m.get("status") != "COMPLETE" or done > at(d, "15:21:05") or not n or not 150 <= n <= 400),
+        out("C12", lv(not m, m.get("status") != "COMPLETE" or done > at(d, "15:20:55") or not n or not 150 <= n <= 400),
             status=m.get("status", "missing"), completed=done.strftime("%T") if done else "-", members=n, outcome=(o or {}).get("outcome", "absent"))
     @check("C13")
     def _():
@@ -701,7 +701,7 @@ Window E (post-decision):
 ```python probe=E
 import numpy as np
 import pandas as pd
-runs("R01", [("collect", D, "15:20:00", 1), ("research-roster", D, "15:20:30", 1), ("predict", D, "15:21:00", 1), ("auction-close", D, "15:21:05", 1), ("order-entry", D, "15:21:15", 1),
+runs("R01", [("collect", D, "15:20:00", 1), ("research-roster", D, "15:20:30", 1), ("predict", D, "15:21:00", 1), ("auction-close", D, "15:20:25", 1), ("order-entry", D, "15:21:15", 1),
              ("finalize-close", D, "15:30:30", 1), ("order-reconcile-entry", D, "15:30:40", 1), ("paper-entry", D, "15:30:30", 1), ("postclose-snapshot", D, "15:31:30", 1)])
 o = expect("R02", D, {"predict": {"OK"}, "order_entry": {"OK", "SKIPPED:trading_disabled"}, "finalize_close": {"OK"},
                       "order_reconcile_entry": {"OK", "SKIPPED:trading_disabled"}})

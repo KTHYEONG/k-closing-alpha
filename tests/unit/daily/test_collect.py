@@ -3629,8 +3629,8 @@ def test_collect_main_reads_run_clock_once(tmp_path, monkeypatch) -> None:
     # When
     asyncio.run(collect.main(force=False))
 
-    # Then: run 시작 1회 + enrichment 완료 1회
-    assert calls["n"] == 2
+    # Then: run 시작 1회 + cohort 선언 시각 1회(조회 이후 실제 관측 시점) + enrichment 완료 1회
+    assert calls["n"] == 3
 
     # Given: SHIFTED 세션 조기 스킵
     calls["n"] = 0
@@ -3912,3 +3912,136 @@ def test_collect_refuses_example_store(monkeypatch) -> None:
     with pytest.raises(SystemExit) as exc:
         asyncio.run(collect.main())
     assert exc.value.code == 1
+
+
+def _cohort_declaration_stub(collect, monkeypatch, tmp_path, fetch_probe):
+    import asyncio
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+
+    import pandas as pd
+
+    from datetime import date
+
+    from src.data.capture_contracts import SessionClock
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    class _Stop(Exception):  # noqa: N818 - contract skeleton name
+        pass
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 14, 15, 20, 5, tzinfo=tz)
+
+    class _FakeKis:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def ensure_token(self, session):
+            return None
+
+        async def get_market_index_rate(self, session, code):
+            return {"rt_cd": "1"}
+
+        async def get_market_index_history(self, session, code, start, end):
+            return {"rt_cd": "0", "output2": []}
+
+    async def _open(_client, _session, _day):
+        return True
+
+    target = date(2026, 9, 14)
+    day = SessionDay(trading_date=target, kind=SessionKind.STANDARD, clock=SessionClock.standard(target), provenance="test")
+
+    async def _scan(*_args, **_kwargs):
+        return [
+            {"code": "005930", "name": "A", "price": "18000", "chgrate": "5.0"},
+            {"code": "500041", "name": "ETN", "price": "1000", "chgrate": "1.0"},
+        ]
+
+    async def _sharded(stock_list, clients, session, **kwargs):
+        fetch_probe(kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(collect, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(
+        collect,
+        "kis_data_client_kwargs",
+        lambda: {"app_key": "k", "app_secret": "s", "account_id": "", "hts_id": "h", "token_file": "t"},
+    )
+    monkeypatch.setattr(collect, "_validate_hts_id", lambda _hts_id: None)
+    monkeypatch.setattr(collect, "KisApiClient", _FakeKis)
+    monkeypatch.setattr(collect, "kis_decision_shard_client_kwargs", lambda: [{}])
+    monkeypatch.setattr(collect, "build_kiwoom_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "build_toss_scan_client", lambda: None)
+    monkeypatch.setattr(collect, "is_kis_trading_day", _open)
+    monkeypatch.setattr("src.data.trading_calendar.is_kis_trading_day", _open)
+    monkeypatch.setattr(collect, "resolve_session_day", lambda _d, **_k: day)
+    monkeypatch.setattr(collect, "resolve_daily_candidates", _scan)
+    monkeypatch.setattr(
+        collect,
+        "resolve_eligible_codes",
+        AsyncMock(
+            return_value=collect.EligibilityResolution(
+                prev_trading_day=pd.Timestamp("2026-09-11"),
+                listed=frozenset({"005930", "500041"}),
+                screenable=frozenset({"005930", "500041"}),
+                eligible=frozenset({"005930"}),
+            )
+        ),
+    )
+    monkeypatch.setattr(collect, "fetch_all_stock_data_sharded", _sharded)
+    monkeypatch.setattr(collect, "load_security_classification", lambda *a, **k: frozenset({"005930", "500041"}))
+    monkeypatch.setattr(collect, "_capture_root", lambda: tmp_path / "capture")
+    return _Stop
+
+
+def test_collect_publishes_declaration_before_detail_fetch(tmp_path, monkeypatch) -> None:
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from src.daily import collect
+    from src.data.capture_store import CaptureStore
+
+    cutoff = datetime(2026, 9, 14, 16, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+    seen: dict = {}
+
+    def _probe(kwargs):
+        store = CaptureStore(tmp_path / "capture")
+        seen["declared"] = store.read_declared_cohort("2026-09-14", available_by=cutoff)
+        seen["cohort"] = kwargs["cohort"]
+
+    stop = _cohort_declaration_stub(collect, monkeypatch, tmp_path, _probe)
+
+    with pytest.raises(stop):
+        asyncio.run(collect.main(force=False))
+
+    assert seen["declared"] is not None
+    assert seen["declared"] == seen["cohort"]
+    assert seen["declared"].eligible_symbols == ("005930",)
+
+
+def test_declaration_failure_does_not_fail_collect(tmp_path, monkeypatch, caplog) -> None:
+    import asyncio
+    import logging
+
+    from src.daily import collect
+    from src.data.capture_store import CaptureStore
+
+    reached: list[bool] = []
+    stop = _cohort_declaration_stub(collect, monkeypatch, tmp_path, lambda kwargs: reached.append(True))
+
+    def _fail(self, *args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(CaptureStore, "publish_cohort_declaration", _fail)
+    caplog.set_level(logging.WARNING, logger="src.daily.collect")
+
+    with pytest.raises(stop):
+        asyncio.run(collect.main(force=False))
+
+    assert reached == [True]
+    failed = [r for r in caplog.records if "stage=cohort_declaration status=FAILED error=OSError" in r.getMessage()]
+    assert len(failed) == 1
+    assert failed[0].levelno == logging.WARNING

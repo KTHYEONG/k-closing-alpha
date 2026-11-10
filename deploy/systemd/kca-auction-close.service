@@ -1,6 +1,5 @@
 [Unit]
 Description=KCA optional auction close capture (research, no orders)
-After=kca-collect.service
 OnFailure=kca-alert@%n.service
 
 [Service]

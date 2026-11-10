@@ -889,3 +889,146 @@ def test_iter_run_envelopes_rejects_non_envelope_artifacts(tmp_path: Path) -> No
     (run_dir / "005930-p0000-a00.json.gz").write_bytes(gzip.compress(b'["bare list"]', mtime=0))
     with pytest.raises(ValueError, match="malformed raw evidence"):
         list(store.iter_run_envelopes(DAY.isoformat(), "run-1"))
+
+
+SEOUL_TZ = ZoneInfo("Asia/Seoul")
+
+
+def _declared(tmp_path: Path) -> tuple[CaptureStore, Cohort, datetime]:
+    store = CaptureStore(tmp_path / "capture")
+    cohort = _cohort()
+    declared_at = datetime(2026, 9, 14, 15, 20, 10, tzinfo=SEOUL_TZ)
+    store.publish_cohort_declaration(cohort, declared_at=declared_at, retain_days=40)
+    return store, cohort, declared_at
+
+
+def test_declaration_roundtrip_honours_availability_cutoff(tmp_path: Path) -> None:
+    store, cohort, declared_at = _declared(tmp_path)
+
+    assert store.read_declared_cohort(DAY.isoformat(), available_by=declared_at) == cohort
+    assert store.read_declared_cohort(DAY.isoformat(), available_by=declared_at - timedelta(seconds=1)) is None
+    assert store.read_declared_cohort("2026-09-15", available_by=declared_at + timedelta(days=1)) is None
+
+
+def test_identical_declaration_republish_is_noop(tmp_path: Path) -> None:
+    store, cohort, declared_at = _declared(tmp_path)
+    path = store.root / "declared" / DAY.isoformat() / f"{cohort.cohort_id}.json"
+    before = path.read_bytes()
+
+    store.publish_cohort_declaration(cohort, declared_at=declared_at + timedelta(seconds=30), retain_days=40)
+
+    assert path.read_bytes() == before
+
+
+def test_declaration_requires_aware_clock(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    with pytest.raises(ValueError, match="timezone-aware"):
+        store.publish_cohort_declaration(_cohort(), declared_at=datetime(2026, 9, 14, 15, 20), retain_days=40)
+
+
+def test_declaration_is_not_a_manifest(tmp_path: Path) -> None:
+    store, _, declared_at = _declared(tmp_path)
+
+    assert store.read_manifests(DAY.isoformat()) == ()
+    with pytest.raises(FileNotFoundError):
+        store.read_cohort(DAY.isoformat(), available_by=declared_at + timedelta(hours=1))
+
+
+def test_declaration_corruption_raises_not_none(tmp_path: Path) -> None:
+    store, cohort, declared_at = _declared(tmp_path)
+    path = store.root / "declared" / DAY.isoformat() / f"{cohort.cohort_id}.json"
+    path.write_text(path.read_text(encoding="utf-8").replace("suspended", "tampered"), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cohort declaration"):
+        store.read_declared_cohort(DAY.isoformat(), available_by=declared_at)
+
+
+def test_declaration_prune_removes_only_expired_dates(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    today = datetime(2026, 9, 17, 15, 20, tzinfo=SEOUL_TZ)
+    root = store.root / "declared"
+    (root / "2026-08-07").mkdir(parents=True)  # 41 days before today
+    (root / "2026-09-07").mkdir(parents=True)  # 10 days before today
+    (root / "not-a-date").mkdir(parents=True)
+    (root / "2026-13-45").mkdir(parents=True)
+    (root / "2026-08-07" / "stale.json").write_text("{}", encoding="utf-8")
+
+    store.publish_cohort_declaration(_cohort(), declared_at=today, retain_days=40)
+
+    assert not (root / "2026-08-07").exists()
+    assert (root / "2026-09-07").exists()
+    assert (root / "not-a-date").exists()
+    assert (root / "2026-13-45").exists()
+    assert (root / DAY.isoformat()).exists()
+
+
+def test_declaration_prune_failure_never_raises(tmp_path: Path, monkeypatch: Any) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    stale = store.root / "declared" / "2026-07-01"
+    stale.mkdir(parents=True)
+
+    def _boom(path: Any, *args: Any, **kwargs: Any) -> None:
+        raise OSError("denied")
+
+    monkeypatch.setattr(store_module.shutil, "rmtree", _boom)
+    store.publish_cohort_declaration(_cohort(), declared_at=datetime(2026, 9, 14, 15, 20, tzinfo=SEOUL_TZ), retain_days=40)
+
+    assert stale.exists()
+
+
+def _declaration_path(store: CaptureStore, cohort: Cohort) -> Path:
+    return store.root / "declared" / cohort.trading_date.isoformat() / f"{cohort.cohort_id}.json"
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        pytest.param(lambda text: "not json", id="unparseable"),
+        pytest.param(lambda text: json.dumps({"schema_version": 1, "cohort": {}}), id="missing-keys"),
+        pytest.param(lambda text: text.replace("2026-09-14T15:20:10+09:00", "garbage"), id="bad-declared-at"),
+        pytest.param(lambda text: text.replace("2026-09-14T15:20:10+09:00", "2026-09-14T15:20:10"), id="naive-declared-at"),
+        pytest.param(lambda text: json.dumps(json.loads(text), indent=2), id="non-canonical-bytes"),
+    ],
+)
+def test_declaration_malformed_content_raises(tmp_path: Path, tamper: Any) -> None:
+    store, cohort, declared_at = _declared(tmp_path)
+    path = _declaration_path(store, cohort)
+    path.write_text(tamper(path.read_text(encoding="utf-8")), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cohort declaration"):
+        store.read_declared_cohort(DAY.isoformat(), available_by=declared_at)
+
+
+def test_declaration_renamed_file_is_hash_inconsistent(tmp_path: Path) -> None:
+    store, cohort, declared_at = _declared(tmp_path)
+    path = _declaration_path(store, cohort)
+    path.rename(path.with_name("cohort-2026-09-17-0000000000000000.json"))
+
+    with pytest.raises(ValueError, match="hash-inconsistent"):
+        store.read_declared_cohort(DAY.isoformat(), available_by=declared_at)
+
+
+def test_declaration_under_wrong_date_directory_raises(tmp_path: Path) -> None:
+    store, cohort, declared_at = _declared(tmp_path)
+    wrong = store.root / "declared" / "2026-09-18"
+    wrong.mkdir(parents=True)
+    _declaration_path(store, cohort).rename(wrong / f"{cohort.cohort_id}.json")
+
+    with pytest.raises(ValueError, match="cohort declaration"):
+        store.read_declared_cohort("2026-09-18", available_by=declared_at)
+
+
+def test_declaration_prune_listing_failure_never_raises(tmp_path: Path, monkeypatch: Any) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    real_iterdir = Path.iterdir
+
+    def _denied(self: Path) -> Any:
+        if self.name == "declared":
+            raise OSError("denied")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", _denied)
+
+    ref = store.publish_cohort_declaration(_cohort(), declared_at=datetime(2026, 9, 14, 15, 20, tzinfo=SEOUL_TZ), retain_days=40)
+
+    assert ref.path.startswith("declared/")

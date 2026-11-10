@@ -19,6 +19,7 @@ from src import settings
 
 # 커스텀 모듈 임포트
 from src.api.kis.client import KisApiClient, kis_data_client_kwargs, kis_decision_shard_client_kwargs
+from src.config.collection import CollectionSettings
 from src.config.market_session import REALTIME_REQUOTE_DEADLINE_HHMMSS
 from src.data.capture_contracts import (
     CaptureContext,
@@ -1098,6 +1099,25 @@ def persist_daily_snapshot(df: pd.DataFrame, snapshot_date: str) -> int:
     return archive.upsert_archive_snapshot(df, snapshot_date=snapshot_date)
 
 
+def declare_cohort(store: CaptureStore, cohort: Cohort) -> None:
+    """Publish the population before its detail fetch; a failure never fails or delays collect."""
+    try:
+        retain_days = CollectionSettings().COLLECTION_COHORT_DECLARATION_RETAIN_DAYS
+        store.publish_cohort_declaration(
+            cohort,
+            declared_at=datetime.now(ZoneInfo("Asia/Seoul")),
+            retain_days=retain_days,
+        )
+    except Exception as exc:
+        logger.warning("[DATA] stage=cohort_declaration status=FAILED error=%s", type(exc).__name__)
+        return
+    logger.info(
+        "[DATA] stage=cohort_declaration status=OK n_eligible=%d cohort_id=%s",
+        len(cohort.eligible_symbols),
+        cohort.cohort_id,
+    )
+
+
 async def main(force: bool = False) -> None:
     # auction_capture is a separate command; it loads this job's published cohort
     # through CaptureStore rather than being awaited inside initial collect.
@@ -1260,6 +1280,7 @@ async def main(force: bool = False) -> None:
             rejections,
             eligibility_rule_version=_DECISION_ELIGIBILITY_RULE_VERSION,
         )
+        declare_cohort(store, cohort)
         stock_list = filter_eligible_candidates(stock_list, eligible_codes)
 
         logger.info(

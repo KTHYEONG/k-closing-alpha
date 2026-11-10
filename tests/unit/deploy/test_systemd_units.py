@@ -1373,3 +1373,17 @@ def test_auction_path_unit_pair_declared() -> None:
     for mount in re.findall(r"-v \S+", close_mounts):
         if ".cache/kis" in mount or "/app/data" in mount or "/app/artifacts" in mount:
             assert mount in service
+
+
+def test_auction_close_unit_not_ordered_after_collect() -> None:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[3] / "deploy" / "systemd"
+    service = (root / "kca-auction-close.service").read_text(encoding="utf-8")
+    timer = (root / "kca-auction-close.timer").read_text(encoding="utf-8").splitlines()
+
+    assert "After=kca-collect.service" not in service
+    assert "OnFailure=kca-alert@%n.service" in service
+    assert "OnCalendar=Mon..Fri 15:20:25 Asia/Seoul" in timer
+    for unit in sorted(root.glob("kca-*.service")):
+        assert "After=kca-auction-close.service" not in unit.read_text(encoding="utf-8"), unit.name

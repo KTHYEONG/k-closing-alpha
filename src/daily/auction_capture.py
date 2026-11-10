@@ -34,12 +34,13 @@ from src.data.capture_contracts import (
     CapturedResponse,
     CaptureManifest,
     CaptureStatus,
+    Cohort,
     CoverageEntry,
     SessionClock,
 )
 from src.data.capture_store import CaptureStore
 from src.data.capture_store import resolve_capture_root as _capture_root
-from src.data.research_roster import research_extras, research_manifest, split_research_entries
+from src.data.research_roster import read_research_roster, research_extras, research_manifest, split_research_entries
 from src.data.session_calendar import SessionKind, resolve_session_day
 from src.data.trading_calendar import is_kis_trading_day, resolve_prev_trading_day_kis
 from src.execution.paper_broker import load_held_roster
@@ -54,6 +55,8 @@ _OPEN_TRUST_FLOOR_SECONDS: int = 30
 # KIS gateway asks the caller to simply re-query for this code (observed 2026-11-04 15:25, one symbol lost).
 _TRANSIENT_VENDOR_CODES: frozenset[str] = frozenset({"EGW00316"})
 _TRANSIENT_VENDOR_RETRIES: int = 1
+_INPUT_POLL_SECONDS: float = 0.5
+_ROUND0_INPUT_MARGIN: timedelta = timedelta(seconds=5)
 
 
 def _previous_trading_day(snapshot_date: str) -> str:
@@ -93,6 +96,17 @@ def program_rounds(clock: SessionClock) -> list[datetime]:
     return [clock.close_at + timedelta(minutes=offset) for offset in _PROGRAM_OFFSET_MINUTES]
 
 
+def _close_cohort(store: CaptureStore, snapshot_date: str, now: datetime) -> tuple[Cohort, str]:
+    """Decision manifest first; the early declaration only while no decision manifest is observable."""
+    try:
+        return store.read_cohort(snapshot_date, available_by=now), "decision"
+    except FileNotFoundError as exc:
+        declared = store.read_declared_cohort(snapshot_date, available_by=now)
+        if declared is None:
+            raise RuntimeError(f"auction cohort cannot be verified: {snapshot_date!r}") from exc
+        return declared, "declared"
+
+
 def _resolve_roster(
     snapshot_date: str,
     phase: str,
@@ -100,12 +114,20 @@ def _resolve_roster(
     now: datetime,
     previous_trading_day: str | None = None,
 ) -> tuple[list[str], str | None, bool]:
+    roster, cohort_id, incomplete, _ = _resolve_roster_source(snapshot_date, phase, store, now, previous_trading_day)
+    return roster, cohort_id, incomplete
+
+
+def _resolve_roster_source(
+    snapshot_date: str,
+    phase: str,
+    store: CaptureStore,
+    now: datetime,
+    previous_trading_day: str | None = None,
+) -> tuple[list[str], str | None, bool, str | None]:
     if phase == "close":
-        try:
-            cohort = store.read_cohort(snapshot_date, available_by=now)
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"auction cohort cannot be verified: {snapshot_date!r}") from exc
-        return [str(item) for item in cohort.eligible_symbols], cohort.cohort_id, False
+        cohort, source = _close_cohort(store, snapshot_date, now)
+        return [str(item) for item in cohort.eligible_symbols], cohort.cohort_id, False, source
     prev_day = previous_trading_day or _previous_trading_day(snapshot_date)
     held = load_held_roster()
     try:
@@ -118,7 +140,7 @@ def _resolve_roster(
                 held.failure_reason,
                 snapshot_date,
             )
-        return list(held.symbols), None, True
+        return list(held.symbols), None, True, None
     codes: list[str] = [str(item) for item in prev_cohort.eligible_symbols]
     for item in held.symbols:
         if item not in codes:
@@ -129,7 +151,45 @@ def _resolve_roster(
             held.failure_reason,
             snapshot_date,
         )
-    return codes, prev_cohort.cohort_id, not held.ok
+    return codes, prev_cohort.cohort_id, not held.ok, None
+
+
+def _cohort_available(store: CaptureStore, snapshot_date: str, now: datetime) -> bool:
+    try:
+        store.read_cohort(snapshot_date, available_by=now)
+        return True
+    except FileNotFoundError:
+        return store.read_declared_cohort(snapshot_date, available_by=now) is not None
+
+
+def _research_available(store: CaptureStore, snapshot_date: str, now: datetime) -> bool:
+    try:
+        read_research_roster(store, snapshot_date, available_by=now)
+    except (FileNotFoundError, ValueError):
+        return False
+    return True
+
+
+async def _await_auction_inputs(
+    store: CaptureStore,
+    snapshot_date: str,
+    *,
+    research_enabled: bool,
+    deadline: datetime,
+    now_fn: Callable[[], datetime],
+    sleeper: Callable[[float], Awaitable[None]],
+) -> None:
+    """Poll until the closing population (and research roster when enabled) is observable, or the deadline passes."""
+    while True:
+        now = now_fn()
+        if _cohort_available(store, snapshot_date, now) and (
+            not research_enabled or _research_available(store, snapshot_date, now)
+        ):
+            return
+        remaining = (deadline - now).total_seconds()
+        if remaining <= 0:
+            return
+        await sleeper(min(_INPUT_POLL_SECONDS, remaining))
 
 
 def _extract_open_price(payload: dict[str, Any] | None) -> int:
@@ -945,6 +1005,8 @@ def _log_capture_plan(
     start_lag_seconds: float,
     n_handoff: int = 0,
     capacity_with_handoff: int = 0,
+    cohort_source: str = "none",
+    inputs_wait_s: float = 0.0,
 ) -> dict[str, float | str]:
     """Log whether the closing plan fits the key budget and return its numbers; program demand is averaged over the rounds that can carry it."""
     demand_orderbook = n_roster + n_extras
@@ -955,7 +1017,7 @@ def _log_capture_plan(
     (logger.warning if overcommit else logger.info)(
         "[DATA] stage=auction_capture_plan phase=close status=%s n_roster=%d n_extras=%d n_priority=%d n_clients=%d "
         "rounds=%d interval_s=%d capacity_per_round=%d demand_orderbook=%d demand_program_per_round=%d start_lag_s=%.1f "
-        "handoff_slots=%d capacity_with_handoff=%d",
+        "handoff_slots=%d capacity_with_handoff=%d cohort_source=%s inputs_wait_s=%.1f",
         status,
         n_roster,
         n_extras,
@@ -969,6 +1031,8 @@ def _log_capture_plan(
         start_lag_seconds,
         n_handoff,
         capacity_with_handoff,
+        cohort_source,
+        inputs_wait_s,
     )
     return {
         "roster": n_roster,
@@ -978,6 +1042,8 @@ def _log_capture_plan(
         "demand_per_round": demand_orderbook + demand_program,
         "status": status,
         "start_lag_s": start_lag_seconds,
+        "cohort_source": cohort_source,
+        "inputs_wait_s": inputs_wait_s,
     }
 
 
@@ -1047,8 +1113,27 @@ async def run_auction_capture(
         raise ValueError("handoff clients and labels must align")
     if handoff_clients and not profile.COLLECTION_AUCTION_HANDOFF_SLOTS:
         raise ValueError("handoff clients require declared handoff slots")
+    rounds = close_rounds(session_clock, int(profile.COLLECTION_AUCTION_INTERVAL_SECONDS)) if phase == "close" else _open_rounds(session_clock)
+    inputs_wait_s = 0.0
+    if phase == "close":
+        wait_started = now_clock()
+        if not (injected_clock and sleeper is asyncio.sleep):
+            await _await_auction_inputs(
+                store,
+                snapshot_date,
+                research_enabled=profile.COLLECTION_RESEARCH_ROSTER_ENABLED,
+                deadline=min(
+                    rounds[0] - _ROUND0_INPUT_MARGIN,
+                    wait_started + timedelta(seconds=profile.COLLECTION_AUCTION_INPUT_WAIT_SECONDS),
+                ),
+                now_fn=now_clock,
+                sleeper=sleeper,
+            )
+        inputs_wait_s = (now_clock() - wait_started).total_seconds()
     now = now_clock()
-    roster, cohort_id, cohort_incomplete = _resolve_roster(snapshot_date, phase, store, now, previous_trading_day)
+    roster, cohort_id, cohort_incomplete, cohort_source = _resolve_roster_source(
+        snapshot_date, phase, store, now, previous_trading_day
+    )
     roster_date = snapshot_date if phase == "close" else (previous_trading_day or _previous_trading_day(snapshot_date))
     extras = research_extras(
         store,
@@ -1084,10 +1169,8 @@ async def run_auction_capture(
             utilization=profile.COLLECTION_AUCTION_CAPACITY_UTILIZATION,
             tps_per_key=KIS_REST_TPS_PER_APP_KEY,
         )
-        rounds = close_rounds(session_clock, int(profile.COLLECTION_AUCTION_INTERVAL_SECONDS))
         phase_end = session_clock.close_at
     else:
-        rounds = _open_rounds(session_clock)
         phase_end = session_clock.open_at + timedelta(seconds=int(profile.COLLECTION_OPEN_CONFIRM_SECONDS))
     run_id = f"auction-{phase}-{snapshot_date}-{uuid.uuid4().hex[:8]}"
     reason_tag = f"auction-{phase}"
@@ -1116,6 +1199,8 @@ async def run_auction_capture(
             start_lag_seconds=(now_clock() - rounds[0]).total_seconds(),
             n_handoff=len(handoff_clients),
             capacity_with_handoff=capacity_with_handoff,
+            cohort_source=cohort_source or "none",
+            inputs_wait_s=inputs_wait_s,
         )
         if stats_sink is not None:
             stats_sink.update(plan)

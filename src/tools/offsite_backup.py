@@ -48,6 +48,8 @@ LOOSE_EXCLUDES: tuple[str, ...] = (
     "/history/capture/manifests/**",
     "/history/capture/backups/**",
     "/history/capture/staging/offsite/**",
+    # Early cohort declarations are derivable from the decision manifest; keep them out of the never-pruned loose copy.
+    "/history/capture/declared/**",
     # The full-rewrite monolith travels as its base + patch form (price_history_offsite), uploaded by its own step.
     "/history/price_history.parquet",
     "/history/price_history_offsite/**",

@@ -34,7 +34,7 @@ def test_loose_copy_data_excludes_segment_tiers_and_local_snapshots() -> None:
     assert cmd[cmd.index("--backup-dir") + 1] == f"{BACKUP_REMOTE_BASE}/_deleted/data/2026-09-18"
     for pattern in LOOSE_EXCLUDES:
         assert pattern in cmd
-    assert len(LOOSE_EXCLUDES) == 8
+    assert len(LOOSE_EXCLUDES) == 9
     assert "/history/capture/offsite/ledger/**" in LOOSE_EXCLUDES
     assert "/history/capture/manifests/**" in LOOSE_EXCLUDES
     assert "/history/price_history.parquet" in LOOSE_EXCLUDES
@@ -285,6 +285,7 @@ def test_tape_backfill_ledger_is_not_excluded_from_loose_copy() -> None:
     # Given the resume ledger lives under capture/staging/tape_backfill
     # Then only the seal workspace is excluded from staging
     assert "/history/capture/staging/offsite/**" in LOOSE_EXCLUDES
+    assert "/history/capture/declared/**" in LOOSE_EXCLUDES
     assert not any(pattern.startswith("/history/capture/staging/**") for pattern in LOOSE_EXCLUDES)
 
 

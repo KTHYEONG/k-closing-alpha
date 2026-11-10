@@ -35,6 +35,9 @@ class CollectionSettings(EnvSettings):
         COLLECTION_AUCTION_HANDOFF_SLOTS: Non-leading decision-shard slots lent to auction research after
             the decision manifest exists, default empty (off).
         COLLECTION_ALTDATA_EXTRA_SLOTS: Extra KIS data slots for alt-data fan-out, default empty.
+        COLLECTION_COHORT_DECLARATION_RETAIN_DAYS: Calendar days of early cohort declarations kept, default 40.
+        COLLECTION_AUCTION_INPUT_WAIT_SECONDS: Longest wait for the closing cohort and research roster before the
+            closing capture starts, default 35; the wait never extends past the round-0 start minus 5 seconds.
         COLLECTION_AUCTION_INTERVAL_SECONDS: Closing sweep interval, default 60.
         COLLECTION_AUCTION_CAPACITY_UTILIZATION: Share of the per-key request budget a closing round plans for,
             default 0.85 (headroom against the measured ~33 of 36 req/s).
@@ -132,6 +135,8 @@ class CollectionSettings(EnvSettings):
     COLLECTION_RESEARCH_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
     COLLECTION_AUCTION_HANDOFF_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
     COLLECTION_ALTDATA_EXTRA_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
+    COLLECTION_COHORT_DECLARATION_RETAIN_DAYS: int = Field(default=40, gt=0)
+    COLLECTION_AUCTION_INPUT_WAIT_SECONDS: int = Field(default=35, ge=0)
     COLLECTION_AUCTION_INTERVAL_SECONDS: int = Field(default=60, gt=0)
     COLLECTION_AUCTION_CAPACITY_UTILIZATION: float = Field(default=0.85, gt=0, le=1, allow_inf_nan=False)
     COLLECTION_REQUEST_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, allow_inf_nan=False)

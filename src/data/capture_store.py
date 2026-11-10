@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import uuid
 from collections.abc import Iterator, Sequence
 from datetime import date, datetime
@@ -30,6 +31,7 @@ from src.data.capture_contracts import (
     CoverageEntry,
     RawCaptureError,
     _require_path_safe,
+    build_cohort,
 )
 from src.data.io_utils import atomic_write_bytes
 from src.utils.file_lock import DEFAULT_LOCK_TIMEOUT_SECONDS, exclusive_file_lock, sidecar_lock_path
@@ -38,6 +40,8 @@ __all__ = ["CaptureStore", "resolve_capture_root"]
 
 _MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 _LOCK_TIMEOUT_SECONDS = DEFAULT_LOCK_TIMEOUT_SECONDS
+_DECLARED_DIR = "declared"
+_DATE_DIR_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def resolve_capture_root(profile: CollectionSettings | None = None) -> Path:
@@ -482,6 +486,122 @@ class CaptureStore:
         cohort = chosen.cohort
         assert cohort is not None
         return cohort
+
+    def publish_cohort_declaration(self, cohort: Cohort, *, declared_at: datetime, retain_days: int) -> ArtifactRef:
+        """Publish the day's population before its detail fetch, outside the decision manifests.
+
+        A declaration is an availability record, not coverage evidence: it lives beside `manifests/`
+        so no manifest reader can mistake it for a decision. The first declaration of a cohort keeps its
+        `declared_at`, because that instant is when the population became observable. Declarations
+        older than `retain_days` are pruned after each write; the removed content is derivable from the
+        decision manifest.
+
+        Args:
+            cohort: Population identified before any detail fetch.
+            declared_at: Aware instant at which the population became observable.
+            retain_days: Calendar days of declarations kept, counted from `declared_at`.
+
+        Returns:
+            Immutable declaration reference.
+
+        Raises:
+            ValueError: Naive `declared_at`, or an existing declaration that fails validation.
+            OSError: Publication fails.
+        """
+        if declared_at.tzinfo is None or declared_at.utcoffset() is None:
+            raise ValueError("declared_at must be timezone-aware")
+        rel = "/".join([_DECLARED_DIR, cohort.trading_date.isoformat(), f"{cohort.cohort_id}.json"])
+        target = self._root / rel
+        if target.exists():
+            # The file is named by its cohort content hash, so a validated file already holds this cohort.
+            self._load_declaration(target, cohort.trading_date)
+            ref = self._publish_bytes(rel, target.read_bytes(), None)
+        else:
+            payload = _canonical_json(
+                {"schema_version": 1, "declared_at": declared_at.isoformat(), "cohort": cohort.model_dump(mode="json")}
+            )
+            ref = self._publish_bytes(rel, payload, None)
+        self._prune_declarations(declared_at.date(), retain_days)
+        return ref
+
+    def read_declared_cohort(self, snapshot_date: str, *, available_by: datetime) -> Cohort | None:
+        """Resolve the latest population declared for an exact date and observable by the cutoff.
+
+        Args:
+            snapshot_date: Exact trading date requested by the caller.
+            available_by: Latest permitted declaration time.
+
+        Returns:
+            The latest declaration with `declared_at <= available_by`, or None when none qualifies.
+
+        Raises:
+            ValueError: A declaration is malformed, hash-inconsistent, or belongs to another date.
+        """
+        cutoff = self._cutoff(available_by)
+        day = date.fromisoformat(snapshot_date)
+        day_dir = self._root / _DECLARED_DIR / day.isoformat()
+        if not day_dir.is_dir():
+            return None
+        qualifying: list[tuple[datetime, str, Cohort]] = []
+        for path in sorted(day_dir.glob("*.json")):
+            declared_at, cohort = self._load_declaration(path, day)
+            if declared_at <= cutoff:
+                qualifying.append((declared_at, cohort.cohort_id, cohort))
+        if not qualifying:
+            return None
+        return max(qualifying, key=lambda item: (item[0], item[1]))[2]
+
+    @staticmethod
+    def _load_declaration(path: Path, trading_date: date) -> tuple[datetime, Cohort]:
+        try:
+            raw_bytes = path.read_bytes()
+            raw = json.loads(raw_bytes)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"unreadable cohort declaration: {path.name!r}") from exc
+        if not isinstance(raw, dict) or set(raw) != {"schema_version", "declared_at", "cohort"} or raw["schema_version"] != 1:
+            raise ValueError(f"malformed cohort declaration: {path.name!r}")
+        try:
+            declared_at = datetime.fromisoformat(raw["declared_at"])
+            cohort = Cohort.model_validate(raw["cohort"])
+            rebuilt = build_cohort(
+                cohort.trading_date,
+                cohort.scanned_symbols,
+                cohort.eligible_symbols,
+                cohort.rejections,
+                eligibility_rule_version=cohort.eligibility_rule_version,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"malformed cohort declaration: {path.name!r}") from exc
+        if declared_at.utcoffset() is None or cohort.trading_date != trading_date:
+            raise ValueError(f"malformed cohort declaration: {path.name!r}")
+        if rebuilt != cohort or path.stem != cohort.cohort_id:
+            raise ValueError(f"hash-inconsistent cohort declaration: {path.name!r}")
+        canonical = _canonical_json(
+            {"schema_version": 1, "declared_at": raw["declared_at"], "cohort": cohort.model_dump(mode="json")}
+        )
+        if raw_bytes != canonical:
+            raise ValueError(f"hash-inconsistent cohort declaration: {path.name!r}")
+        return declared_at, cohort
+
+    def _prune_declarations(self, today: date, retain_days: int) -> None:
+        base = self._root / _DECLARED_DIR
+        try:
+            children = sorted(base.iterdir()) if base.is_dir() else []
+        except OSError:
+            return
+        for child in children:
+            if not _DATE_DIR_PATTERN.fullmatch(child.name) or child.is_symlink() or not child.is_dir():
+                continue
+            try:
+                day = date.fromisoformat(child.name)
+            except ValueError:
+                continue
+            if (today - day).days <= retain_days:
+                continue
+            try:
+                shutil.rmtree(child)
+            except OSError:
+                continue
 
     def publish_frame(self, frame: pd.DataFrame, *, context: CaptureContext) -> ArtifactRef:
         """Retain an immutable normalized outcome independently of decision inputs.

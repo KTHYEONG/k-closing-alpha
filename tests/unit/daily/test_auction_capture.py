@@ -3129,3 +3129,273 @@ def test_run_auction_capture_rejects_misaligned_or_undeclared_handoff(tmp_path) 
             )
         )
 
+
+
+def _declare_cohort(store: Any, snapshot_date: str, eligible: list[str], *, declared_at: dt.datetime | None = None) -> Any:
+    from src.data.capture_contracts import build_cohort
+
+    cohort = build_cohort(
+        dt.date.fromisoformat(snapshot_date), eligible, eligible, {}, eligibility_rule_version="v1"
+    )
+    store.publish_cohort_declaration(
+        cohort, declared_at=declared_at or _seoul(2026, 9, 17, 15, 20, 10), retain_days=40
+    )
+    return cohort
+
+
+def _virtual_clock(start: dt.datetime) -> tuple[dict[str, Any], Any]:
+    state: dict[str, Any] = {"now": start, "sleeps": []}
+
+    async def _sleep(seconds: float) -> None:
+        state["sleeps"].append(seconds)
+        state["now"] += dt.timedelta(seconds=seconds)
+
+    return state, _sleep
+
+
+def test_start_before_collect_end_uses_declaration(tmp_path) -> None:
+    """Only the early declaration exists: the capture proceeds on the declared population and stamps its id."""
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    cohort = _declare_cohort(store, "2026-09-17", ["000001", "000002"])
+    state, sleep = _virtual_clock(_seoul(2026, 9, 17, 15, 20, 20))
+    client = _FakeClient(calls=[])
+    stats: dict[str, float | str] = {}
+
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="close",
+            profile=_profile(tmp_path),
+            store=store,
+            clients=[client],
+            session_clock=_clock("2026-09-17"),
+            now_fn=lambda: state["now"],
+            sleep_fn=sleep,
+            stats_sink=stats,
+        )
+    )
+
+    assert stats["cohort_source"] == "declared"
+    assert manifest.context.cohort_id == cohort.cohort_id
+    assert {code for kind, code in client.calls if kind == "orderbook"} == {"000001", "000002"}
+
+
+def test_decision_manifest_preferred_and_declaration_unread(tmp_path, monkeypatch) -> None:
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-17", ["000001"])
+    _declare_cohort(store, "2026-09-17", ["000001", "000009"])
+
+    def _must_not_read(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("declaration read although a decision manifest exists")
+
+    monkeypatch.setattr(store, "read_declared_cohort", _must_not_read)
+    stats: dict[str, float | str] = {}
+    _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="close",
+            profile=_profile(tmp_path),
+            store=store,
+            clients=[_FakeClient(calls=[])],
+            session_clock=_clock("2026-09-17"),
+            now_fn=lambda: _seoul(2026, 9, 17, 15, 20, 20),
+            stats_sink=stats,
+        )
+    )
+
+    assert stats["cohort_source"] == "decision"
+
+
+def test_declaration_alone_does_not_activate_handoff(tmp_path) -> None:
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    _declare_cohort(store, "2026-09-17", ["000001"])
+
+    assert auction_capture._decision_manifest_published(store, "2026-09-17") is False
+
+
+def test_input_wait_is_bounded_by_deadline(tmp_path) -> None:
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    state, sleep = _virtual_clock(_seoul(2026, 9, 17, 15, 20, 10))
+
+    with pytest.raises(RuntimeError, match="cannot be verified"):
+        _run(
+            auction_capture.run_auction_capture(
+                "2026-09-17",
+                phase="close",
+                profile=_profile(tmp_path),
+                store=store,
+                clients=[_FakeClient(calls=[])],
+                session_clock=_clock("2026-09-17"),
+                now_fn=lambda: state["now"],
+                sleep_fn=sleep,
+            )
+        )
+
+    assert state["now"] == _seoul(2026, 9, 17, 15, 20, 45)  # start + COLLECTION_AUCTION_INPUT_WAIT_SECONDS (35 s)
+    assert all(seconds <= 0.5 for seconds in state["sleeps"])
+
+
+def test_input_wait_returns_early_and_rounds_keep_schedule(tmp_path) -> None:
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    state, base_sleep = _virtual_clock(_seoul(2026, 9, 17, 15, 20, 20))
+    polls = {"n": 0}
+
+    async def _sleep(seconds: float) -> None:
+        await base_sleep(seconds)
+        polls["n"] += 1
+        if polls["n"] == 3:
+            _declare_cohort(store, "2026-09-17", ["000001"], declared_at=state["now"])
+
+    observed: list[dt.datetime] = []
+
+    class _TimedClient(_FakeClient):
+        async def get_orderbook_snapshot(self, session: Any, code: str, market_div_code: str | None = None):
+            observed.append(state["now"])
+            return await super().get_orderbook_snapshot(session, code, market_div_code)
+
+    stats: dict[str, float | str] = {}
+    _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="close",
+            profile=_profile(tmp_path),
+            store=store,
+            clients=[_TimedClient(calls=[])],
+            session_clock=_clock("2026-09-17"),
+            now_fn=lambda: state["now"],
+            sleep_fn=_sleep,
+            stats_sink=stats,
+        )
+    )
+
+    assert stats["inputs_wait_s"] == pytest.approx(1.5)
+    assert min(observed) >= _seoul(2026, 9, 17, 15, 21, 0)
+
+
+def test_research_roster_gates_the_input_wait_when_enabled(tmp_path) -> None:
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-17", ["000001"])
+    state, sleep = _virtual_clock(_seoul(2026, 9, 17, 15, 20, 20))
+
+    asyncio.run(
+        auction_capture._await_auction_inputs(
+            store,
+            "2026-09-17",
+            research_enabled=True,
+            deadline=_seoul(2026, 9, 17, 15, 20, 30),
+            now_fn=lambda: state["now"],
+            sleeper=sleep,
+        )
+    )
+
+    assert state["now"] == _seoul(2026, 9, 17, 15, 20, 30)
+
+
+def test_round0_full_window_when_started_early(tmp_path, monkeypatch) -> None:
+    """Start at 15:20:40 with 1,125 symbols: round 0 dispatches everything inside its 60 s window.
+
+    The program lane is suppressed because its own sleep would share the single virtual clock and
+    advance it past round 0; the lane's scheduling is covered by its own tests.
+    """
+    from src.api.kis.client import KIS_REST_TPS_PER_APP_KEY
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CoverageEntry
+
+    monkeypatch.setattr(auction_capture, "program_rounds", lambda clock: [])
+    symbols = [f"{i:06d}" for i in range(1, 1126)]
+    store = _store(tmp_path)
+    _declare_cohort(store, "2026-09-17", symbols)
+    state, sleep = _virtual_clock(_seoul(2026, 9, 17, 15, 20, 40))
+    clients = [_FakeClient(calls=[]), _FakeClient(calls=[])]
+    assert auction_capture.estimate_round_capacity(
+        len(clients), 60, utilization=0.85, tps_per_key=KIS_REST_TPS_PER_APP_KEY
+    ) >= len(symbols)
+
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="close",
+            profile=_profile(tmp_path),
+            store=store,
+            clients=clients,
+            session_clock=_clock("2026-09-17"),
+            now_fn=lambda: state["now"],
+            sleep_fn=sleep,
+        )
+    )
+
+    round0 = _seoul(2026, 9, 17, 15, 21, 0)
+    round0_entries = [e for e in manifest.entries if isinstance(e, CoverageEntry) and e.scheduled_at == round0]
+    assert round0_entries
+    assert all(e.reason != "deadline" for e in round0_entries)
+    assert sum(1 for kind, _ in clients[0].calls + clients[1].calls if kind == "orderbook") >= len(symbols)
+
+
+def test_declared_and_decision_cohort_ids_identical(tmp_path) -> None:
+    """Same scan inputs yield the same content-hash identity, so the later decision manifest cannot diverge."""
+    from src.data.capture_contracts import CaptureContext, CaptureDataset, CaptureManifest, CaptureStatus, build_cohort
+
+    store = _store(tmp_path)
+    eligible = ["000001", "000002"]
+    declared = _declare_cohort(store, "2026-09-17", eligible)
+    decision = build_cohort(dt.date(2026, 9, 17), eligible, eligible, {}, eligibility_rule_version="v1")
+    store.publish_manifest(
+        CaptureManifest(
+            schema_version=1,
+            context=CaptureContext(
+                trading_date=dt.date(2026, 9, 17),
+                run_id="decision-2026-09-17-abcd1234",
+                dataset=CaptureDataset.SCAN,
+                vendor="owner-local",
+                endpoint="decision-input",
+                symbol=None,
+                venue="KRX",
+                session="regular",
+                capture_reason="decision-input",
+                cohort_id=decision.cohort_id,
+                scheduled_at=None,
+            ),
+            cohort=decision,
+            completed_at=_seoul(2026, 9, 17, 15, 21, 0),
+            entries=(),
+            artifacts=(),
+            status=CaptureStatus.COMPLETE,
+        )
+    )
+
+    assert decision.cohort_id == declared.cohort_id
+    assert store.read_cohort("2026-09-17", available_by=_seoul(2026, 9, 17, 16, 0)).cohort_id == declared.cohort_id
+
+
+def test_research_gate_opens_when_roster_is_readable(tmp_path, monkeypatch) -> None:
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-17", ["000001"])
+    state, sleep = _virtual_clock(_seoul(2026, 9, 17, 15, 20, 20))
+    monkeypatch.setattr(auction_capture, "read_research_roster", lambda *a, **k: object())
+
+    asyncio.run(
+        auction_capture._await_auction_inputs(
+            store,
+            "2026-09-17",
+            research_enabled=True,
+            deadline=_seoul(2026, 9, 17, 15, 20, 30),
+            now_fn=lambda: state["now"],
+            sleeper=sleep,
+        )
+    )
+
+    assert state["sleeps"] == []
