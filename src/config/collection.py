@@ -34,6 +34,8 @@ class CollectionSettings(EnvSettings):
         COLLECTION_RESEARCH_SLOTS: Explicit research key slots, default empty.
         COLLECTION_ALTDATA_EXTRA_SLOTS: Extra KIS data slots for alt-data fan-out, default empty.
         COLLECTION_AUCTION_INTERVAL_SECONDS: Closing sweep interval, default 60.
+        COLLECTION_AUCTION_CAPACITY_UTILIZATION: Share of the per-key request budget a closing round plans for,
+            default 0.85 (headroom against the measured ~33 of 36 req/s).
         COLLECTION_REQUEST_TIMEOUT_SECONDS: Total call timeout, default 5.0.
         COLLECTION_CONCURRENCY_PER_KEY: In-flight limit, default 8.
         COLLECTION_ARCHIVE_PUBLISH_ROWS: Buffered rows per archive publisher before a partition flush,
@@ -128,6 +130,7 @@ class CollectionSettings(EnvSettings):
     COLLECTION_RESEARCH_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
     COLLECTION_ALTDATA_EXTRA_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
     COLLECTION_AUCTION_INTERVAL_SECONDS: int = Field(default=60, gt=0)
+    COLLECTION_AUCTION_CAPACITY_UTILIZATION: float = Field(default=0.85, gt=0, le=1, allow_inf_nan=False)
     COLLECTION_REQUEST_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     COLLECTION_CONCURRENCY_PER_KEY: int = Field(default=8, gt=0)
     COLLECTION_ARCHIVE_PUBLISH_ROWS: int = Field(default=2_000_000, gt=0)

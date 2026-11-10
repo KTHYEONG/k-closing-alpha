@@ -7,6 +7,7 @@ import asyncio
 import collections
 import functools
 import logging
+import math
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from collections.abc import Set as AbstractSet
@@ -164,6 +165,80 @@ async def _wait_until_scheduled(
     await sleeper(wait_seconds)
 
 
+def estimate_round_capacity(n_clients: int, interval_seconds: int, *, utilization: float, tps_per_key: float) -> int:
+    """Requests one round of `interval_seconds` can plan for across `n_clients` rate-limited keys.
+
+    Raises:
+        ValueError: Non-positive interval, utilization outside (0, 1], or non-positive/non-finite rate.
+    """
+    if interval_seconds <= 0:
+        raise ValueError(f"interval_seconds must be positive: {interval_seconds!r}")
+    if not 0 < utilization <= 1:
+        raise ValueError(f"utilization must be in (0, 1]: {utilization!r}")
+    if not math.isfinite(tps_per_key) or tps_per_key <= 0:
+        raise ValueError(f"tps_per_key must be positive and finite: {tps_per_key!r}")
+    if n_clients <= 0:
+        return 0
+    return math.floor(n_clients * tps_per_key * interval_seconds * utilization)
+
+
+def _rotate_tier(tier: list[str], round_index: int, round_count: int) -> list[str]:
+    if not tier:
+        return []
+    offset = ((round_index * len(tier)) // round_count) % len(tier)
+    return tier[offset:] + tier[:offset]
+
+
+def plan_round_order(
+    dispatch: Sequence[str],
+    *,
+    priority: AbstractSet[str],
+    low_priority: AbstractSet[str],
+    round_index: int,
+    round_count: int,
+) -> list[str]:
+    """Deterministic request order for one orderbook round.
+
+    Tier 0 (`priority`) keeps dispatch order; tier 1 (the rest) and tier 2 (`low_priority`
+    not in `priority`, always last) rotate left by `round_index * len(tier) // round_count`,
+    so the symbols a saturated round cuts off differ from round to round.
+
+    Raises:
+        ValueError: `round_count < 1`, `round_index` outside `[0, round_count)`, or duplicate symbols.
+    """
+    if round_count < 1:
+        raise ValueError(f"round_count must be >= 1: {round_count!r}")
+    if not 0 <= round_index < round_count:
+        raise ValueError(f"round_index {round_index!r} outside [0, {round_count})")
+    if len(set(dispatch)) != len(dispatch):
+        raise ValueError("dispatch symbols must be unique")
+    head = [symbol for symbol in dispatch if symbol in priority]
+    body = [symbol for symbol in dispatch if symbol not in priority and symbol not in low_priority]
+    tail = [symbol for symbol in dispatch if symbol not in priority and symbol in low_priority]
+    return [*head, *_rotate_tier(body, round_index, round_count), *_rotate_tier(tail, round_index, round_count)]
+
+
+class _OrderbookPriorityGate:
+    """Idle except between `begin_round` and `end_round` of an orderbook round."""
+
+    def __init__(self) -> None:
+        self._idle = asyncio.Event()
+        self._idle.set()
+
+    @property
+    def is_idle(self) -> bool:
+        return self._idle.is_set()
+
+    def begin_round(self) -> None:
+        self._idle.clear()
+
+    def end_round(self) -> None:
+        self._idle.set()
+
+    async def wait_idle(self) -> None:
+        await self._idle.wait()
+
+
 async def _observe_roster(
     *,
     roster: Sequence[str],
@@ -173,6 +248,7 @@ async def _observe_roster(
     now_fn: Callable[[], datetime],
     observe: Callable[[int, str, Any], Awaitable[CoverageEntry]],
     on_deadline: Callable[[int, str], CoverageEntry],
+    gate: _OrderbookPriorityGate | None = None,
 ) -> list[CoverageEntry]:
     """Observe every roster symbol for one scheduled round with bounded concurrency.
 
@@ -187,19 +263,61 @@ async def _observe_roster(
         deadline: Dispatch cutoff for this round (next round start or phase end).
         observe: Performs one symbol's request and persistence, returning its entry.
         on_deadline: Builds the PARTIAL(reason="deadline") entry for an undispatched symbol.
+        gate: Program lane only; requests wait while an orderbook round is active and never hold a slot then.
 
     Returns:
         One entry per roster symbol, ordered by roster position.
     """
 
     async def _one(position: int, symbol: str) -> CoverageEntry:
-        async with semaphore:
+        if gate is None:
+            async with semaphore:
+                if now_fn() >= deadline:
+                    return on_deadline(position, symbol)
+                return await observe(position, symbol, clients[position % len(clients)])
+        while True:
             if now_fn() >= deadline:
                 return on_deadline(position, symbol)
-            return await observe(position, symbol, clients[position % len(clients)])
+            await gate.wait_idle()
+            async with semaphore:
+                if not gate.is_idle:
+                    continue
+                if now_fn() >= deadline:
+                    return on_deadline(position, symbol)
+                return await observe(position, symbol, clients[position % len(clients)])
 
     return list(
         await asyncio.gather(*(_one(position, symbol) for position, symbol in enumerate(roster)))
+    )
+
+
+def _log_round_line(
+    dataset: CaptureDataset,
+    *,
+    scheduled_at: datetime,
+    index: int,
+    entries: Sequence[CoverageEntry],
+    started: datetime,
+    ended: datetime,
+    capacity_per_round: int,
+) -> None:
+    n_complete = sum(1 for entry in entries if entry.status is CaptureStatus.COMPLETE)
+    n_deadline = sum(1 for entry in entries if entry.reason == "deadline")
+    n_late = sum(1 for entry in entries if entry.reason == "deadline" and entry.first_event_time is not None)
+    logger.info(
+        "[DATA] stage=auction_capture_round phase=close dataset=%s round=%s index=%d n_roster=%d n_requested=%d "
+        "n_complete=%d n_deadline=%d n_late=%d n_failed=%d duration_s=%.1f capacity_per_round=%d",
+        dataset.value,
+        scheduled_at.isoformat(),
+        index,
+        len(entries),
+        sum(1 for entry in entries if entry.first_event_time is not None),
+        n_complete,
+        n_deadline,
+        n_late,
+        len(entries) - n_complete - n_deadline,
+        max((ended - max(scheduled_at, started)).total_seconds(), 0.0),
+        capacity_per_round,
     )
 
 
@@ -337,6 +455,8 @@ async def _capture_program_rounds(
     now_fn: Callable[[], datetime],
     sleeper: Callable[[float], Awaitable[None]],
     injected_clock: bool,
+    capacity_per_round: int,
+    gate: _OrderbookPriorityGate | None = None,
 ) -> list[CoverageEntry]:
     """Capture program observations at their declared pre-close timestamps."""
     entries: list[CoverageEntry] = []
@@ -345,27 +465,37 @@ async def _capture_program_rounds(
             scheduled_at, now_fn=now_fn, sleeper=sleeper, injected_clock=injected_clock
         )
         deadline = rounds[prog_index + 1] if prog_index + 1 < len(rounds) else close_at
-        entries.extend(
-            await _observe_roster(
-                roster=roster,
-                clients=clients,
-                semaphore=semaphore,
-                deadline=deadline,
+        started = now_fn()
+        round_entries = await _observe_roster(
+            roster=roster,
+            clients=clients,
+            semaphore=semaphore,
+            deadline=deadline,
+            now_fn=now_fn,
+            observe=functools.partial(
+                _observe_program_symbol,
+                session=session,
+                scheduled_at=scheduled_at,
+                prog_index=prog_index,
+                store=store,
+                trading_day=trading_day,
+                run_id=run_id,
+                cohort_id=cohort_id,
+                reason_tag=reason_tag,
                 now_fn=now_fn,
-                observe=functools.partial(
-                    _observe_program_symbol,
-                    session=session,
-                    scheduled_at=scheduled_at,
-                    prog_index=prog_index,
-                    store=store,
-                    trading_day=trading_day,
-                    run_id=run_id,
-                    cohort_id=cohort_id,
-                    reason_tag=reason_tag,
-                    now_fn=now_fn,
-                ),
-                on_deadline=functools.partial(_program_deadline_entry, scheduled_at=scheduled_at),
-            )
+            ),
+            on_deadline=functools.partial(_program_deadline_entry, scheduled_at=scheduled_at),
+            gate=gate,
+        )
+        entries.extend(round_entries)
+        _log_round_line(
+            CaptureDataset.PROGRAM,
+            scheduled_at=scheduled_at,
+            index=prog_index,
+            entries=round_entries,
+            started=started,
+            ended=now_fn(),
+            capacity_per_round=capacity_per_round,
         )
     return entries
 
@@ -685,6 +815,40 @@ def _open_deadline_entry(
     )
 
 
+def _log_capture_plan(
+    *,
+    n_roster: int,
+    n_extras: int,
+    n_priority: int,
+    n_clients: int,
+    rounds: Sequence[datetime],
+    program_instants: Sequence[datetime],
+    interval_seconds: int,
+    capacity_per_round: int,
+    start_lag_seconds: float,
+) -> None:
+    """Log whether the closing plan fits the key budget; program demand is averaged over the rounds that can carry it."""
+    demand_orderbook = n_roster + n_extras
+    rounds_after_first_program = sum(1 for moment in rounds if program_instants and moment >= program_instants[0])
+    demand_program = math.ceil(demand_orderbook * len(program_instants) / max(rounds_after_first_program, 1))
+    overcommit = demand_orderbook + demand_program > capacity_per_round
+    (logger.warning if overcommit else logger.info)(
+        "[DATA] stage=auction_capture_plan phase=close status=%s n_roster=%d n_extras=%d n_priority=%d n_clients=%d "
+        "rounds=%d interval_s=%d capacity_per_round=%d demand_orderbook=%d demand_program_per_round=%d start_lag_s=%.1f",
+        "OVERCOMMIT" if overcommit else "OK",
+        n_roster,
+        n_extras,
+        n_priority,
+        n_clients,
+        len(rounds),
+        interval_seconds,
+        capacity_per_round,
+        demand_orderbook,
+        demand_program,
+        start_lag_seconds,
+    )
+
+
 async def run_auction_capture(
     snapshot_date: str,
     *,
@@ -753,7 +917,24 @@ async def run_auction_capture(
     )
     dispatch = [*roster, *extras]
     research_set = frozenset(extras)
+    priority: frozenset[str] = frozenset()
+    capacity_per_round = 0
     if phase == "close":
+        from src.api.kis.client import KIS_REST_TPS_PER_APP_KEY
+
+        held = load_held_roster()
+        if held.ok:
+            priority = frozenset(held.symbols) & frozenset(dispatch)
+        else:
+            logger.warning(
+                "[DATA] stage=auction_capture status=HELD_ROSTER_UNAVAILABLE reason=%s", held.failure_reason
+            )
+        capacity_per_round = estimate_round_capacity(
+            len(clients),
+            int(profile.COLLECTION_AUCTION_INTERVAL_SECONDS),
+            utilization=profile.COLLECTION_AUCTION_CAPACITY_UTILIZATION,
+            tps_per_key=KIS_REST_TPS_PER_APP_KEY,
+        )
         rounds = close_rounds(session_clock, int(profile.COLLECTION_AUCTION_INTERVAL_SECONDS))
         phase_end = session_clock.close_at
     else:
@@ -770,9 +951,22 @@ async def run_auction_capture(
             ",".join(degraded_slots), len(clients),
         )
     first_client: Any = clients[0]
+    if phase == "close":
+        _log_capture_plan(
+            n_roster=len(roster),
+            n_extras=len(extras),
+            n_priority=len(priority),
+            n_clients=len(clients),
+            rounds=rounds,
+            program_instants=program_rounds(session_clock),
+            interval_seconds=int(profile.COLLECTION_AUCTION_INTERVAL_SECONDS),
+            capacity_per_round=capacity_per_round,
+            start_lag_seconds=(now_clock() - rounds[0]).total_seconds(),
+        )
 
     async with first_client.create_session() as broker_session:
         program_task: asyncio.Task[list[CoverageEntry]] | None = None
+        gate = _OrderbookPriorityGate()
         if phase == "close":
             program_task = asyncio.create_task(
                 _capture_program_rounds(
@@ -790,6 +984,8 @@ async def run_auction_capture(
                     now_fn=now_clock,
                     sleeper=sleeper,
                     injected_clock=injected_clock,
+                    capacity_per_round=capacity_per_round,
+                    gate=gate,
                 )
             )
         for index, scheduled_at in enumerate(rounds):
@@ -823,30 +1019,55 @@ async def run_auction_capture(
                 )
                 continue
             degraded: list[str] = []
-            round_entries = await _observe_roster(
-                roster=dispatch,
-                clients=clients,
-                semaphore=sem,
-                deadline=deadline,
-                now_fn=now_clock,
-                observe=functools.partial(
-                    _observe_orderbook_symbol,
-                    session=broker_session,
-                    scheduled_at=scheduled_at,
-                    page_index=index,
+            if phase == "close":
+                ordered = plan_round_order(
+                    dispatch,
+                    priority=priority,
+                    low_priority=research_set,
+                    round_index=index,
+                    round_count=len(rounds),
+                )
+                gate.begin_round()
+            else:
+                ordered = dispatch
+            round_started = now_clock()
+            try:
+                round_entries = await _observe_roster(
+                    roster=ordered,
+                    clients=clients,
+                    semaphore=sem,
                     deadline=deadline,
-                    store=store,
-                    trading_day=trading_day,
-                    run_id=run_id,
-                    cohort_id=cohort_id,
-                    reason_tag=reason_tag,
-                    phase=phase,
                     now_fn=now_clock,
-                    degraded=degraded,
-                ),
-                on_deadline=functools.partial(_orderbook_deadline_entry, scheduled_at=scheduled_at),
-            )
+                    observe=functools.partial(
+                        _observe_orderbook_symbol,
+                        session=broker_session,
+                        scheduled_at=scheduled_at,
+                        page_index=index,
+                        deadline=deadline,
+                        store=store,
+                        trading_day=trading_day,
+                        run_id=run_id,
+                        cohort_id=cohort_id,
+                        reason_tag=reason_tag,
+                        phase=phase,
+                        now_fn=now_clock,
+                        degraded=degraded,
+                    ),
+                    on_deadline=functools.partial(_orderbook_deadline_entry, scheduled_at=scheduled_at),
+                )
+            finally:
+                gate.end_round()
             entries.extend(round_entries)
+            if phase == "close":
+                _log_round_line(
+                    CaptureDataset.ORDERBOOK,
+                    scheduled_at=scheduled_at,
+                    index=index,
+                    entries=round_entries,
+                    started=round_started,
+                    ended=now_clock(),
+                    capacity_per_round=capacity_per_round,
+                )
             if any(symbol not in research_set for symbol in degraded) or any(
                 entry.status is not CaptureStatus.COMPLETE
                 for entry in round_entries

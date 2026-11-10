@@ -7,7 +7,17 @@ import datetime as dt
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from src.execution.paper_broker import HeldRoster
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_held_roster(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Close-phase capture reads the held roster; never touch the real paper ledger."""
+    from src.daily import auction_capture
+
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), True, None))
 
 
 def _seoul(year: int, month: int, day: int, hour: int, minute: int, second: int = 0) -> dt.datetime:
@@ -1848,14 +1858,20 @@ def test_close_primary_manifest_unchanged_with_extras(tmp_path) -> None:
 
 
 def test_close_extras_dispatched_after_cohort(tmp_path) -> None:
-    """Every round requests the cohort before any extra."""
+    """Every round requests the whole cohort before any extra; rotation never changes the multiset."""
     from src.daily.auction_capture import close_rounds, program_rounds
 
     client = _FakeClient(calls=[])
     _close_run(tmp_path, client, enabled=True)
 
     rounds = len(close_rounds(_clock("2026-09-17"), 60))
-    assert [code for kind, code in client.calls if kind == "orderbook"] == ["000001", "000002", "000003"] * rounds
+    orderbook = [code for kind, code in client.calls if kind == "orderbook"]
+    assert len(orderbook) == 3 * rounds
+    for start in range(0, len(orderbook), 3):
+        round_codes = orderbook[start : start + 3]
+        assert set(round_codes[:2]) == {"000001", "000002"}
+        assert round_codes[2] == "000003"
+    assert sorted(orderbook) == sorted(["000001", "000002", "000003"] * rounds)
     assert [code for kind, code in client.calls if kind == "program"] == ["000001", "000002", "000003"] * len(
         program_rounds(_clock("2026-09-17"))
     )
@@ -1938,3 +1954,450 @@ def test_flag_off_no_research_manifest(tmp_path) -> None:
     assert {code for kind, code in client.calls if kind == "program"} == {"000001", "000002"}
     assert {e.symbol for e in manifest.entries} == {"000001", "000002"}
     assert not [m for m in store.read_manifests("2026-09-17") if m.context.capture_reason.endswith("-research")]
+
+
+# --- fair round order, orderbook-first program lane, round observability ---------------------------------
+
+
+def test_estimate_capacity_two_keys() -> None:
+    from src.daily.auction_capture import estimate_round_capacity
+
+    assert estimate_round_capacity(2, 60, utilization=0.85, tps_per_key=18.0) == 1836
+    assert estimate_round_capacity(0, 60, utilization=0.85, tps_per_key=18.0) == 0
+    for bad, pattern in (
+        ({"interval_seconds": 0}, "interval_seconds"),
+        ({"utilization": 0.0}, "utilization"),
+        ({"utilization": 1.01}, "utilization"),
+        ({"utilization": float("nan")}, "utilization"),
+        ({"tps_per_key": 0.0}, "tps_per_key"),
+        ({"tps_per_key": float("inf")}, "tps_per_key"),
+        ({"tps_per_key": float("nan")}, "tps_per_key"),
+    ):
+        kwargs: dict[str, Any] = {"interval_seconds": 60, "utilization": 0.85, "tps_per_key": 18.0, **bad}
+        with pytest.raises(ValueError, match=pattern):
+            estimate_round_capacity(2, **kwargs)
+
+
+def test_plan_order_is_permutation_and_tiered() -> None:
+    from src.daily.auction_capture import plan_round_order
+
+    symbols = [f"{i:06d}" for i in range(10)]
+    priority = {symbols[7], symbols[3]}
+    low = {symbols[5], symbols[3]}
+    for round_index in range(9):
+        order = plan_round_order(symbols, priority=priority, low_priority=low, round_index=round_index, round_count=9)
+        assert sorted(order) == symbols
+        assert order[:2] == [symbols[3], symbols[7]]
+        assert order[-1] == symbols[5]
+        assert set(order[2:-1]) == set(symbols) - priority - {symbols[5]}
+
+
+def test_plan_order_rotation_spreads_tail() -> None:
+    from src.daily.auction_capture import plan_round_order
+
+    n, rounds, capacity = 1125, 9, 700
+    symbols = [f"{i:06d}" for i in range(n)]
+    tail_rounds = dict.fromkeys(symbols, 0)
+    naive_tail_rounds = dict.fromkeys(symbols, 0)
+    for round_index in range(rounds):
+        order = plan_round_order(symbols, priority=frozenset(), low_priority=frozenset(), round_index=round_index, round_count=rounds)
+        for symbol in order[capacity:]:
+            tail_rounds[symbol] += 1
+        for symbol in symbols[capacity:]:
+            naive_tail_rounds[symbol] += 1
+
+    assert sum(tail_rounds.values()) == rounds * (n - capacity)
+    assert set(tail_rounds.values()) <= {3, 4}
+    assert max(tail_rounds.values()) - min(tail_rounds.values()) <= 1
+    assert sorted(set(naive_tail_rounds.values())) == [0, rounds]
+    assert sum(1 for count in naive_tail_rounds.values() if count == rounds) == n - capacity
+
+
+def test_plan_order_deterministic_and_validates() -> None:
+    from src.daily.auction_capture import plan_round_order
+
+    symbols = [f"{i:06d}" for i in range(20)]
+    kwargs: dict[str, Any] = {"priority": {symbols[1]}, "low_priority": {symbols[2]}, "round_index": 4, "round_count": 9}
+    assert plan_round_order(symbols, **kwargs) == plan_round_order(symbols, **kwargs)
+    assert plan_round_order([], priority=set(), low_priority=set(), round_index=0, round_count=1) == []
+    with pytest.raises(ValueError, match="round_count"):
+        plan_round_order(symbols, **{**kwargs, "round_count": 0})
+    with pytest.raises(ValueError, match="round_index"):
+        plan_round_order(symbols, **{**kwargs, "round_index": 9})
+    with pytest.raises(ValueError, match="round_index"):
+        plan_round_order(symbols, **{**kwargs, "round_index": -1})
+    with pytest.raises(ValueError, match="unique"):
+        plan_round_order([*symbols, symbols[0]], **kwargs)
+
+
+def _gate_entry(dataset: Any, symbol: str, scheduled_at: dt.datetime, status: Any, *, reason: str = "auction-close") -> Any:
+    from src.data.capture_contracts import CaptureStatus, CoverageEntry
+
+    requested = reason != "deadline" or status is CaptureStatus.COMPLETE
+    return CoverageEntry(
+        symbol=symbol,
+        dataset=dataset,
+        venue="KRX",
+        session="regular",
+        scheduled_at=scheduled_at,
+        status=status,
+        rows=1 if status is CaptureStatus.COMPLETE else 0,
+        first_event_time=scheduled_at if requested else None,
+        last_event_time=scheduled_at if requested else None,
+        reason=reason,
+        raw_refs=(),
+    )
+
+
+class _VirtualLane:
+    """Serial virtual-time harness: each request advances the clock one second."""
+
+    def __init__(self, start: dt.datetime) -> None:
+        from src.data.capture_contracts import CaptureDataset
+
+        self.dataset = CaptureDataset
+        self.state = {"now": start}
+        self.starts: list[tuple[str, dt.datetime]] = []
+        self.hold = asyncio.Event()
+
+    def now(self) -> dt.datetime:
+        return self.state["now"]
+
+    def observe(self, kind: str, dataset: Any, scheduled_at: dt.datetime, *, hold_first: bool = False) -> Any:
+        from src.data.capture_contracts import CaptureStatus
+
+        async def _observe(position: int, symbol: str, client: Any) -> Any:
+            self.starts.append((kind, self.state["now"]))
+            if hold_first and position == 0:
+                await self.hold.wait()
+            began = self.state["now"]
+            await asyncio.sleep(0)
+            self.state["now"] = max(self.state["now"], began) + dt.timedelta(seconds=1)
+            return _gate_entry(dataset, symbol, scheduled_at, CaptureStatus.COMPLETE)
+
+        return _observe
+
+    def on_deadline(self, dataset: Any, scheduled_at: dt.datetime) -> Any:
+        from src.data.capture_contracts import CaptureStatus
+
+        return lambda position, symbol: _gate_entry(dataset, symbol, scheduled_at, CaptureStatus.PARTIAL, reason="deadline")
+
+
+def test_program_lane_yields_to_orderbook() -> None:
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    t0 = _seoul(2026, 11, 10, 15, 22)
+    lane = _VirtualLane(t0)
+    roster = [f"{i:06d}" for i in range(12)]
+    semaphore = asyncio.Semaphore(1)
+
+    async def scenario() -> tuple[list[Any], list[Any], dt.datetime, dt.datetime]:
+        gate = auction_capture._OrderbookPriorityGate()
+        program = asyncio.create_task(
+            auction_capture._observe_roster(
+                roster=roster,
+                clients=[object()],
+                semaphore=semaphore,
+                deadline=t0 + dt.timedelta(minutes=4),
+                now_fn=lane.now,
+                observe=lane.observe("program", CaptureDataset.PROGRAM, t0, hold_first=True),
+                on_deadline=lane.on_deadline(CaptureDataset.PROGRAM, t0),
+                gate=gate,
+            )
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert [kind for kind, _ in lane.starts] == ["program"]  # one request in flight, the rest parked
+        gate.begin_round()
+        orderbook_started = lane.now()
+        orderbook = asyncio.create_task(
+            auction_capture._observe_roster(
+                roster=roster,
+                clients=[object()],
+                semaphore=semaphore,
+                deadline=t0 + dt.timedelta(seconds=20),
+                now_fn=lane.now,
+                observe=lane.observe("orderbook", CaptureDataset.ORDERBOOK, t0),
+                on_deadline=lane.on_deadline(CaptureDataset.ORDERBOOK, t0),
+            )
+        )
+        await asyncio.sleep(0)
+        lane.hold.set()
+        try:
+            orderbook_entries = await orderbook
+        finally:
+            gate.end_round()
+        orderbook_ended = lane.now()
+        assert orderbook_started == t0
+        return orderbook_entries, await program, orderbook_started, orderbook_ended
+
+    orderbook_entries, program_entries, _, orderbook_ended = _run(scenario())
+
+    assert [e.status for e in orderbook_entries] == [CaptureStatus.COMPLETE] * len(roster)
+    program_starts = [moment for kind, moment in lane.starts if kind == "program"]
+    assert len(program_starts) == len(roster)
+    assert program_starts[0] == t0
+    assert all(moment >= orderbook_ended for moment in program_starts[1:])
+    assert [e.status for e in program_entries] == [CaptureStatus.COMPLETE] * len(roster)
+
+
+def test_program_lane_starves_only_when_orderbook_saturates() -> None:
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    t0 = _seoul(2026, 11, 10, 15, 22)
+    lane = _VirtualLane(t0)
+    roster = [f"{i:06d}" for i in range(5)]
+
+    async def scenario() -> tuple[list[Any], list[Any]]:
+        gate = auction_capture._OrderbookPriorityGate()
+        gate.begin_round()
+        program = asyncio.create_task(
+            auction_capture._observe_roster(
+                roster=roster,
+                clients=[object()],
+                semaphore=asyncio.Semaphore(2),
+                deadline=t0 + dt.timedelta(seconds=10),
+                now_fn=lane.now,
+                observe=lane.observe("program", CaptureDataset.PROGRAM, t0),
+                on_deadline=lane.on_deadline(CaptureDataset.PROGRAM, t0),
+                gate=gate,
+            )
+        )
+        try:
+            orderbook_entries = await auction_capture._observe_roster(
+                roster=roster,
+                clients=[object()],
+                semaphore=asyncio.Semaphore(2),
+                deadline=t0 + dt.timedelta(minutes=1),
+                now_fn=lane.now,
+                observe=lane.observe("orderbook", CaptureDataset.ORDERBOOK, t0),
+                on_deadline=lane.on_deadline(CaptureDataset.ORDERBOOK, t0),
+            )
+            lane.state["now"] = t0 + dt.timedelta(seconds=20)
+        finally:
+            gate.end_round()
+        return orderbook_entries, await program
+
+    orderbook_entries, program_entries = _run(scenario())
+
+    assert all(e.status is CaptureStatus.COMPLETE for e in orderbook_entries)
+    assert [kind for kind, _ in lane.starts] == ["orderbook"] * len(roster)
+    assert all(e.status is CaptureStatus.PARTIAL and e.reason == "deadline" and e.first_event_time is None for e in program_entries)
+    assert [e.symbol for e in program_entries] == roster
+
+
+def test_gate_none_behavior_unchanged() -> None:
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureDataset
+
+    t0 = _seoul(2026, 11, 10, 15, 22)
+    roster = [f"{i:06d}" for i in range(6)]
+
+    def _entries(**extra: Any) -> tuple[list[Any], list[tuple[str, dt.datetime]]]:
+        lane = _VirtualLane(t0)
+        entries = _run(
+            auction_capture._observe_roster(
+                roster=roster,
+                clients=[object()],
+                semaphore=asyncio.Semaphore(1),
+                deadline=t0 + dt.timedelta(seconds=3),
+                now_fn=lane.now,
+                observe=lane.observe("orderbook", CaptureDataset.ORDERBOOK, t0),
+                on_deadline=lane.on_deadline(CaptureDataset.ORDERBOOK, t0),
+                **extra,
+            )
+        )
+        return entries, lane.starts
+
+    default_entries, default_starts = _entries()
+    explicit_entries, explicit_starts = _entries(gate=None)
+
+    assert default_entries == explicit_entries
+    assert default_starts == explicit_starts
+    assert [e.symbol for e in default_entries] == roster
+    assert [e.reason for e in default_entries] == ["auction-close"] * 3 + ["deadline"] * 3
+
+
+def test_gate_released_on_exception(tmp_path, monkeypatch) -> None:
+    from src.daily import auction_capture
+
+    gates: list[Any] = []
+
+    class _RecordingGate(auction_capture._OrderbookPriorityGate):
+        def __init__(self) -> None:
+            super().__init__()
+            gates.append(self)
+
+    real = auction_capture._observe_roster
+
+    async def _boom_for_orderbook(**kwargs: Any) -> Any:
+        if kwargs.get("gate") is None:
+            assert not gates[0].is_idle
+            raise RuntimeError("round blew up")
+        return await real(**kwargs)
+
+    monkeypatch.setattr(auction_capture, "_OrderbookPriorityGate", _RecordingGate)
+    monkeypatch.setattr(auction_capture, "_observe_roster", _boom_for_orderbook)
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-17", ["000001"])
+
+    with pytest.raises(RuntimeError, match="round blew up"):
+        _run(
+            auction_capture.run_auction_capture(
+                "2026-09-17",
+                phase="close",
+                profile=_profile(tmp_path),
+                store=store,
+                clients=[_FakeClient()],
+                session_clock=_clock("2026-09-17"),
+                now_fn=lambda: _seoul(2026, 9, 17, 15, 20),
+            )
+        )
+
+    assert len(gates) == 1
+    assert gates[0].is_idle
+
+
+def _stubbed_close_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    symbols: list[str],
+    *,
+    n_clients: int = 2,
+    status_for: Any = None,
+) -> tuple[Any, list[list[str]]]:
+    """Close run whose request layer is replaced by a stub; returns the manifest and each orderbook round's roster."""
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    rosters: list[list[str]] = []
+
+    async def _stub(*, roster: Any, on_deadline: Any, gate: Any = None, **_: Any) -> list[Any]:
+        if gate is None:
+            rosters.append(list(roster))
+        entries = []
+        for position, symbol in enumerate(roster):
+            base = on_deadline(position, symbol)
+            if status_for is None:
+                entries.append(base.model_copy(update={"status": CaptureStatus.COMPLETE, "rows": 1, "reason": "auction-close", "first_event_time": base.scheduled_at, "last_event_time": base.scheduled_at}))
+            else:
+                entries.append(status_for(position, base))
+        return entries
+
+    monkeypatch.setattr(auction_capture, "_observe_roster", _stub)
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-17", symbols)
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="close",
+            profile=_profile(tmp_path),
+            store=store,
+            clients=[_FakeClient() for _ in range(n_clients)],
+            session_clock=_clock("2026-09-17"),
+            now_fn=lambda: _seoul(2026, 9, 17, 15, 20),
+        )
+    )
+    return manifest, rosters
+
+
+def _plan_records(caplog: pytest.LogCaptureFixture) -> list[Any]:
+    return [r for r in caplog.records if "stage=auction_capture_plan" in r.getMessage()]
+
+
+def test_overcommit_logged_at_start(tmp_path, monkeypatch, caplog) -> None:
+    import logging
+
+    cases = [(449, logging.INFO, "OK", 449, 113), (1125, logging.INFO, "OK", 1125, 282), (1600, logging.WARNING, "OVERCOMMIT", 1600, 400)]
+    for n, level, status, demand_orderbook, demand_program in cases:
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="src.daily.auction_capture"):
+            _stubbed_close_run(tmp_path / f"n{n}", monkeypatch, [f"{i:06d}" for i in range(n)])
+        (record,) = _plan_records(caplog)
+        message = record.getMessage()
+        assert record.levelno == level
+        assert f"status={status} " in message
+        assert "capacity_per_round=1836" in message
+        assert f"demand_orderbook={demand_orderbook} " in message
+        assert f"demand_program_per_round={demand_program} " in message
+        assert "start_lag_s=-60.0" in message  # 15:20 now, first round 15:21
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING and "OVERCOMMIT" in r.getMessage()] == (
+            [record] if status == "OVERCOMMIT" else []
+        )
+
+
+def test_round_line_counts_match_entries(tmp_path, monkeypatch, caplog) -> None:
+    import logging
+
+    from src.data.capture_contracts import CaptureStatus
+
+    def _status_for(position: int, base: Any) -> Any:
+        if position < 3:
+            return base.model_copy(update={"status": CaptureStatus.PARTIAL, "reason": "deadline"})
+        if position < 5:
+            return base.model_copy(update={"status": CaptureStatus.FAILED, "reason": "TimeoutError", "first_event_time": base.scheduled_at, "last_event_time": base.scheduled_at})
+        return base.model_copy(update={"status": CaptureStatus.COMPLETE, "rows": 1, "reason": "auction-close", "first_event_time": base.scheduled_at, "last_event_time": base.scheduled_at})
+
+    with caplog.at_level(logging.INFO, logger="src.daily.auction_capture"):
+        _stubbed_close_run(tmp_path, monkeypatch, [f"{i:06d}" for i in range(10)], status_for=_status_for)
+
+    lines = [r.getMessage() for r in caplog.records if "stage=auction_capture_round" in r.getMessage()]
+    orderbook = [line for line in lines if "dataset=ORDERBOOK" in line]
+    program = [line for line in lines if "dataset=PROGRAM" in line]
+    assert len(orderbook) == 9
+    assert len(program) == 2
+    for line in [*orderbook, *program]:
+        fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
+        assert fields["n_roster"] == "10"
+        assert (fields["n_requested"], fields["n_complete"], fields["n_deadline"], fields["n_late"], fields["n_failed"]) == ("7", "5", "3", "0", "2")
+        assert int(fields["n_complete"]) + int(fields["n_deadline"]) + int(fields["n_failed"]) == int(fields["n_roster"])
+        assert fields["capacity_per_round"] == "1836"
+        assert "n_deferred" not in fields
+    assert [dict(p.split("=", 1) for p in line.split() if "=" in p)["index"] for line in orderbook] == [str(i) for i in range(9)]
+
+
+def test_held_roster_failure_is_non_fatal(tmp_path, monkeypatch, caplog) -> None:
+    import logging
+
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster(("000003",), False, "OSError"))
+    symbols = [f"{i:06d}" for i in range(1, 6)]
+    with caplog.at_level(logging.INFO, logger="src.daily.auction_capture"):
+        manifest, rosters = _stubbed_close_run(tmp_path, monkeypatch, symbols)
+
+    assert manifest.status == CaptureStatus.COMPLETE
+    warnings = [r for r in caplog.records if "HELD_ROSTER_UNAVAILABLE" in r.getMessage()]
+    assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+    assert "reason=OSError" in warnings[0].getMessage()
+    (plan,) = _plan_records(caplog)
+    assert "n_priority=0 " in plan.getMessage()
+    assert len(rosters) == 9
+
+
+def test_held_roster_leads_every_round(tmp_path, monkeypatch) -> None:
+    from src.daily import auction_capture
+
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster(("000004", "999999"), True, None))
+    symbols = [f"{i:06d}" for i in range(1, 8)]
+    _, rosters = _stubbed_close_run(tmp_path, monkeypatch, symbols)
+
+    assert len(rosters) == 9
+    assert all(order[0] == "000004" and sorted(order) == symbols for order in rosters)
+    assert len({tuple(order) for order in rosters}) > 1
+
+
+def test_audit_expectation_unchanged(tmp_path, monkeypatch) -> None:
+    from src.tools.daily_audit import _audit_auction_sweeps
+
+    symbols = [f"{i:06d}" for i in range(449)]
+    manifest, rosters = _stubbed_close_run(tmp_path, monkeypatch, symbols)
+    clock = _clock("2026-09-17")
+
+    issues = _audit_auction_sweeps((manifest,), tuple(symbols), _profile(tmp_path), clock, clock.close_at)
+
+    assert not [issue for issue in issues if "missing_entries" in issue]
+    assert len(manifest.entries) == 449 * (len(rosters) + 2)
