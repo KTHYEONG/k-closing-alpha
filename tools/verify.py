@@ -344,6 +344,11 @@ def main() -> None:
     parser.add_argument("--no-xdist", action="store_true", help="Force serial pytest execution")
     parser.add_argument("--timeout", type=int, default=None, help="Pytest timeout in seconds")
     parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Run the whole test suite like CI instead of only tests mapped to changed files (run before push)",
+    )
+    parser.add_argument(
         "--run-slow",
         action="store_true",
         help="Run tests marked slow (real-data suite) instead of excluding them",
@@ -425,6 +430,9 @@ def main() -> None:
 
     # 4. Direct Test Discovery
     test_files, unmapped = _find_test_files(py_files)
+    if args.full:
+        # CI (deploy.yml) runs the whole suite; mapped tests alone missed pinned-contract tests (2026-11-10).
+        test_files, unmapped = ["tests"], []
     if not test_files:
         if unmapped:
             diags = [
@@ -465,7 +473,7 @@ def main() -> None:
         "-q",
         "--tb=line",
     ]
-    pytest_timeout = args.timeout or max(60, min(240, 20 * len(test_files)))
+    pytest_timeout = args.timeout or (900 if args.full else max(60, min(240, 20 * len(test_files))))
     pt_res = run_cmd(pytest_cmd, timeout=pytest_timeout)
 
     if pt_res.returncode == 124:
