@@ -769,3 +769,77 @@ def test_kis_msg_cd_extracts_only_the_code() -> None:
 
     assert kis_msg_cd(RuntimeError("x EGW00133 secret y")) == "EGW00133"
     assert kis_msg_cd(ValueError("none")) == ""
+
+
+def _handoff_env() -> dict[str, str]:
+    env = {"KIS_DATA_SLOTS": "1,2,3,4,5", "KIS_DECISION_SHARD_SLOTS": "1,5"}
+    for n in range(1, 6):
+        env[f"KIS_DATA_{n}_APP_KEY"] = f"KEYVALUE-{n}"
+        env[f"KIS_DATA_{n}_APP_SECRET"] = f"SECRET-{n}"
+    return env
+
+
+def test_handoff_accepts_non_leader_shard() -> None:
+    from src.api.kis.key_pool import resolve_handoff_credentials
+
+    (cred,) = resolve_handoff_credentials(_handoff_env(), slots=("5",), research_slots=("3", "4"))
+
+    assert cred.slot == "DATA_5"
+    assert cred.app_key == "KEYVALUE-5"
+
+
+def test_handoff_empty_slots_returns_nothing() -> None:
+    from src.api.kis.key_pool import resolve_handoff_credentials
+
+    assert resolve_handoff_credentials({}, slots=(), research_slots=()) == ()
+
+
+def test_handoff_rejects_leader() -> None:
+    from src.api.kis.key_pool import resolve_handoff_credentials
+
+    with pytest.raises(ValueError, match="DATA_1"):
+        resolve_handoff_credentials(_handoff_env(), slots=("1",), research_slots=("3", "4"))
+
+
+def test_handoff_rejects_non_shard_and_research_overlap() -> None:
+    from src.api.kis.key_pool import resolve_handoff_credentials
+
+    env = _handoff_env()
+    with pytest.raises(ValueError, match="DATA_2"):
+        resolve_handoff_credentials(env, slots=("2",), research_slots=("3", "4"))
+    with pytest.raises(ValueError, match="DATA_3"):
+        resolve_handoff_credentials(env, slots=("3",), research_slots=("3", "4"))
+
+
+def test_handoff_rejects_undeclared_pool_and_duplicates() -> None:
+    from src.api.kis.key_pool import resolve_handoff_credentials
+
+    with pytest.raises(ValueError, match="KIS_DATA_SLOTS"):
+        resolve_handoff_credentials({}, slots=("5",), research_slots=())
+    with pytest.raises(ValueError, match="duplicate"):
+        resolve_handoff_credentials(_handoff_env(), slots=("5", "5"), research_slots=())
+
+
+def test_handoff_error_messages_hide_keys() -> None:
+    from src.api.kis.key_pool import resolve_handoff_credentials
+
+    env = _handoff_env()
+    env["KIS_DATA_2_APP_SECRET"] = ""
+    for slots, label in ((("1",), "DATA_1"), (("2",), "DATA_2"), (("9",), "DATA_9")):
+        with pytest.raises(ValueError, match=label) as caught:
+            resolve_handoff_credentials(env, slots=slots, research_slots=("3", "4"))
+        assert "SECRET-" not in str(caught.value) and "KEYVALUE-" not in str(caught.value)
+    with pytest.raises(ValueError, match="DATA_2 is not a decision shard") as caught:
+        resolve_handoff_credentials(env, slots=("2",), research_slots=("3", "4"))
+    env["KIS_DATA_5_APP_SECRET"] = ""
+    with pytest.raises(ValueError, match="DATA_5") as caught:
+        resolve_handoff_credentials(env, slots=("5",), research_slots=("3", "4"))
+    assert "SECRET-" not in str(caught.value) and "KEYVALUE-" not in str(caught.value)
+
+
+def test_research_guard_unchanged_for_decision_shard() -> None:
+    from src.api.kis.key_pool import resolve_research_credentials
+
+    with pytest.raises(ValueError, match="overlaps KIS_DECISION_SHARD_SLOTS"):
+        resolve_research_credentials(_handoff_env(), slots=("5",))
+

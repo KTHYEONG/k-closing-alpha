@@ -373,3 +373,37 @@ def test_postclose_snapshot_defaults_off() -> None:
 def test_postclose_snapshot_bounds_validated(overrides: dict[str, object], match: str) -> None:
     with pytest.raises(ValueError, match=match):
         CollectionSettings(_env_file=None, **overrides)
+
+
+def test_handoff_slots_parse_and_validate() -> None:
+    """Handoff slots accept the shared spellings; empty means off; malformed lists are rejected."""
+    from src.config.collection import CollectionSettings
+
+    base = {"COLLECTION_AUCTION_ENABLED": True, "COLLECTION_RESEARCH_SLOTS": ("3", "4"), "_env_file": None}
+    for raw, expected in (("5", ("5",)), ("[5]", ("5",)), ("", ())):
+        parsed = CollectionSettings(COLLECTION_AUCTION_HANDOFF_SLOTS=raw, **base).COLLECTION_AUCTION_HANDOFF_SLOTS
+        assert parsed == expected
+    with pytest.raises(ValueError, match="decimal"):
+        CollectionSettings(COLLECTION_AUCTION_HANDOFF_SLOTS="a", **base)
+    with pytest.raises(ValueError, match="unique"):
+        CollectionSettings(COLLECTION_AUCTION_HANDOFF_SLOTS="5,5", **base)
+
+
+def test_handoff_disjoint_from_research() -> None:
+    from src.config.collection import CollectionSettings
+
+    with pytest.raises(ValueError, match="disjoint"):
+        CollectionSettings(
+            COLLECTION_AUCTION_ENABLED=True,
+            COLLECTION_RESEARCH_SLOTS=("3", "4"),
+            COLLECTION_AUCTION_HANDOFF_SLOTS=("4",),
+            _env_file=None,
+        )
+
+
+def test_handoff_requires_auction_enabled() -> None:
+    from src.config.collection import CollectionSettings
+
+    with pytest.raises(ValueError, match="enabled auction"):
+        CollectionSettings(COLLECTION_AUCTION_HANDOFF_SLOTS=("5",), _env_file=None)
+

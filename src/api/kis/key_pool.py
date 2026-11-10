@@ -333,6 +333,47 @@ def resolve_research_credentials(env: Mapping[str, str], *, slots: tuple[str, ..
     return _parse_slot_credentials(env, slots, duplicate_label="slot", reject_trade_key_collision=True)
 
 
+def resolve_handoff_credentials(
+    env: Mapping[str, str], *, slots: tuple[str, ...], research_slots: tuple[str, ...]
+) -> tuple[KisCredential, ...]:
+    """Resolve non-leading decision-shard keys that auction research may borrow after collect.
+
+    Args:
+        env: Credential source already supplied to this project.
+        slots: Configured handoff slot identifiers; empty disables the handoff.
+        research_slots: Research slots, which a handoff slot must not share.
+
+    Returns:
+        Declared unique credentials in configured order; empty when ``slots`` is empty.
+
+    Raises:
+        ValueError: Undeclared pool, duplicates, a slot outside the pool, the decision leader,
+            a non-shard slot, a research overlap, or credential collisions. Messages name slot labels only.
+    """
+    if not slots:
+        return ()
+    pool = _parse_slot_list(env.get("KIS_DATA_SLOTS"))
+    if pool is None:
+        raise ValueError("KIS_DATA_SLOTS pool is not declared")
+    if len(set(slots)) != len(slots):
+        raise ValueError("duplicate handoff slot")
+    pool_set = set(pool)
+    shards = _parse_slot_list(env.get("KIS_DECISION_SHARD_SLOTS")) or []
+    research = set(research_slots)
+    for token in slots:
+        if not _SLOT_RE.match(token):
+            raise ValueError(f"invalid handoff slot token: {token}")
+        if token not in pool_set:
+            raise ValueError(f"handoff slot DATA_{token} is not in KIS_DATA_SLOTS pool")
+        if token not in shards:
+            raise ValueError(f"handoff slot DATA_{token} is not a decision shard")
+        if token == shards[0]:
+            raise ValueError(f"handoff slot DATA_{token} is the decision leader")
+        if token in research:
+            raise ValueError(f"handoff slot DATA_{token} overlaps research slots")
+    return _parse_slot_credentials(env, slots, duplicate_label="slot", reject_trade_key_collision=True)
+
+
 async def prewarm_healthy_clients(
     clients: Sequence[Any], credentials: Sequence[KisCredential], broker_session: Any
 ) -> tuple[list[Any], tuple[str, ...]]:

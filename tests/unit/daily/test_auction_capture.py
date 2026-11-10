@@ -60,7 +60,7 @@ def _store(tmp_path: Path):
     return CaptureStore(tmp_path / "capture")
 
 
-def _publish_cohort(store: Any, snapshot_date: str, eligible: list[str]) -> Any:
+def _publish_cohort(store: Any, snapshot_date: str, eligible: list[str], *, run_id: str = "decision-1") -> Any:
     from src.data.capture_contracts import (
         SEOUL,
         CaptureContext,
@@ -83,7 +83,7 @@ def _publish_cohort(store: Any, snapshot_date: str, eligible: list[str]) -> Any:
         schema_version=1,
         context=CaptureContext(
             trading_date=day,
-            run_id="decision-1",
+            run_id=run_id,
             dataset=CaptureDataset.SCAN,
             vendor="owner-local",
             endpoint="decision-input",
@@ -2607,3 +2607,525 @@ def test_audit_expectation_unchanged(tmp_path, monkeypatch) -> None:
 
     assert not [issue for issue in issues if "missing_entries" in issue]
     assert len(manifest.entries) == 449 * (len(rosters) + 2)
+
+
+def _handoff_profile(tmp_path: Path, **overrides: Any):
+    return _profile(tmp_path, COLLECTION_RESEARCH_SLOTS=("3", "4"), COLLECTION_AUCTION_HANDOFF_SLOTS=("5",), **overrides)
+
+
+class _KeyedClient(_FakeClient):
+    """Fake key that logs token issuance and orderbook requests with the virtual clock reading."""
+
+    def __init__(
+        self,
+        key: str,
+        state: dict[str, Any],
+        log: list[tuple[Any, ...]],
+        *,
+        token_error: Exception | None = None,
+        cached: bool = True,
+    ) -> None:
+        super().__init__(calls=[])
+        self.key = key
+        self._state = state
+        self._log = log
+        self._token_error = token_error
+        self._cached = cached
+
+    def adopt_cached_token(self) -> str | None:
+        self._log.append(("token", self.key, self._state["now"]))
+        if self._token_error is not None:
+            raise self._token_error
+        return "cached-token" if self._cached else None
+
+    async def get_orderbook_snapshot(self, session: Any, code: str, market_div_code: str | None = None) -> dict[str, Any]:
+        self._log.append(("orderbook", self.key, self._state["now"]))
+        return await super().get_orderbook_snapshot(session, code, market_div_code)
+
+
+def _publishing_sleeper(state: dict[str, Any], publish_at: dt.datetime | None, publish: Any):
+    async def _sleep(seconds: float) -> None:
+        state["now"] += dt.timedelta(seconds=seconds)
+        if publish_at is not None and not state.get("published") and state["now"] >= publish_at:
+            publish()
+            state["published"] = True
+
+    return _sleep
+
+
+_HANDOFF_SYMBOLS = [f"{i:06d}" for i in range(6)]
+
+
+def test_pool_pick_uses_active_set_only() -> None:
+    from src.daily.auction_capture import _ClientPool
+
+    pool = _ClientPool(["b1", "b2"], ["h1"], ["DATA_5"], per_key=8)
+    assert [pool.pick(i)[0] for i in range(4)] == ["b1", "b2", "b1", "b2"]
+
+    pool.activate_handoff(0)
+    pool.activate_handoff(0)
+    assert pool.active_count() == 3
+    assert [pool.pick(i)[0] for i in range(4)] == ["b1", "b2", "h1", "b1"]
+    assert pool.pick(0)[1] is not pool.pick(1)[1]
+    assert pool.pick(0)[1] is not pool.pick(2)[1]
+
+
+def test_per_key_concurrency_bound_holds() -> None:
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    state = {"now": _seoul(2026, 9, 17, 15, 21, 0)}
+    inflight: dict[str, int] = {"a": 0, "b": 0, "c": 0}
+    peak: dict[str, int] = {"a": 0, "b": 0, "c": 0}
+
+    class _Slow:
+        def __init__(self, key: str, delay: float) -> None:
+            self.key = key
+            self.delay = delay
+
+        async def get_orderbook_snapshot(self, session: Any, code: str, market_div_code: str | None = None) -> dict[str, Any]:
+            inflight[self.key] += 1
+            peak[self.key] = max(peak[self.key], inflight[self.key])
+            await asyncio.sleep(self.delay)
+            inflight[self.key] -= 1
+            return {"rt_cd": "0"}
+
+    pool = auction_capture._ClientPool(
+        [_Slow("a", 0.02), _Slow("b", 0.001)], [_Slow("c", 0.001)], ["DATA_5"], per_key=8
+    )
+    pool.activate_handoff(0)
+    roster = [f"{i:06d}" for i in range(100)]
+    t0 = state["now"]
+
+    async def _observe(position: int, symbol: str, client: Any) -> Any:
+        await client.get_orderbook_snapshot(None, symbol)
+        return _surge_entry(symbol, CaptureStatus.COMPLETE, t0)
+
+    entries = _run(
+        auction_capture._observe_roster(
+            roster=roster,
+            pool=pool,
+            deadline=t0 + dt.timedelta(hours=1),
+            now_fn=lambda: state["now"],
+            observe=_observe,
+            on_deadline=lambda position, symbol: _surge_entry(symbol, CaptureStatus.PARTIAL, t0),
+        )
+    )
+
+    assert [e.symbol for e in entries] == roster
+    assert all(e.status == CaptureStatus.COMPLETE for e in entries)
+    assert peak == {"a": 8, "b": 8, "c": 8}
+
+
+def test_handoff_not_activated_before_decision_manifest(tmp_path, caplog, monkeypatch) -> None:
+    import logging
+
+    from src.daily import auction_capture
+
+    # Shared fake clock: a program sleep would advance time under the orderbook round; program lane is covered by its own sweep tests.
+    monkeypatch.setattr(auction_capture, "program_rounds", lambda clock: [])
+    caplog.set_level(logging.INFO, logger=auction_capture.logger.name)
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-17", _HANDOFF_SYMBOLS, run_id="scan-1")
+    state = {"now": _seoul(2026, 9, 17, 15, 20)}
+    log: list[tuple[Any, ...]] = []
+    base = [_KeyedClient("base0", state, log), _KeyedClient("base1", state, log)]
+    handoff = [_KeyedClient("DATA_5", state, log)]
+
+    _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="close",
+            profile=_handoff_profile(tmp_path),
+            store=store,
+            clients=base,
+            session_clock=_clock("2026-09-17"),
+            now_fn=lambda: state["now"],
+            sleep_fn=_publishing_sleeper(state, None, None),
+            handoff_clients=handoff,
+            handoff_labels=("DATA_5",),
+        )
+    )
+
+    assert not [event for event in log if event[0] == "token"]
+    assert not [event for event in log if event[1] == "DATA_5"]
+    assert "HANDOFF_ACTIVE" not in caplog.text
+
+
+def test_handoff_activates_after_decision_manifest(tmp_path, caplog, monkeypatch) -> None:
+    import logging
+
+    from src.daily import auction_capture
+
+    # Shared fake clock: a program sleep would advance time under the orderbook round; program lane is covered by its own sweep tests.
+    monkeypatch.setattr(auction_capture, "program_rounds", lambda clock: [])
+    caplog.set_level(logging.INFO, logger=auction_capture.logger.name)
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-17", _HANDOFF_SYMBOLS, run_id="scan-1")
+    clock = _clock("2026-09-17")
+    publish_at = auction_capture.close_rounds(clock, 60)[2]
+    state = {"now": _seoul(2026, 9, 17, 15, 20)}
+    log: list[tuple[Any, ...]] = []
+    base = [_KeyedClient("base0", state, log), _KeyedClient("base1", state, log)]
+    handoff = [_KeyedClient("DATA_5", state, log)]
+
+    _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="close",
+            profile=_handoff_profile(tmp_path),
+            store=store,
+            clients=base,
+            session_clock=clock,
+            now_fn=lambda: state["now"],
+            sleep_fn=_publishing_sleeper(
+                state, publish_at, lambda: _publish_cohort(store, "2026-09-17", _HANDOFF_SYMBOLS, run_id="decision-1")
+            ),
+            handoff_clients=handoff,
+            handoff_labels=("DATA_5",),
+        )
+    )
+
+    tokens = [event for event in log if event[0] == "token"]
+    handoff_requests = [event for event in log if event[0] == "orderbook" and event[1] == "DATA_5"]
+    early_base = [event for event in log if event[0] == "orderbook" and event[2] < publish_at]
+    assert [event[2] for event in tokens] == [publish_at]
+    assert handoff_requests and all(event[2] >= publish_at for event in handoff_requests)
+    assert early_base and all(event[1].startswith("base") for event in early_base)
+    activations = [r.getMessage() for r in caplog.records if "HANDOFF_ACTIVE" in r.getMessage()]
+    assert len(activations) == 1
+    assert "active_keys=3" in activations[0]
+    assert "slots=DATA_5" in activations[0]
+
+
+def test_handoff_token_failure_is_non_fatal(tmp_path, caplog, monkeypatch) -> None:
+    import logging
+
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureStatus
+    # Shared fake clock: a program sleep would advance time under the orderbook round; program lane is covered by its own sweep tests.
+    monkeypatch.setattr(auction_capture, "program_rounds", lambda clock: [])
+
+    caplog.set_level(logging.INFO, logger=auction_capture.logger.name)
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-17", _HANDOFF_SYMBOLS)
+    state = {"now": _seoul(2026, 9, 17, 15, 20)}
+    log: list[tuple[Any, ...]] = []
+    base = [_KeyedClient("base0", state, log), _KeyedClient("base1", state, log)]
+    handoff = [_KeyedClient("DATA_5", state, log, token_error=RuntimeError("upstream secret detail"))]
+
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="close",
+            profile=_handoff_profile(tmp_path),
+            store=store,
+            clients=base,
+            session_clock=_clock("2026-09-17"),
+            now_fn=lambda: state["now"],
+            sleep_fn=_publishing_sleeper(state, None, None),
+            handoff_clients=handoff,
+            handoff_labels=("DATA_5",),
+        )
+    )
+
+    warnings = [r.getMessage() for r in caplog.records if "HANDOFF_FAILED" in r.getMessage()]
+    assert warnings == ["[DATA] stage=auction_capture status=HANDOFF_FAILED slot=DATA_5 reason=RuntimeError"]
+    assert "secret detail" not in caplog.text
+    assert len([event for event in log if event[0] == "token"]) == 1
+    assert not [event for event in log if event[0] == "orderbook" and event[1] == "DATA_5"]
+    assert manifest.status is CaptureStatus.COMPLETE
+
+
+def _run_async_stubs(monkeypatch, created: list[Any], captured: dict[str, Any]) -> None:
+    from src.daily import auction_capture
+
+    class _Cred:
+        slot = "DATA_3"
+        app_key = "key-research"
+        app_secret = "sec"
+        hts_id = "hts"
+
+    class _Client:
+        def __init__(self, app_key: str, app_secret: str, account_id: str, hts_id: str, token_file: str | None = None) -> None:
+            created.append(app_key)
+            self.app_key = app_key
+
+        def create_session(self) -> _Session:
+            return _Session()
+
+        async def ensure_token(self, session: Any) -> None:
+            return None
+
+    async def _capture(*args: Any, **kwargs: Any) -> str:
+        captured.update(kwargs)
+        return "manifest-ok"
+
+    async def _open(client: Any, session: Any, date: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(auction_capture, "resolve_research_credentials", lambda env, *, slots: (_Cred(),))
+    monkeypatch.setattr("src.api.kis.client.KisApiClient", _Client)
+    monkeypatch.setattr(auction_capture, "run_auction_capture", _capture)
+    monkeypatch.setattr(auction_capture, "is_kis_trading_day", _open)
+
+
+def test_handoff_config_error_is_non_fatal(tmp_path, monkeypatch, caplog) -> None:
+    import logging
+
+    from src.daily import auction_capture
+
+    caplog.set_level(logging.WARNING, logger=auction_capture.logger.name)
+    created: list[str] = []
+    captured: dict[str, Any] = {}
+    _run_async_stubs(monkeypatch, created, captured)
+    monkeypatch.delenv("KIS_DATA_SLOTS", raising=False)
+
+    out = asyncio.run(
+        auction_capture._run_async("2026-09-17", "close", _handoff_profile(tmp_path))
+    )
+
+    assert out == "manifest-ok"
+    assert [c.app_key for c in captured["clients"]] == ["key-research"]
+    assert captured["handoff_clients"] == []
+    warnings = [r.getMessage() for r in caplog.records if "HANDOFF_DISABLED" in r.getMessage()]
+    assert warnings == ["[DATA] stage=auction_capture status=HANDOFF_DISABLED reason=config"]
+
+
+def test_handoff_wiring_builds_borrowed_clients(tmp_path, monkeypatch) -> None:
+    from src.daily import auction_capture
+
+    created: list[str] = []
+    captured: dict[str, Any] = {}
+    _run_async_stubs(monkeypatch, created, captured)
+    monkeypatch.setenv("KIS_DATA_SLOTS", "1,2,3,4,5")
+    monkeypatch.setenv("KIS_DECISION_SHARD_SLOTS", "1,5")
+    monkeypatch.setenv("KIS_DATA_1_APP_KEY", "key-1")
+    monkeypatch.setenv("KIS_DATA_1_APP_SECRET", "sec-1")
+    monkeypatch.setenv("KIS_DATA_5_APP_KEY", "key-5")
+    monkeypatch.setenv("KIS_DATA_5_APP_SECRET", "sec-5")
+
+    asyncio.run(auction_capture._run_async("2026-09-17", "close", _handoff_profile(tmp_path)))
+
+    assert [c.app_key for c in captured["handoff_clients"]] == ["key-5"]
+    assert captured["handoff_labels"] == ("DATA_5",)
+    assert created == ["key-research", "key-5"]
+
+
+def test_handoff_disabled_by_default(tmp_path, monkeypatch) -> None:
+    from src.daily import auction_capture
+
+    created: list[str] = []
+    captured: dict[str, Any] = {}
+    _run_async_stubs(monkeypatch, created, captured)
+    monkeypatch.setenv("KIS_DATA_SLOTS", "1,2,3,4,5")
+    monkeypatch.setenv("KIS_DECISION_SHARD_SLOTS", "1,5")
+    monkeypatch.setenv("KIS_DATA_5_APP_KEY", "key-5")
+    monkeypatch.setenv("KIS_DATA_5_APP_SECRET", "sec-5")
+
+    asyncio.run(auction_capture._run_async("2026-09-17", "close", _profile(tmp_path)))
+
+    assert created == ["key-research"]
+    assert captured["handoff_clients"] == []
+    assert captured["handoff_labels"] == ()
+
+
+def test_capacity_gain_visible(tmp_path, caplog, monkeypatch) -> None:
+    import logging
+
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+
+    caplog.set_level(logging.INFO, logger=auction_capture.logger.name)
+    # The fake clock is shared by both lanes, so a program sleep would move time under round 0; this test isolates the orderbook lane.
+    monkeypatch.setattr(auction_capture, "program_rounds", lambda clock: [])
+    symbols = [f"{i:06d}" for i in range(1600)]
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-17", symbols, run_id="scan-1")
+    clock = _clock("2026-09-17")
+    rounds = auction_capture.close_rounds(clock, 60)
+    state = {"now": _seoul(2026, 9, 17, 15, 20)}
+    free: dict[str, dt.datetime] = {}
+    served: list[tuple[str, dt.datetime, dt.datetime]] = []
+    service = dt.timedelta(seconds=1 / 18)
+
+    class _TimedKey(_KeyedClient):
+        async def get_orderbook_snapshot(self, session: Any, code: str, market_div_code: str | None = None) -> dict[str, Any]:
+            issued = state["now"]
+            start = max(issued, free.get(self.key, issued))
+            free[self.key] = start + service
+            served.append((self.key, issued, free[self.key]))
+            return await super().get_orderbook_snapshot(session, code, market_div_code)
+
+    log: list[tuple[Any, ...]] = []
+    base = [_TimedKey("base0", state, log), _TimedKey("base1", state, log)]
+    handoff = [_TimedKey("DATA_5", state, log)]
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="close",
+            profile=_handoff_profile(tmp_path),
+            store=store,
+            clients=base,
+            session_clock=clock,
+            now_fn=lambda: state["now"],
+            sleep_fn=_publishing_sleeper(
+                state, rounds[1], lambda: _publish_cohort(store, "2026-09-17", symbols, run_id="decision-1")
+            ),
+            handoff_clients=handoff,
+            handoff_labels=("DATA_5",),
+        )
+    )
+
+    assert "capacity_with_handoff=2754" in caplog.text
+    orderbook = [e for e in manifest.entries if e.dataset == CaptureDataset.ORDERBOOK]
+    for moment in rounds:
+        done = [e for e in orderbook if e.scheduled_at == moment and e.status is CaptureStatus.COMPLETE]
+        assert len(done) == len(symbols)
+    by_round = {moment: [(key, finish) for key, issued, finish in served if issued == moment] for moment in rounds}
+    assert {key for key, _ in by_round[rounds[0]]} == {"base0", "base1"}
+    assert {key for key, _ in by_round[rounds[1]]} == {"base0", "base1", "DATA_5"}
+    durations = [max(f for _, f in by_round[moment]) - moment for moment in rounds[:2]]
+    assert durations[1] < durations[0]
+    assert all(
+        max(f for _, f in by_round[moment]) - moment <= dt.timedelta(seconds=60) for moment in rounds[1:]
+    )
+
+
+def test_handoff_waits_while_manifest_store_unreadable(caplog) -> None:
+    import logging
+
+    from src.daily import auction_capture
+
+    caplog.set_level(logging.WARNING, logger=auction_capture.logger.name)
+
+    class _UnreadableStore:
+        def read_manifests(self, snapshot_date: str) -> tuple[Any, ...]:
+            raise OSError("evidence store offline")
+
+    calls: list[Any] = []
+
+    class _Handoff:
+        def adopt_cached_token(self) -> str | None:
+            calls.append("adopt")
+            return "cached-token"
+
+    pool = auction_capture._ClientPool([], [_Handoff()], ["DATA_5"], per_key=8)
+    activated = _run(
+        auction_capture._maybe_activate_handoff(
+            pool, _UnreadableStore(), "2026-09-17", round_at=_seoul(2026, 9, 17, 15, 21)
+        )
+    )
+
+    assert activated is False
+    assert calls == []
+    assert "HANDOFF_WAIT reason=OSError" in caplog.text
+
+
+def test_handoff_waits_without_decision_manifest() -> None:
+    from src.daily import auction_capture
+
+    class _EmptyStore:
+        def read_manifests(self, snapshot_date: str) -> tuple[Any, ...]:
+            return ()
+
+    calls: list[Any] = []
+
+    class _Handoff:
+        def adopt_cached_token(self) -> str | None:
+            calls.append("adopt")
+            return "cached-token"
+
+    pool = auction_capture._ClientPool([], [_Handoff()], ["DATA_5"], per_key=8)
+    activated = _run(
+        auction_capture._maybe_activate_handoff(
+            pool, _EmptyStore(), "2026-09-17", round_at=_seoul(2026, 9, 17, 15, 21)
+        )
+    )
+
+    assert activated is False
+    assert calls == []
+    assert pool.decision_published is False
+
+
+def test_handoff_never_issues_token(tmp_path, caplog, monkeypatch) -> None:
+    import logging
+
+    from src.daily import auction_capture
+    from src.data.capture_contracts import CaptureStatus
+
+    caplog.set_level(logging.INFO, logger=auction_capture.logger.name)
+    monkeypatch.setattr(auction_capture, "program_rounds", lambda clock: [])
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-17", _HANDOFF_SYMBOLS)
+    state = {"now": _seoul(2026, 9, 17, 15, 20)}
+    log: list[tuple[Any, ...]] = []
+    issued: list[str] = []
+
+    class _EmptyCacheKey(_KeyedClient):
+        async def ensure_token(self, session: Any) -> None:
+            issued.append(self.key)
+
+    base = [_KeyedClient("base0", state, log), _KeyedClient("base1", state, log)]
+    handoff = [_EmptyCacheKey("DATA_5", state, log, cached=False)]
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-09-17",
+            phase="close",
+            profile=_handoff_profile(tmp_path),
+            store=store,
+            clients=base,
+            session_clock=_clock("2026-09-17"),
+            now_fn=lambda: state["now"],
+            sleep_fn=_publishing_sleeper(state, None, None),
+            handoff_clients=handoff,
+            handoff_labels=("DATA_5",),
+        )
+    )
+
+    warnings = [r.getMessage() for r in caplog.records if "HANDOFF_FAILED" in r.getMessage()]
+    assert warnings == ["[DATA] stage=auction_capture status=HANDOFF_FAILED slot=DATA_5 reason=no_cached_token"]
+    assert issued == []
+    assert not [event for event in log if event[0] == "orderbook" and event[1] == "DATA_5"]
+    assert "HANDOFF_ACTIVE" not in caplog.text
+    assert manifest.status is CaptureStatus.COMPLETE
+
+
+def test_observe_roster_requires_pool_or_clients() -> None:
+    from src.daily import auction_capture
+
+    with pytest.raises(ValueError, match="client pool"):
+        _run(
+            auction_capture._observe_roster(
+                roster=["000001"],
+                deadline=_seoul(2026, 9, 17, 15, 21),
+                now_fn=lambda: _seoul(2026, 9, 17, 15, 20),
+                observe=lambda position, symbol, client: None,
+                on_deadline=lambda position, symbol: None,
+            )
+        )
+
+
+def test_run_auction_capture_rejects_misaligned_or_undeclared_handoff(tmp_path) -> None:
+    from src.daily import auction_capture
+
+    common = {
+        "phase": "close",
+        "store": _store(tmp_path),
+        "clients": [_FakeClient()],
+        "session_clock": _clock("2026-09-17"),
+        "now_fn": lambda: _seoul(2026, 9, 17, 15, 20),
+    }
+    with pytest.raises(ValueError, match="must align"):
+        _run(
+            auction_capture.run_auction_capture(
+                "2026-09-17", profile=_handoff_profile(tmp_path), handoff_clients=[_FakeClient()], handoff_labels=(), **common
+            )
+        )
+    with pytest.raises(ValueError, match="declared handoff slots"):
+        _run(
+            auction_capture.run_auction_capture(
+                "2026-09-17", profile=_profile(tmp_path), handoff_clients=[_FakeClient()], handoff_labels=("DATA_5",), **common
+            )
+        )
+

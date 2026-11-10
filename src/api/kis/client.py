@@ -285,6 +285,13 @@ class KisApiClient:
             return None
         return access_token if is_valid else None
 
+    def adopt_cached_token(self) -> str | None:
+        """Adopt the usable cached token without issuing one; None leaves ``self.token`` unchanged."""
+        cached = self._read_cached_token()
+        if cached is not None:
+            self.token = cached
+        return cached
+
     async def _issue_token(self, session: aiohttp.ClientSession) -> bool:
         """토큰을 발급한다. 호출자는 호스트 파일 락을 보유해야 한다."""
         url = f"{self.base_url}/oauth2/tokenP"

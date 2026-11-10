@@ -32,6 +32,8 @@ class CollectionSettings(EnvSettings):
         COLLECTION_AUCTION_ENABLED: Enable independently budgeted sweeps, default False.
         COLLECTION_ALTDATA_ENABLED: Enable incremental slow-data jobs, default False.
         COLLECTION_RESEARCH_SLOTS: Explicit research key slots, default empty.
+        COLLECTION_AUCTION_HANDOFF_SLOTS: Non-leading decision-shard slots lent to auction research after
+            the decision manifest exists, default empty (off).
         COLLECTION_ALTDATA_EXTRA_SLOTS: Extra KIS data slots for alt-data fan-out, default empty.
         COLLECTION_AUCTION_INTERVAL_SECONDS: Closing sweep interval, default 60.
         COLLECTION_AUCTION_CAPACITY_UTILIZATION: Share of the per-key request budget a closing round plans for,
@@ -128,6 +130,7 @@ class CollectionSettings(EnvSettings):
     COLLECTION_AUCTION_ENABLED: bool = Field(default=False)
     COLLECTION_ALTDATA_ENABLED: bool = Field(default=False)
     COLLECTION_RESEARCH_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
+    COLLECTION_AUCTION_HANDOFF_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
     COLLECTION_ALTDATA_EXTRA_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
     COLLECTION_AUCTION_INTERVAL_SECONDS: int = Field(default=60, gt=0)
     COLLECTION_AUCTION_CAPACITY_UTILIZATION: float = Field(default=0.85, gt=0, le=1, allow_inf_nan=False)
@@ -203,7 +206,7 @@ class CollectionSettings(EnvSettings):
     COLLECTION_POSTCLOSE_SNAPSHOT_DEADLINE_HHMMSS: str = Field(default="153900", pattern=r"^\d{6}$")
     COLLECTION_POSTCLOSE_SNAPSHOT_CONCURRENCY: int = Field(default=4, gt=0, le=16)
 
-    @field_validator("COLLECTION_RESEARCH_SLOTS", "COLLECTION_ALTDATA_EXTRA_SLOTS", "COLLECTION_BACKFILL_SLOTS", "COLLECTION_AFTERMARKET_BOOK_SLOTS", mode="before")
+    @field_validator("COLLECTION_RESEARCH_SLOTS", "COLLECTION_AUCTION_HANDOFF_SLOTS", "COLLECTION_ALTDATA_EXTRA_SLOTS", "COLLECTION_BACKFILL_SLOTS", "COLLECTION_AFTERMARKET_BOOK_SLOTS", mode="before")
     @classmethod
     def _parse_slot_env(cls, v: Any) -> Any:
         """Accept the slot-list spelling every env loader agrees on.
@@ -220,7 +223,7 @@ class CollectionSettings(EnvSettings):
         items = json.loads(text) if text.startswith("[") else text.split(",")
         return tuple(str(item).strip() for item in items if str(item).strip())
 
-    @field_validator("COLLECTION_RESEARCH_SLOTS", "COLLECTION_ALTDATA_EXTRA_SLOTS", "COLLECTION_BACKFILL_SLOTS", "COLLECTION_AFTERMARKET_BOOK_SLOTS", mode="after")
+    @field_validator("COLLECTION_RESEARCH_SLOTS", "COLLECTION_AUCTION_HANDOFF_SLOTS", "COLLECTION_ALTDATA_EXTRA_SLOTS", "COLLECTION_BACKFILL_SLOTS", "COLLECTION_AFTERMARKET_BOOK_SLOTS", mode="after")
     @classmethod
     def _check_slots(cls, v: tuple[str, ...]) -> tuple[str, ...]:
         for slot in v:
@@ -313,6 +316,11 @@ class CollectionSettings(EnvSettings):
             raise ValueError("pit backfill change band must be non-empty")
         if self.COLLECTION_AUCTION_ENABLED and len(self.COLLECTION_RESEARCH_SLOTS) == 0:
             raise ValueError("enabled auctions require declared research credentials")
+        if self.COLLECTION_AUCTION_HANDOFF_SLOTS:
+            if not self.COLLECTION_AUCTION_ENABLED:
+                raise ValueError("auction handoff slots require enabled auction collection")
+            if set(self.COLLECTION_AUCTION_HANDOFF_SLOTS) & set(self.COLLECTION_RESEARCH_SLOTS):
+                raise ValueError("auction handoff slots must be disjoint from research slots")
         for key, clock in self.COLLECTION_SESSION_OVERRIDES.items():
             try:
                 parsed = date.fromisoformat(key)

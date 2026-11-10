@@ -17,7 +17,13 @@ from typing import Any, Literal
 import pandas as pd
 
 from src import settings
-from src.api.kis.key_pool import prewarm_healthy_clients, resolve_research_credentials, token_cache_path
+from src.api.kis.key_pool import (
+    KisCredential,
+    prewarm_healthy_clients,
+    resolve_handoff_credentials,
+    resolve_research_credentials,
+    token_cache_path,
+)
 from src.config.collection import CollectionSettings
 from src.config.market_session import KRX_CLOSE_MARKET_DIV_CODE
 from src.data.capture_contracts import (
@@ -239,11 +245,107 @@ class _OrderbookPriorityGate:
         await self._idle.wait()
 
 
+class _ClientPool:
+    """Research keys always serve; each handoff key joins once its single activation attempt succeeds.
+
+    Every key owns its semaphore, so the per-key in-flight bound holds while the active set grows.
+    """
+
+    def __init__(self, base: Sequence[Any], handoff: Sequence[Any], handoff_labels: Sequence[str], *, per_key: int) -> None:
+        self._base: list[tuple[Any, asyncio.Semaphore]] = [(client, asyncio.Semaphore(per_key)) for client in base]
+        self._handoff: list[tuple[Any, asyncio.Semaphore]] = [(client, asyncio.Semaphore(per_key)) for client in handoff]
+        self.handoff_labels: tuple[str, ...] = tuple(handoff_labels)
+        self.decision_published = False
+        self._attempted: set[int] = set()
+        self._activated: set[int] = set()
+
+    @property
+    def handoff_configured(self) -> bool:
+        return bool(self._handoff)
+
+    @property
+    def handoff_clients(self) -> list[Any]:
+        return [client for client, _ in self._handoff]
+
+    @property
+    def unattempted_handoff(self) -> list[int]:
+        return [index for index in range(len(self._handoff)) if index not in self._attempted]
+
+    def mark_attempted(self, index: int) -> None:
+        self._attempted.add(index)
+
+    def activate_handoff(self, index: int = 0) -> None:
+        self._activated.add(index)
+
+    def active_count(self) -> int:
+        return len(self._active())
+
+    def pick(self, position: int) -> tuple[Any, asyncio.Semaphore]:
+        active = self._active()
+        return active[position % len(active)]
+
+    def _active(self) -> list[tuple[Any, asyncio.Semaphore]]:
+        return self._base + [self._handoff[index] for index in sorted(self._activated)]
+
+
+def _decision_manifest_published(store: CaptureStore, snapshot_date: str) -> bool:
+    """A decision manifest is published only after its collect, including every decision-shard request, has returned."""
+    return any(
+        manifest.cohort is not None and manifest.context.run_id.startswith("decision-")
+        for manifest in store.read_manifests(snapshot_date)
+    )
+
+
+async def _maybe_activate_handoff(
+    pool: _ClientPool,
+    store: CaptureStore,
+    snapshot_date: str,
+    *,
+    round_at: datetime,
+) -> bool:
+    """Adopt each handoff slot's cached token once, only after the day's decision collect finished; never issues, never raises."""
+    if not pool.unattempted_handoff:
+        return False
+    if not pool.decision_published:
+        try:
+            pool.decision_published = _decision_manifest_published(store, snapshot_date)
+        except (OSError, ValueError) as exc:
+            logger.warning("[DATA] stage=auction_capture status=HANDOFF_WAIT reason=%s", type(exc).__name__)
+            return False
+        if not pool.decision_published:
+            return False
+    activated: list[str] = []
+    for index in pool.unattempted_handoff:
+        pool.mark_attempted(index)
+        label = pool.handoff_labels[index]
+        try:
+            adopted = pool.handoff_clients[index].adopt_cached_token()
+        except Exception as exc:
+            logger.warning(
+                "[DATA] stage=auction_capture status=HANDOFF_FAILED slot=%s reason=%s", label, type(exc).__name__
+            )
+            continue
+        if adopted is None:
+            logger.warning("[DATA] stage=auction_capture status=HANDOFF_FAILED slot=%s reason=no_cached_token", label)
+            continue
+        pool.activate_handoff(index)
+        activated.append(label)
+    if activated:
+        logger.info(
+            "[DATA] stage=auction_capture status=HANDOFF_ACTIVE phase=close round=%s slots=%s active_keys=%d",
+            round_at.isoformat(),
+            ",".join(activated),
+            pool.active_count(),
+        )
+    return bool(activated)
+
+
 async def _observe_roster(
     *,
     roster: Sequence[str],
-    clients: Sequence[Any],
-    semaphore: asyncio.Semaphore,
+    clients: Sequence[Any] = (),
+    semaphore: asyncio.Semaphore | None = None,
+    pool: _ClientPool | None = None,
     deadline: datetime,
     now_fn: Callable[[], datetime],
     observe: Callable[[int, str, Any], Awaitable[CoverageEntry]],
@@ -258,8 +360,9 @@ async def _observe_roster(
 
     Args:
         roster: Ordered symbols; position selects the client (position % len(clients)).
-        clients: Research-slot data clients.
-        semaphore: Shared bound of COLLECTION_CONCURRENCY_PER_KEY * len(clients).
+        clients: Research-slot data clients, used with ``semaphore`` when ``pool`` is None.
+        semaphore: Shared bound of COLLECTION_CONCURRENCY_PER_KEY * len(clients) when ``pool`` is None.
+        pool: Per-key lanes; takes precedence over ``clients`` and ``semaphore``.
         deadline: Dispatch cutoff for this round (next round start or phase end).
         observe: Performs one symbol's request and persistence, returning its entry.
         on_deadline: Builds the PARTIAL(reason="deadline") entry for an undispatched symbol.
@@ -269,22 +372,33 @@ async def _observe_roster(
         One entry per roster symbol, ordered by roster position.
     """
 
+    lane: Callable[[int], tuple[Any, asyncio.Semaphore]]
+    if pool is not None:
+        lane = pool.pick
+    else:
+        if not clients or semaphore is None:
+            raise ValueError("observe roster requires a client pool, or clients with a semaphore")
+        shared = semaphore
+        lane = lambda position: (clients[position % len(clients)], shared)  # noqa: E731
+
     async def _one(position: int, symbol: str) -> CoverageEntry:
         if gate is None:
-            async with semaphore:
+            client, lane_sem = lane(position)
+            async with lane_sem:
                 if now_fn() >= deadline:
                     return on_deadline(position, symbol)
-                return await observe(position, symbol, clients[position % len(clients)])
+                return await observe(position, symbol, client)
         while True:
             if now_fn() >= deadline:
                 return on_deadline(position, symbol)
             await gate.wait_idle()
-            async with semaphore:
+            client, lane_sem = lane(position)
+            async with lane_sem:
                 if not gate.is_idle:
                     continue
                 if now_fn() >= deadline:
                     return on_deadline(position, symbol)
-                return await observe(position, symbol, clients[position % len(clients)])
+                return await observe(position, symbol, client)
 
     return list(
         await asyncio.gather(*(_one(position, symbol) for position, symbol in enumerate(roster)))
@@ -300,6 +414,7 @@ def _log_round_line(
     started: datetime,
     ended: datetime,
     capacity_per_round: int,
+    active_keys: int | None = None,
 ) -> float:
     n_complete = sum(1 for entry in entries if entry.status is CaptureStatus.COMPLETE)
     n_deadline = sum(1 for entry in entries if entry.reason == "deadline")
@@ -307,7 +422,7 @@ def _log_round_line(
     duration_s = max((ended - max(scheduled_at, started)).total_seconds(), 0.0)
     logger.info(
         "[DATA] stage=auction_capture_round phase=close dataset=%s round=%s index=%d n_roster=%d n_requested=%d "
-        "n_complete=%d n_deadline=%d n_late=%d n_failed=%d duration_s=%.1f capacity_per_round=%d",
+        "n_complete=%d n_deadline=%d n_late=%d n_failed=%d duration_s=%.1f capacity_per_round=%d%s",
         dataset.value,
         scheduled_at.isoformat(),
         index,
@@ -319,6 +434,7 @@ def _log_round_line(
         len(entries) - n_complete - n_deadline,
         duration_s,
         capacity_per_round,
+        "" if active_keys is None else f" active_keys={active_keys}",
     )
     return duration_s
 
@@ -446,8 +562,7 @@ async def _capture_program_rounds(
     session: Any,
     rounds: Sequence[datetime],
     roster: Sequence[str],
-    clients: Sequence[Any],
-    semaphore: asyncio.Semaphore,
+    pool: _ClientPool,
     store: CaptureStore,
     trading_day: date,
     run_id: str,
@@ -466,12 +581,12 @@ async def _capture_program_rounds(
         await _wait_until_scheduled(
             scheduled_at, now_fn=now_fn, sleeper=sleeper, injected_clock=injected_clock
         )
+        await _maybe_activate_handoff(pool, store, trading_day.isoformat(), round_at=scheduled_at)
         deadline = rounds[prog_index + 1] if prog_index + 1 < len(rounds) else close_at
         started = now_fn()
         round_entries = await _observe_roster(
             roster=roster,
-            clients=clients,
-            semaphore=semaphore,
+            pool=pool,
             deadline=deadline,
             now_fn=now_fn,
             observe=functools.partial(
@@ -828,6 +943,8 @@ def _log_capture_plan(
     interval_seconds: int,
     capacity_per_round: int,
     start_lag_seconds: float,
+    n_handoff: int = 0,
+    capacity_with_handoff: int = 0,
 ) -> dict[str, float | str]:
     """Log whether the closing plan fits the key budget and return its numbers; program demand is averaged over the rounds that can carry it."""
     demand_orderbook = n_roster + n_extras
@@ -837,7 +954,8 @@ def _log_capture_plan(
     status = "OVERCOMMIT" if overcommit else "OK"
     (logger.warning if overcommit else logger.info)(
         "[DATA] stage=auction_capture_plan phase=close status=%s n_roster=%d n_extras=%d n_priority=%d n_clients=%d "
-        "rounds=%d interval_s=%d capacity_per_round=%d demand_orderbook=%d demand_program_per_round=%d start_lag_s=%.1f",
+        "rounds=%d interval_s=%d capacity_per_round=%d demand_orderbook=%d demand_program_per_round=%d start_lag_s=%.1f "
+        "handoff_slots=%d capacity_with_handoff=%d",
         status,
         n_roster,
         n_extras,
@@ -849,6 +967,8 @@ def _log_capture_plan(
         demand_orderbook,
         demand_program,
         start_lag_seconds,
+        n_handoff,
+        capacity_with_handoff,
     )
     return {
         "roster": n_roster,
@@ -874,6 +994,8 @@ async def run_auction_capture(
     previous_trading_day: str | None = None,
     degraded_slots: Sequence[str] = (),
     stats_sink: dict[str, float | str] | None = None,
+    handoff_clients: Sequence[Any] = (),
+    handoff_labels: Sequence[str] = (),
 ) -> CaptureManifest:
     """Capture the complete project cohort through independently timed auctions.
 
@@ -893,6 +1015,8 @@ async def run_auction_capture(
         previous_trading_day: Previous actual trading day for the opening population.
         degraded_slots: Slots whose token issuance failed before capture; any makes the manifest PARTIAL.
         stats_sink: Optional close-phase plan numbers and orderbook round duration, filled in place.
+        handoff_clients: Decision-shard clients lent to research after the decision manifest; not prewarmed.
+        handoff_labels: Log-safe slot labels aligned with ``handoff_clients``.
 
     Returns:
         Manifest retaining all expected entries and observed task states.
@@ -919,6 +1043,10 @@ async def run_auction_capture(
         raise ValueError("auction capture requires declared research slots")
     if not clients:
         raise ValueError("auction capture requires prewarmed data clients")
+    if len(handoff_clients) != len(handoff_labels):
+        raise ValueError("handoff clients and labels must align")
+    if handoff_clients and not profile.COLLECTION_AUCTION_HANDOFF_SLOTS:
+        raise ValueError("handoff clients require declared handoff slots")
     now = now_clock()
     roster, cohort_id, cohort_incomplete = _resolve_roster(snapshot_date, phase, store, now, previous_trading_day)
     roster_date = snapshot_date if phase == "close" else (previous_trading_day or _previous_trading_day(snapshot_date))
@@ -933,6 +1061,7 @@ async def run_auction_capture(
     research_set = frozenset(extras)
     priority: frozenset[str] = frozenset()
     capacity_per_round = 0
+    capacity_with_handoff = 0
     if phase == "close":
         from src.api.kis.client import KIS_REST_TPS_PER_APP_KEY
 
@@ -949,6 +1078,12 @@ async def run_auction_capture(
             utilization=profile.COLLECTION_AUCTION_CAPACITY_UTILIZATION,
             tps_per_key=KIS_REST_TPS_PER_APP_KEY,
         )
+        capacity_with_handoff = estimate_round_capacity(
+            len(clients) + len(handoff_clients),
+            int(profile.COLLECTION_AUCTION_INTERVAL_SECONDS),
+            utilization=profile.COLLECTION_AUCTION_CAPACITY_UTILIZATION,
+            tps_per_key=KIS_REST_TPS_PER_APP_KEY,
+        )
         rounds = close_rounds(session_clock, int(profile.COLLECTION_AUCTION_INTERVAL_SECONDS))
         phase_end = session_clock.close_at
     else:
@@ -956,7 +1091,9 @@ async def run_auction_capture(
         phase_end = session_clock.open_at + timedelta(seconds=int(profile.COLLECTION_OPEN_CONFIRM_SECONDS))
     run_id = f"auction-{phase}-{snapshot_date}-{uuid.uuid4().hex[:8]}"
     reason_tag = f"auction-{phase}"
-    sem = asyncio.Semaphore(int(profile.COLLECTION_CONCURRENCY_PER_KEY) * len(clients))
+    pool = _ClientPool(
+        clients, handoff_clients, handoff_labels, per_key=int(profile.COLLECTION_CONCURRENCY_PER_KEY)
+    )
     entries: list[CoverageEntry] = []
     incomplete = bool(cohort_incomplete) or bool(degraded_slots)
     if degraded_slots:
@@ -977,6 +1114,8 @@ async def run_auction_capture(
             interval_seconds=int(profile.COLLECTION_AUCTION_INTERVAL_SECONDS),
             capacity_per_round=capacity_per_round,
             start_lag_seconds=(now_clock() - rounds[0]).total_seconds(),
+            n_handoff=len(handoff_clients),
+            capacity_with_handoff=capacity_with_handoff,
         )
         if stats_sink is not None:
             stats_sink.update(plan)
@@ -990,8 +1129,7 @@ async def run_auction_capture(
                     session=broker_session,
                     rounds=program_rounds(session_clock),
                     roster=dispatch,
-                    clients=clients,
-                    semaphore=sem,
+                    pool=pool,
                     store=store,
                     trading_day=trading_day,
                     run_id=run_id,
@@ -1037,6 +1175,7 @@ async def run_auction_capture(
                 continue
             degraded: list[str] = []
             if phase == "close":
+                await _maybe_activate_handoff(pool, store, snapshot_date, round_at=scheduled_at)
                 ordered = plan_round_order(
                     dispatch,
                     priority=priority,
@@ -1051,8 +1190,7 @@ async def run_auction_capture(
             try:
                 round_entries = await _observe_roster(
                     roster=ordered,
-                    clients=clients,
-                    semaphore=sem,
+                    pool=pool,
                     deadline=deadline,
                     now_fn=now_clock,
                     observe=functools.partial(
@@ -1086,6 +1224,7 @@ async def run_auction_capture(
                         started=round_started,
                         ended=now_clock(),
                         capacity_per_round=capacity_per_round,
+                        active_keys=pool.active_count() if pool.handoff_configured else None,
                     ),
                 )
             if any(symbol not in research_set for symbol in degraded) or any(
@@ -1126,8 +1265,7 @@ async def run_auction_capture(
                 pass_degraded: list[str] = []
                 round_entries = await _observe_roster(
                     roster=pass_symbols,
-                    clients=clients,
-                    semaphore=sem,
+                    pool=pool,
                     deadline=confirm_end,
                     now_fn=now_clock,
                     observe=functools.partial(
@@ -1257,18 +1395,30 @@ async def _run_async(
 
     from src.api.kis.client import KisApiClient
 
-    env = dict(os.environ)
-    creds = resolve_research_credentials(env, slots=tuple(profile.COLLECTION_RESEARCH_SLOTS))
-    clients = [
-        KisApiClient(
+    def _client(cred: KisCredential) -> Any:
+        return KisApiClient(
             cred.app_key,
             cred.app_secret,
             "",
             cred.hts_id,
             token_file=str(token_cache_path(cred.app_key, settings.KIS_TOKEN_CACHE_DIR)),
         )
-        for cred in creds
-    ]
+
+    env = dict(os.environ)
+    creds = resolve_research_credentials(env, slots=tuple(profile.COLLECTION_RESEARCH_SLOTS))
+    clients = [_client(cred) for cred in creds]
+    handoff_creds: tuple[KisCredential, ...] = ()
+    if profile.COLLECTION_AUCTION_HANDOFF_SLOTS:
+        try:
+            handoff_creds = resolve_handoff_credentials(
+                env,
+                slots=tuple(profile.COLLECTION_AUCTION_HANDOFF_SLOTS),
+                research_slots=tuple(profile.COLLECTION_RESEARCH_SLOTS),
+            )
+        except ValueError:
+            logger.warning("[DATA] stage=auction_capture status=HANDOFF_DISABLED reason=config")
+    handoff_clients = [_client(cred) for cred in handoff_creds]
+    handoff_labels = tuple(cred.slot for cred in handoff_creds)
     store = CaptureStore(_capture_root(profile))
     trading_day = date.fromisoformat(snapshot_date)
     clock = session_day.clock if session_day.clock is not None else SessionClock.standard(trading_day)
@@ -1292,6 +1442,8 @@ async def _run_async(
         previous_trading_day=previous_trading_day,
         degraded_slots=degraded_slots,
         stats_sink=stats_sink,
+        handoff_clients=handoff_clients,
+        handoff_labels=handoff_labels,
     )
 
 

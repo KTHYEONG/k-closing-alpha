@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from src.api.kis.client import KisApiClient
+from src.api.kis.client import KisApiClient, _now_kst
 
 
 def test_kis_client_instances_share_process_global_rate_limiter() -> None:
@@ -606,3 +606,44 @@ def test_kis_token_lock_timeout_exceeds_healthy_holder_issuance_budget() -> None
         KIS_TOKEN_ISSUE_BACKOFF_SEC * attempt for attempt in range(1, KIS_TOKEN_ISSUE_ATTEMPTS)
     )
     assert holder_budget < KisSettings().KIS_TOKEN_LOCK_TIMEOUT_SECONDS
+
+
+def _write_cache(path, *, app_key: str, expires_in_minutes: int, marker: str = "CACHED") -> None:
+    import json
+    from datetime import timedelta
+
+    expired_at = (_now_kst() + timedelta(minutes=expires_in_minutes)).isoformat(timespec="seconds")
+    path.write_text(json.dumps({"access_token": marker, "expired_at": expired_at, "app_key": app_key}), encoding="utf-8")
+
+
+def test_adopt_cached_token_contract(tmp_path) -> None:
+    """Adopt returns the usable cached token; a miss, a near-expiry entry or a foreign key leaves token unchanged."""
+    token_file = tmp_path / "tok.json"
+
+    hit = KisApiClient(app_key="k", app_secret="s", token_file=str(token_file))
+    _write_cache(token_file, app_key="k", expires_in_minutes=600)
+    assert hit.adopt_cached_token() == "CACHED"
+    assert hit.token == "CACHED"
+
+    for case in ("missing", "near_expiry", "foreign_key"):
+        client = KisApiClient(app_key="k", app_secret="s", token_file=str(tmp_path / f"{case}.json"))
+        client.token = "KEEP"
+        if case == "near_expiry":
+            _write_cache(tmp_path / f"{case}.json", app_key="k", expires_in_minutes=5)
+        if case == "foreign_key":
+            _write_cache(tmp_path / f"{case}.json", app_key="other", expires_in_minutes=600)
+        assert client.adopt_cached_token() is None
+        assert client.token == "KEEP"
+
+
+def test_adopt_cached_token_never_posts(tmp_path, monkeypatch) -> None:
+    """A cache miss must not reach the issuance path."""
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(tmp_path / "none.json"))
+
+    async def _forbidden(*args, **kwargs):
+        raise AssertionError("issuance attempted")
+
+    monkeypatch.setattr(client, "_issue_token", _forbidden)
+    assert client.adopt_cached_token() is None
+    assert client.token is None
+
