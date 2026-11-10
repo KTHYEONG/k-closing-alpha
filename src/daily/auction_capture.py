@@ -56,6 +56,7 @@ _OPEN_TRUST_FLOOR_SECONDS: int = 30
 _TRANSIENT_VENDOR_CODES: frozenset[str] = frozenset({"EGW00316"})
 _TRANSIENT_VENDOR_RETRIES: int = 1
 _INPUT_POLL_SECONDS: float = 0.5
+NO_OPEN_TRADE_REASON: str = "no_open_trade"
 _ROUND0_INPUT_MARGIN: timedelta = timedelta(seconds=5)
 
 
@@ -962,7 +963,7 @@ def _unresolved_open_entry(
         rows=0,
         first_event_time=first_seen,
         last_event_time=last_seen_at,
-        reason="no_open_trade" if no_open_trade else "open_unresolved",
+        reason=NO_OPEN_TRADE_REASON if no_open_trade else "open_unresolved",
         raw_refs=(ref,) if ref is not None else (),
     )
 

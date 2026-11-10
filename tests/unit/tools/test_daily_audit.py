@@ -296,6 +296,52 @@ def _publish_auction_open(store, day, run_id, symbols, *, clock, status=None):
     return store.publish_manifest(manifest)
 
 
+def _publish_open_entries(store, day, run_id, rows):
+    """rows: (symbol, dataset, status, reason) for each auction-open entry."""
+    from datetime import datetime, timedelta
+
+    import pandas as pd
+
+    from src.data.capture_contracts import CaptureDataset, CaptureManifest, CaptureStatus, CoverageEntry
+
+    floor = _session_clock(day).open_at + timedelta(seconds=30)
+    entries = []
+    for symbol, dataset, status, reason in rows:
+        # NO_TRADES needs stored evidence; the store verifies every referenced artifact on publish.
+        evidence = ()
+        if status == CaptureStatus.NO_TRADES:
+            context = _capture_context(day, run_id, dataset, "auction-open").model_copy(update={"symbol": symbol})
+            evidence = (store.publish_frame(pd.DataFrame({"symbol": [symbol]}), context=context),)
+        entries.append(
+            CoverageEntry(
+                symbol=symbol,
+                dataset=dataset,
+                venue="KRX",
+                session="regular",
+                scheduled_at=floor,
+                status=status,
+                rows=0 if status == CaptureStatus.NO_TRADES else 1,
+                first_event_time=floor,
+                last_event_time=floor,
+                reason=reason,
+                raw_refs=evidence,
+            )
+        )
+    entries = tuple(entries)
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=_capture_context(day, run_id, CaptureDataset.PRICE, "auction-open"),
+        cohort=None,
+        completed_at=datetime.fromisoformat(f"{day}T09:05:00+09:00"),
+        entries=entries,
+        artifacts=(),
+        status=(
+            CaptureStatus.COMPLETE if all(e.status == CaptureStatus.COMPLETE for e in entries) else CaptureStatus.PARTIAL
+        ),
+    )
+    return store.publish_manifest(manifest)
+
+
 def _audit(store, day, profile, clock, moment):
     from datetime import date
 
@@ -1545,6 +1591,138 @@ def test_audit_collection_passes_clean_when_everything_certified(tmp_path) -> No
 
     # Then
     assert issues == ()
+
+
+def test_audit_collection_ignores_postclose_snapshot_ticks(tmp_path) -> None:
+    """Postclose snapshot ticks never stand in for the archived regular tape."""
+    from src.daily.postclose_snapshot import POSTCLOSE_REASON
+    from src.data.capture_contracts import CaptureDataset
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    clock = _session_clock(day)
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"])
+    _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"])
+    _publish_chart_manifest(
+        store, day, "run-postclose", CaptureDataset.TRADE_TICKS, ["005930"], reason=POSTCLOSE_REASON, last_time="15:31:00"
+    )
+
+    # When
+    issues = _audit(store, day, _collection_profile(tmp_path), clock, _audit_moment(day))
+
+    # Then: 장후 스냅샷의 15:31 이벤트는 정규 틱 증명도 세션 위반도 아니다
+    assert not any(issue.startswith("collection:ticks:") for issue in issues)
+
+
+def test_audit_collection_postclose_only_ticks_still_missing(tmp_path) -> None:
+    """A symbol backed only by the postclose snapshot has no regular tick proof."""
+    from src.daily.postclose_snapshot import POSTCLOSE_REASON
+    from src.data.capture_contracts import CaptureDataset
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"])
+    _publish_chart_manifest(
+        store, day, "run-postclose", CaptureDataset.TRADE_TICKS, ["005930"], reason=POSTCLOSE_REASON, last_time="15:31:00"
+    )
+
+    # When
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    # Then
+    assert "collection:ticks:1:missing_entries" in issues
+
+
+def test_audit_collection_still_flags_archive_tick_violation_with_postclose_present(tmp_path) -> None:
+    """Postclose entries do not mask an out-of-session archive tick."""
+    from src.daily.postclose_snapshot import POSTCLOSE_REASON
+    from src.data.capture_contracts import CaptureDataset
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    store = CaptureStore(tmp_path / "capture")
+    _publish_cohort_decision(store, day, ["005930"])
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"])
+    _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"], last_time="20:00:00")
+    _publish_chart_manifest(
+        store, day, "run-postclose", CaptureDataset.TRADE_TICKS, ["005930"], reason=POSTCLOSE_REASON, last_time="15:31:00"
+    )
+
+    # When
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+
+    # Then
+    assert "collection:ticks:1:session_violation" in issues
+
+
+def test_audit_collection_accepts_no_open_trade_price_entries(tmp_path) -> None:
+    """A vendor-confirmed empty open settles its PRICE entry."""
+    from src.daily.auction_capture import NO_OPEN_TRADE_REASON
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    clock = _session_clock(day)
+    profile = _collection_profile(tmp_path, auction=True)
+    store = CaptureStore(tmp_path / "capture")
+    symbols = ["005930", "000660", "035420"]
+    _publish_cohort_decision(store, day, symbols)
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, symbols)
+    _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, symbols)
+    _publish_auction_close(store, day, "run-close", symbols, clock=clock)
+    _publish_open_entries(
+        store,
+        day,
+        "run-open",
+        [
+            ("005930", CaptureDataset.PRICE, CaptureStatus.COMPLETE, "auction-open"),
+            ("000660", CaptureDataset.PRICE, CaptureStatus.NO_TRADES, NO_OPEN_TRADE_REASON),
+            ("035420", CaptureDataset.PRICE, CaptureStatus.COMPLETE, "auction-open"),
+        ],
+    )
+
+    # When
+    issues = _audit(store, day, profile, clock, _audit_moment(day))
+
+    # Then
+    assert not any(issue.startswith("collection:auction_open:") for issue in issues)
+
+
+def test_audit_collection_flags_non_price_or_other_reason_no_trades_in_open(tmp_path) -> None:
+    """Only PRICE NO_TRADES with the no-open-trade reason settles; other no-trades stay open."""
+    from src.daily.auction_capture import NO_OPEN_TRADE_REASON
+    from src.data.capture_contracts import CaptureDataset, CaptureStatus
+    from src.data.capture_store import CaptureStore
+
+    day = "2026-09-18"
+    clock = _session_clock(day)
+    profile = _collection_profile(tmp_path, auction=True)
+    store = CaptureStore(tmp_path / "capture")
+    symbols = ["005930", "000660", "035420"]
+    _publish_cohort_decision(store, day, symbols)
+    _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, symbols)
+    _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, symbols)
+    _publish_auction_close(store, day, "run-close", symbols, clock=clock)
+    _publish_open_entries(
+        store,
+        day,
+        "run-open",
+        [
+            ("005930", CaptureDataset.PRICE, CaptureStatus.NO_TRADES, "open_unresolved"),
+            ("000660", CaptureDataset.PRICE, CaptureStatus.PARTIAL, "open_unresolved"),
+            ("035420", CaptureDataset.ORDERBOOK, CaptureStatus.NO_TRADES, NO_OPEN_TRADE_REASON),
+        ],
+    )
+
+    # When
+    issues = _audit(store, day, profile, clock, _audit_moment(day))
+
+    # Then
+    assert "collection:auction_open:3:incomplete_entries" in issues
 
 
 def test_build_digest_includes_collection_issues_compatibly() -> None:

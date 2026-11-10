@@ -43,7 +43,8 @@ from src.config.market_session import (
 )
 from src.daily.archive import fetch_archive_snapshot
 from src.daily.archive_intraday import resolve_previous_archive_date
-from src.daily.auction_capture import close_rounds, program_rounds
+from src.daily.auction_capture import NO_OPEN_TRADE_REASON, close_rounds, program_rounds
+from src.daily.postclose_snapshot import POSTCLOSE_REASON
 from src.data.altdata_health import AltdataVerdict, altdata_verdict
 from src.data.capture_contracts import (
     SEOUL,
@@ -347,6 +348,16 @@ def _regular_entry_settled(dataset: CaptureDataset, entry: CoverageEntry) -> boo
     )
 
 
+def _auction_open_entry_settled(entry: CoverageEntry) -> bool:
+    if entry.status == CaptureStatus.COMPLETE:
+        return True
+    return (
+        entry.dataset is CaptureDataset.PRICE
+        and entry.status == CaptureStatus.NO_TRADES
+        and entry.reason == NO_OPEN_TRADE_REASON
+    )
+
+
 def _audit_regular_bars(
     manifests: tuple[CaptureManifest, ...],
     expected: tuple[str, ...],
@@ -361,6 +372,8 @@ def _audit_regular_bars(
                 continue
             for entry in manifest.entries:
                 if entry.dataset is not dataset or entry.session != "regular" or entry.symbol is None:
+                    continue
+                if entry.reason == POSTCLOSE_REASON:
                     continue
                 by_symbol.setdefault(entry.symbol, []).append(entry)
         missing = sum(1 for symbol in expected if not by_symbol.get(symbol))
@@ -430,7 +443,7 @@ def _audit_auction_sweeps(
         if not terminal:
             issues.append(_collection_issue("auction_open", 1, "missing_manifest"))
         else:
-            bad = sum(1 for m in terminal for e in m.entries if e.status != CaptureStatus.COMPLETE)
+            bad = sum(1 for m in terminal for e in m.entries if not _auction_open_entry_settled(e))
             if bad:
                 issues.append(_collection_issue("auction_open", bad, "incomplete_entries"))
     return issues
