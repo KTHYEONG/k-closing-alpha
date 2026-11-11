@@ -136,7 +136,7 @@ def _fake_harvest_factory(calls: list[dict[str, Any]], outcome: Any = None, emit
 def test_needs_exclude_healthy_symbol_days(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
     store = CaptureStore(tmp_path / "capture")
-    monkeypatch.setattr(tr, "_day_universe", lambda day, store: ["005930", "000660"])
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store, *_: ["005930", "000660"])
     _seed_tick_day(
         _DAY, "regular", "005930", _tick_rows(["090000", "090100"], "100"), _bar_rows(["090000", "090100"], "100")
     )
@@ -150,7 +150,7 @@ def test_needs_exclude_healthy_symbol_days(tmp_path, monkeypatch) -> None:
 def test_missing_day_selected(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
     store = CaptureStore(tmp_path / "capture")
-    monkeypatch.setattr(tr, "_day_universe", lambda day, store: ["005930"])
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store, *_: ["005930"])
     needs = tr.collect_tape_needs([_DAY], ["KRX"], store, {}, False)
     assert {(n.symbol, n.day, n.session) for n in needs} == {
         ("005930", _DAY, "regular"),
@@ -284,7 +284,7 @@ def test_resume_skips_settled(tmp_path, monkeypatch) -> None:
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(tr, "_day_universe", lambda day, store: ["A", "B"])
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store, *_: ["A", "B"])
     store = CaptureStore(tmp_path / "capture")
     settled = tr.read_settled_ledger(ledger)
     needs = tr.collect_tape_needs(["2026-10-02"], ["KRX"], store, settled, False)
@@ -521,6 +521,29 @@ def test_read_symbols_branches(tmp_path, monkeypatch) -> None:
         monkeypatch.undo()
 
 
+def test_read_symbols_dedups_in_first_seen_order(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    path = tmp_path / "ticks.parquet"
+    pd.DataFrame({"symbol": ["000002", "000001", "000002", "000003", "000001"]}).to_parquet(path)
+    assert tr._read_symbols(path) == ["000002", "000001", "000003"]
+
+
+def test_collect_tape_needs_reads_each_day_pool_once_per_scan(tmp_path, monkeypatch) -> None:
+    _patch_roots(tmp_path, monkeypatch)
+    store = CaptureStore(tmp_path / "capture")
+    calls: list[str] = []
+
+    def _counting_pool(_store: Any, day: str) -> tuple[list[str], str]:
+        calls.append(day)
+        return (["000001"], "cohort") if day in {"2026-09-01", "2026-09-02", "2026-09-03"} else ([], "none")
+
+    monkeypatch.setattr(tr, "_pool_symbols", _counting_pool)
+    monkeypatch.setattr(tr, "_is_trading_day", lambda day, ingested: True)
+    monkeypatch.setattr(tr, "_session_closed", lambda day, session, now: False)
+    tr.collect_tape_needs(["2026-09-02", "2026-09-03"], ["KRX", "NXT"], store, {}, False)
+    assert sorted(calls) == ["2026-09-01", "2026-09-02", "2026-09-03"]
+
+
 def test_read_cohort_and_universe(tmp_path, monkeypatch) -> None:
     from types import SimpleNamespace
 
@@ -640,7 +663,7 @@ def test_session_need_flags(tmp_path, monkeypatch) -> None:
 def test_collect_skips_unclosed_and_session_closed_units(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
     store = CaptureStore(tmp_path / "capture")
-    monkeypatch.setattr(tr, "_day_universe", lambda day, store: ["005930"])
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store, *_: ["005930"])
     assert tr.collect_tape_needs(["2999-01-01"], ["KRX", "NXT"], store, {}, False) == []
     assert tr.collect_tape_needs(["2999-01-01"], ["KRX"], store, {}, True) == []
     morning = datetime(2026, 9, 10, 10, 0, tzinfo=_SEOUL)
@@ -1135,7 +1158,7 @@ def test_run_tasks_emits_a_heartbeat_every_fifty_walks(tmp_path, monkeypatch, ca
 def test_collect_skips_weekends_and_ingested_holidays(tmp_path, monkeypatch) -> None:
     _patch_roots(tmp_path, monkeypatch)
     store = CaptureStore(tmp_path / "capture")
-    monkeypatch.setattr(tr, "_day_universe", lambda day, store: ["005930"])
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store, *_: ["005930"])
     ingested = pd.DataFrame({"date": pd.to_datetime(["2026-09-23", "2026-09-28"]), "symbol": "005930"})
     ingested.to_parquet(tmp_path / "price_history.parquet")
     days = ["2026-09-23", "2026-09-24", "2026-09-26", "2026-09-28", "2026-09-30"]
@@ -1425,7 +1448,7 @@ def test_holiday_after_newest_ingested_is_not_trading(tmp_path, monkeypatch) -> 
     assert max(ingested) == "2026-10-02"
     assert tr._is_trading_day("2026-10-05", ingested) is False
     store = CaptureStore(tmp_path / "capture")
-    monkeypatch.setattr(tr, "_day_universe", lambda day, store: ["005930"])
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store, *_: ["005930"])
     assert tr.collect_tape_needs(["2026-10-05"], ["KRX", "NXT"], store, {}, False) == []
 
 
@@ -1517,7 +1540,7 @@ def test_run_walk_tasks_passes_pairs_and_survives_holiday_shape(tmp_path, monkey
     holiday = datetime(2026, 10, 5, 21, 0, tzinfo=_SEOUL)
     monkeypatch.setattr(tr, "_now", lambda: holiday)
     _write_ingested_days(tmp_path, ["2026-09-30", "2026-10-01", "2026-10-02"])
-    monkeypatch.setattr(tr, "_day_universe", lambda day, store: ["005930"] if day == "2026-09-30" else [])
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store, *_: ["005930"] if day == "2026-09-30" else [])
     needs = tr.collect_tape_needs(["2026-09-30", "2026-10-05"], ["KRX"], store, {}, False)
     assert needs and all(n.day == "2026-09-30" for n in needs)
     tasks = tr.order_walk_tasks(needs)
@@ -1603,7 +1626,7 @@ def test_collect_includes_today_aftermarket_only_after_ready(tmp_path, monkeypat
     store = CaptureStore(tmp_path / "capture")
     day = "2026-10-02"
     _seed_tick_day(day, "krx_aftermarket", "000660", _tick_rows(["170000"]), None)
-    monkeypatch.setattr(tr, "_day_universe", lambda d, s: ["005930", "000660"] if d == day else [])
+    monkeypatch.setattr(tr, "_day_universe", lambda d, s, *_: ["005930", "000660"] if d == day else [])
     monkeypatch.setattr(tr, "_is_trading_day", lambda d, ing: True)
     monkeypatch.setattr(tr, "_now", lambda: datetime(2026, 10, 2, 20, 0, tzinfo=_SEOUL))
     assert not [n for n in tr.collect_tape_needs([day], ["KRX"], store, {}, False) if n.session == "krx_aftermarket"]
@@ -1719,7 +1742,7 @@ def test_incomplete_same_day_tape_stays_partial(tmp_path, monkeypatch, empty, in
         "status": out[0].entry.status.value, "reason": out[0].entry.reason, "run_date": day,
     }])
     monkeypatch.setattr(tr, "_now", lambda: fixed.replace(day=3))
-    monkeypatch.setattr(tr, "_day_universe", lambda d, s: ["005930"])
+    monkeypatch.setattr(tr, "_day_universe", lambda d, s, *_: ["005930"])
     monkeypatch.setattr(tr, "_is_trading_day", lambda d, ing: True)
     needs = tr.collect_tape_needs([day], ["KRX"], store, tr.read_settled_ledger(ledger), False)
     assert any(n.symbol == "005930" and n.session == "krx_aftermarket" for n in needs)

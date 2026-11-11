@@ -150,11 +150,7 @@ def _read_symbols(path: Path) -> list[str]:
         return []
     if "symbol" not in frame.columns:  # pragma: no cover - column-filtered reads always carry symbol
         return []
-    ordered: list[str] = []
-    for item in frame["symbol"].astype(str).tolist():
-        if item not in ordered:
-            ordered.append(item)
-    return ordered
+    return list(dict.fromkeys(frame["symbol"].astype(str).tolist()))
 
 
 def _read_cohort_symbols(store: CaptureStore, day: str) -> list[str]:
@@ -300,9 +296,19 @@ def _pool_symbols(store: CaptureStore, day: str) -> tuple[list[str], str]:
     return [], "none"
 
 
-def _day_universe(day: str, store: CaptureStore) -> list[str]:
+def _day_universe(
+    day: str, store: CaptureStore, pools: dict[str, tuple[list[str], str]] | None = None
+) -> list[str]:
+    # `pools` spans one scan: a cohort read hashes every raw ref of the day, and each day is also the next day's prev pool.
+    memo = pools if pools is not None else {}
+
+    def _pool(target: str) -> tuple[list[str], str]:
+        if target not in memo:
+            memo[target] = _pool_symbols(store, target)
+        return memo[target]
+
     codes: list[str] = []
-    own, own_source = _pool_symbols(store, day)
+    own, own_source = _pool(day)
     for item in own:
         if item not in codes:
             codes.append(item)
@@ -310,7 +316,7 @@ def _day_universe(day: str, store: CaptureStore) -> list[str]:
     prev_source, prev_day = "none", ""
     for offset in range(1, 11):
         prev = (base - timedelta(days=offset)).isoformat()
-        prev_codes, prev_source = _pool_symbols(store, prev)
+        prev_codes, prev_source = _pool(prev)
         if prev_codes:
             prev_day = prev
             for item in prev_codes:
@@ -485,10 +491,11 @@ def collect_tape_needs(
     cache = index if index is not None else PartitionIndex()
     needs: list[Need] = []
     ingested = _ingested_trading_days()
+    pools: dict[str, tuple[list[str], str]] = {}
     for day in days:
         if not _is_trading_day(day, ingested):
             continue
-        universe = _day_universe(day, store)
+        universe = _day_universe(day, store, pools)
         for venue in venues:
             for spec in [s for s in TAPE_SESSIONS if s.venue == venue]:
                 if not _session_closed(day, spec.session, now):

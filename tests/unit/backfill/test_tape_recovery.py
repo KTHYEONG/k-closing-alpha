@@ -202,7 +202,7 @@ def test_settled_statuses_end_recovery(tmp_path, monkeypatch) -> None:
     _seed(day, "regular", "000001", [("090000", "10")], [("090000", "1000")])
     _seed(day, "regular", "000002", [("090000", "10")], [("090000", "1000")])
     _seed(day, "regular", "000003", [("090000", "10")], [("090000", "1000")])
-    monkeypatch.setattr(tr, "_day_universe", lambda d, s: ["000001", "000002", "000003"] if d == day else [])
+    monkeypatch.setattr(tr, "_day_universe", lambda d, s, *_: ["000001", "000002", "000003"] if d == day else [])
     monkeypatch.setattr(tr, "_session_closed", lambda d, s, n: True)
     settled = {
         (s, day, "regular"): st for s, st in (("000001", "COMPLETE"), ("000002", "NO_TRADES"), ("000003", "PARTIAL"))
@@ -480,7 +480,7 @@ def test_terminal_keys_are_not_needs(tmp_path, monkeypatch) -> None:
     store = CaptureStore(tmp_path / "capture")
     day = "2026-10-02"
     _seed(day, "regular", "000001", [("090000", "10")], [("090000", "1000")])
-    monkeypatch.setattr(tr, "_day_universe", lambda d, s: ["000001"] if d == day else [])
+    monkeypatch.setattr(tr, "_day_universe", lambda d, s, *_: ["000001"] if d == day else [])
     monkeypatch.setattr(tr, "_session_closed", lambda d, s, n: True)
     settled = {("000001", day, "regular"): tr.UNRECOVERABLE_STATUS}
     needs = tr.collect_tape_needs([day], ["KRX"], store, settled, False)

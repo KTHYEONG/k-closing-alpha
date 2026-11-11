@@ -56,7 +56,7 @@ def _patch_sweep(
 
 def _patch_universe(monkeypatch: pytest.MonkeyPatch, days: set[str], symbols: list[str] | None = None) -> None:
     members = symbols if symbols is not None else ["005930"]
-    monkeypatch.setattr(tr, "_day_universe", lambda day, store: list(members) if day in days else [])
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store, *_: list(members) if day in days else [])
 
 
 class _SessionCtx:
