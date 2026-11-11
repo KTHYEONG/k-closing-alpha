@@ -112,6 +112,68 @@ Optional timers (`OPTIONAL_MANUAL_TIMERS`, `src/tools/code_sync.py:35-37`): auct
 
 ## 4. Check catalogue
 
+### 4.0 Plain names (use these in reports)
+IDs stay stable (probes, windows and cross-references use them). Reports to the user show the plain Korean name first and the ID in parentheses, for example `휴면 교차검증이 꺼진 상태 유지 (C9)`. A row with no entry here is shown by its ID plus the assertion's first clause.
+
+| ID | 쉬운 이름 | 실패하면 무슨 뜻인가 |
+|---|---|---|
+| H01 | 타이머 32개 정상 | kca 정기 작업 타이머가 꺼졌거나 실패한 유닛이 있다 |
+| H02 | 서버 코드 = 저장소 최신 | 서버 코드가 저장소와 다르거나 이미지가 최신이 아니다 |
+| H03 | 불필요한 컨테이너·잔여 파일 | 종료된 컨테이너나 새 백업 잔여 파일이 있다 |
+| H04 | 배포 CI 성공 | 최근 배포가 실패했거나 고정 SHA가 맞지 않다 |
+| R01 | 시간이 된 잡이 실제로 실행됨 | 실행됐어야 할 유닛이 끝나지 않았다 |
+| R02 | 오늘 잡 결과가 허용 범위 | 잡 결과가 허용된 상태가 아니다 (예: 진입 주문 DEGRADED → 긴급 메일) |
+| R03 | DEGRADED·결정 없음 목록 | 저하/결정 없음 결과가 있다 (알림 또는 알려진 조건과 맞아야 함) |
+| R04 | 모델 승급 기록 | 모델 레지스트리 최신 행이 승급이 아니다 |
+| R05 | 07:05 토큰 사전 발급 | 슬롯별 토큰 사전 발급이 7개 미만이다 |
+| R06 | 애프터마켓 북 컨테이너 가동 | 15:40~19:59 컨테이너가 떠 있지 않다 |
+| C01 | 15:20 결정 입력 확보 | 결정 입력 커버리지가 99% 미만이거나 매니페스트가 미완료다 |
+| C03 | 애프터마켓 호가 수집 완료 | 애프터마켓 호가 매니페스트가 불완전하다 |
+| C04 | 저녁 아카이브 7종 완료 | 저녁 아카이브가 불완전하고 테이프 보강도 없다 |
+| C05 | 동시호가 시가·종가 수집 완료 | 동시호가 매니페스트가 PARTIAL/미완료다 (11-10: PARTIAL 977) |
+| C06 | 동시호가 경로(DB) | 동시호가 경로 매니페스트가 미완료다 |
+| C07 | EOD 패널 갱신 | 전일 패널이 갱신되지 않았다 (stale) |
+| C08 | 틱 테이프 스윕 | 보강 필요 건이 만료 직전이거나 못 채웠다 |
+| C11 | 일일 완료 키 8개 | 하루 완료 키 8개 중 False가 있다 |
+| C12 | 리서치 로스터 | 15:20 연구 종목 로스터가 없거나 늦게 완료됐다 |
+| C13 | 연구용 매니페스트·절단 비율 | 연구 보조 매니페스트가 없거나 절단 비율이 높다 |
+| C14 | 종가후 스냅샷 | 15:39까지 종가후 스냅샷이 완료되지 않았다 |
+| C15 | 결정 부가 데이터 | 결정 부가 데이터 행 수나 체결강도 채움이 부족하다 |
+| C16 | 동시호가 라운드 마감 초과 | 동시호가 라운드가 마감 시간에 걸린 항목이 있다 (0이어야 함) |
+| Q01 | 결정 입력 품질 | 결정 입력 행 수·결측·인과성에 이상이 있다 |
+| Q05 | 가격 이력 품질 | 가격 이력 행 수 급변·중복·OHLCV 이상이 있다 |
+| Q06 | 분봉 품질 | 1분봉 중복·이상·시간 범위 누락이 있다 |
+| Q07 | 분봉-일봉 거래량 대조 | 분봉 합계와 일봉 거래량 비율이 기준에서 벗어났다 |
+| Q08 | 파티션이 비어 있지 않음 | 당일 필수 파티션이 비어 있다 |
+| Q09 | 분봉 교체 전 백업 | 분봉 교체(shrink) 전 백업이 없다 |
+| Q10 | 틱 소스 차이 | 틱 소스 간 차이가 설명되지 않는다 |
+| Q11 | 대체데이터 신선도 | 대체데이터 패널이 허용 지연보다 오래됐다 |
+| Q12 | 종가 교차확인 | 종가가 소스 간에 다르다 (표본 점검) |
+| B01 | 야간 백업 성공 | 22:15 백업이 실패했거나 늦게 시작·미완료다 |
+| B02 | 봉인 세그먼트 원격 존재 | 로컬 세그먼트가 원격에 봉인돼 있지 않다 |
+| B03 | 원격 vs 로컬 일치 | 원격과 로컬 파일이 다르다 |
+| B04 | 지연 백업 추세 | 지연된 백업이 3회 이상 쌓이거나 21일 넘었다 |
+| B05 | 정리(prune) 결과 | 정리 단계가 실패했거나 오래된 원본 폴더가 남아 있다 |
+| B07 | 일요 복원 훈련 | 주간 검증/복원 훈련이 실패했다 |
+| B08 | 주간 스냅샷 | 주간 스냅샷이 최신이 아니다 |
+| P01 | 진입 주문 1회 기록 | 진입 주문이 중복이거나 top-k와 다르다 (미체결은 WARN) |
+| P02 | 청산 완료 | 전일 보유 종목에 청산이 없거나 미결 보유가 남았다 |
+| P03 | 장부 보존(NAV 일치) | NAV와 현금·평가금액이 1원 넘게 어긋나거나 중복 행이 있다 |
+| P04 | 시간 인과성 | 결정이 15:30 이후이거나 결정 전에 체결됐다 |
+| P06 | 모의 주문 상태 | 미확인·누락·부족분이 있다. 모의 진입이 미전송이면 WARN, 긴급 메일 동반 |
+| P07 | 가상기록-주문 종목 일치 | 페이퍼 진입 종목과 주문 종목이 다르다 |
+| P08 | 실전 엣지 vs 백테스트 | 실전 평균 수익이 백테스트에서 크게 벗어났다 |
+| A01 | 감사 하트비트·열린 이슈 | 감사가 멈췄거나 열린 이슈가 있다 |
+| A02 | 일일 감사 요약 | 감사 요약이 없거나 이슈가 설명되지 않는다 |
+| A03 | 실패 유닛 알림 | 실패한 유닛에 알림이 발송되지 않았다 |
+| A04 | 대시보드 카드 | 대시보드 kca 카드가 정상이 아니다 |
+| A05 | 워치독 | 워치독 최근 실행이 실패했다 |
+| X01 | 토큰 충돌(키 재발급) | 다른 프로세스가 같은 키를 재발급해 토큰이 거부됐다 (보통 채택으로 복구) |
+| X02 | Drive 잠금 지연 | 백업 시작이 잠금 때문에 15분 넘게 밀렸다 |
+| X03 | 공유 호스트 점검(시계·디스크·메모리) | krx 점검에서 한 번만 수행, 이상 시 kca에도 귀속 |
+| X04 | 배포 라이브러리 일치 | 저장소 간 배포 스크립트 사본이 다르다 |
+| X05 | 이미지 정리 | 이미지 정리 정책이 어긋났다 |
+
 | ID | Tier | Windows | Assert (machine-checkable PASS) | Fail → Sev | Drill |
 |---|---|---|---|---|---|
 | H01 | EXT | M | 32 `kca-*` timers listed, no `--failed` kca unit, `Linger=yes` (WARN: a timer not enabled) | P1 | `systemctl --user list-timers 'kca-*' --all` |
@@ -157,7 +219,7 @@ Optional timers (`OPTIONAL_MANUAL_TIMERS`, `src/tools/code_sync.py:35-37`): auct
 | P02 | CORE | O M | §1 | P0 | paper-exit journal (`exit_window_expired`) |
 | P03 | CORE | O E M | §1 | P0 | §5.2 `P-ledger` |
 | P04 | CORE | E M | §1 | P0 | `topk_decisions.parquet` |
-| P06 | CORE | O E | §1. Entry reconcile `n_intents` counts exit + entry intents for the day (e.g. 6 for 3 picks). A stuck UNKNOWN intent is operator-only (`src.daily.order_resolve`, dry-run first) | P0 | `data/orders/<env>/journal.jsonl` |
+| P06 | CORE | O E | §1. Entry reconcile `n_intents` counts exit + entry intents for the day (e.g. 6 for 3 picks). A stuck UNKNOWN intent is operator-only (`src.daily.order_resolve`, dry-run first). In mock, a connection fault on an order POST is recovered automatically: `kis_order ... transport_error=<class>`, `resend=entry|exit` send/result lines are normal traces; `duplicate_suspect` or `resend_conflict` WARNING is a finding (possible duplicate BUY) | P0 | `data/orders/<env>/journal.jsonl` |
 | P08 | EXT | W | Live edge vs backtest: per-trade mean `net_ret` from `paper/trades.parquet` over the last 20 and 60 exit days (`exit_filled_at`), against the backtest expectation ≈ +36 bp/trade (PIT-CORE K3, 2-tick cost). WARN when the 60-day mean ≤ 0 or the 20-day mean < −50 bp (with ≥ 30 trades); never FAIL (single-trade sd is several %). Also reports win rate and mean cost | P2 | `paper/trades.parquet` |
 | P07 | EXT | E (manual) | paper entry symbols == order-journal entry intent symbols for D (same top-k) | P1 | journal `kind=intent` payload |
 | A01 | EXT | all | heartbeat `schema_version 2`, `undelivered_alerts 0`, `reconciled_at` ≤ 15 min (07:00–23:05), `snapshot_date == D` after 21:30 (N) and in M; WARN on open issues | P1 | `cat logs/heartbeat/*.json`, `tail remediation/ledger.jsonl` |
@@ -964,6 +1026,8 @@ def _():
 | `UNKNOWN err=…` | probe drift (schema/path change) | this file | fix the probe in the same change (§8) |
 | Restore needed: `price_history` (since `ed5c912`, a `data/` restore has no monolith) | offsite form is base+patch | `src/tools/price_history_offsite.py` | `rclone copy gdrive:quant-lake/live/k-closing-alpha/data/history/price_history_offsite <tmp>` then `uv run python -m src.tools.price_history_offsite restore --from-dir <tmp> --target <new path>` (refuses an existing target; checks md5 + rows). From a snapshot: first `rclone copy …/snapshots/_blobs/price_history <tmp>`, then `…/snapshots/<D>/data/history/price_history_offsite <tmp>`, same restore. Snapshots ≤ 2026-11-01 hold the monolith |
 | `steps.offsite_ledger` FAIL `ledger_not_append_only` | a seal ledger was rewritten, not appended | `offsite_backup.py` `classify_ledger_files`; `capture_offsite.py:664` | the rewritten file was uploaded with a `_deleted` version; find the writer that rewrote it (root cause), never reset `ledger_upload_state.json` to silence it |
+| `R02 DEGRADED entry_incomplete` + urgent mail `[긴급][kca] 종가 매수 주문 실패`, `P06 WARN not_sent=1` | order POST failed before any HTTP status (`kis_order verdict=ambiguous http=`); 11-11 `179880`: 23 ms, no status, likely a closed keep-alive connection | `kca-order-entry` journal; `src/api/kis/trading.py` `transport_error`; `order_gateway.py` `_entry_resend_allowed` | read `transport_error`; if `ServerDisconnectedError`/`ClientOSError`/`ClientConnectionResetError` in mock the gateway resends once after a 5 s settle re-read, so a remaining `not_found` means the resend was refused (halted, past 15:28, send cap) or the class was a timeout; live never resends (`LIVE_RESEND_ENABLED=False`) |
+| `resend_conflict` / `duplicate_suspect` WARNING | final re-read found 2+ matching orders, or an unbound order matches an intent sent twice | `order_gateway.py` `_entry_final_check`, `reconcile` | do not resend; compare broker orders with the journal and cancel the surplus by hand in the broker UI if a duplicate BUY exists |
 
 ## 7. Baselines and known conditions
 
