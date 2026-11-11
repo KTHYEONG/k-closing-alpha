@@ -175,17 +175,14 @@ async def _await_auction_inputs(
     store: CaptureStore,
     snapshot_date: str,
     *,
-    research_enabled: bool,
     deadline: datetime,
     now_fn: Callable[[], datetime],
     sleeper: Callable[[float], Awaitable[None]],
 ) -> None:
-    """Poll until the closing population (and research roster when enabled) is observable, or the deadline passes."""
+    """Poll until the closing population (and research roster) is observable, or the deadline passes."""
     while True:
         now = now_fn()
-        if _cohort_available(store, snapshot_date, now) and (
-            not research_enabled or _research_available(store, snapshot_date, now)
-        ):
+        if _cohort_available(store, snapshot_date, now) and _research_available(store, snapshot_date, now):
             return
         remaining = (deadline - now).total_seconds()
         if remaining <= 0:
@@ -1104,8 +1101,6 @@ async def run_auction_capture(
         raise ValueError(f"unknown phase {phase!r}")
     if session_clock.trading_date != trading_day:
         raise ValueError("session clock trading_date must equal snapshot_date")
-    if not profile.COLLECTION_AUCTION_ENABLED:
-        raise ValueError("auction capture requires enabled auction collection")
     if not profile.COLLECTION_RESEARCH_SLOTS:
         raise ValueError("auction capture requires declared research slots")
     if not clients:
@@ -1122,7 +1117,6 @@ async def run_auction_capture(
             await _await_auction_inputs(
                 store,
                 snapshot_date,
-                research_enabled=profile.COLLECTION_RESEARCH_ROSTER_ENABLED,
                 deadline=min(
                     rounds[0] - _ROUND0_INPUT_MARGIN,
                     wait_started + timedelta(seconds=profile.COLLECTION_AUCTION_INPUT_WAIT_SECONDS),
@@ -1141,7 +1135,6 @@ async def run_auction_capture(
         roster_date,
         available_by=now,
         exclude=set(roster),
-        enabled=profile.COLLECTION_RESEARCH_ROSTER_ENABLED,
     )
     dispatch = [*roster, *extras]
     research_set = frozenset(extras)
@@ -1593,9 +1586,6 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--date", default=None)
     args = parser.parse_args(argv)
     profile = CollectionSettings()
-    if not profile.COLLECTION_AUCTION_ENABLED:
-        logger.info("[DATA] stage=auction_capture status=SKIP reason=disabled")
-        return
     snapshot_date = args.date or datetime.now(SEOUL).date().isoformat()
     try:
         trading_day = date.fromisoformat(snapshot_date)

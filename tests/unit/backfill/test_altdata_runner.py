@@ -348,7 +348,7 @@ def test_run_altdata_backfill_capture_failure_propagates(monkeypatch, tmp_path) 
 def _capture_profile(**overrides):
     from src.config.collection import CollectionSettings
 
-    base = {"COLLECTION_ALTDATA_ENABLED": True, "COLLECTION_ALTDATA_LOOKBACK_DAYS": 3}
+    base = {"COLLECTION_ALTDATA_LOOKBACK_DAYS": 3}
     base.update(overrides)
     return CollectionSettings(**base, _env_file=None)
 
@@ -421,8 +421,8 @@ def test_run_altdata_capture_refreshes_declared_window(monkeypatch, tmp_path) ->
     assert (seen["start"], seen["end"]) == (pd.Timestamp("2026-09-08"), pd.Timestamp("2026-09-10"))
 
 
-def test_run_altdata_capture_rejects_disabled_profile_and_mismatched_bounds(monkeypatch, tmp_path) -> None:
-    """Disabled profile or mismatched rolling bounds."""
+def test_run_altdata_capture_rejects_mismatched_bounds(monkeypatch, tmp_path) -> None:
+    """Mismatched rolling bounds and missing manifests fail closed."""
     import pytest
 
     import src.daily.altdata_capture as cap
@@ -432,8 +432,6 @@ def test_run_altdata_capture_rejects_disabled_profile_and_mismatched_bounds(monk
     store = CaptureStore(tmp_path / "capture")
     cfg = _capture_cfg(tmp_path, trading_day)
     monkeypatch.setattr(cap, "fetch_krx_daily", lambda window_end, cfg_: __import__("pandas").DataFrame(columns=["symbol"]))
-    with pytest.raises(ValueError, match="enabled altdata collection"):
-        cap.run_altdata_capture(trading_day, profile=_capture_profile(COLLECTION_ALTDATA_ENABLED=False), store=store, cfg=cfg)
     with pytest.raises(ValueError, match="rolling bounds"):
         cap.run_altdata_capture(trading_day, profile=_capture_profile(), store=store, cfg=_capture_cfg(tmp_path, __import__("datetime").date(2026, 9, 9)))
     monkeypatch.setattr(cap, "run_altdata_backfill", lambda cfg_, **kw: {"panels": {}})
@@ -463,21 +461,18 @@ def test_altdata_capture_main_reports_complete_and_incomplete(monkeypatch, tmp_p
     assert cap.main(["--date", "2026-09-10"]) == 1
 
 
-def test_altdata_capture_main_skips_when_disabled_and_rejects_bad_date(monkeypatch) -> None:
-    """Disabled execution performs no requests."""
+def test_altdata_capture_main_rejects_bad_date(monkeypatch) -> None:
+    """Invalid --date fails fast without running capture."""
     import pytest
 
     import src.daily.altdata_capture as cap
 
-    monkeypatch.setattr(cap, "CollectionSettings", lambda *a, **k: _capture_profile(COLLECTION_ALTDATA_ENABLED=False))
+    monkeypatch.setattr(cap, "CollectionSettings", lambda *a, **k: _capture_profile())
     called: list[str] = []
     monkeypatch.setattr(cap, "run_altdata_capture", lambda day, **kw: called.append("x") or None)
-    # 실측 회귀: disabled는 설정상 정상 상태이지 실패가 아니다 -- 0이 아닌 값을 반환하면
-    # systemd가 이를 진짜 실패로 취급해 OnFailure 얼러트를 쏜다(2026-09-18 실측).
-    assert cap.main(["--date", "2026-09-10"]) == 0
-    assert called == []
     with pytest.raises(ValueError, match="Invalid date"):
         cap.main(["--date", "not-a-date"])
+    assert called == []
 
 
 def test_altdata_capture_root_respects_override(tmp_path) -> None:

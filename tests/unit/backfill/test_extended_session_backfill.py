@@ -1653,3 +1653,12 @@ def test_backfill_change_threshold_prefers_env_then_private_store() -> None:
     # When / Then: the override wins; otherwise the store's training-screen lower bound applies
     assert _backfill_min_change_ratio(overridden) == pytest.approx(0.045)
     assert _backfill_min_change_ratio(unset) == strategy_values().universe_chg_min
+
+
+def test_regular_backfill_follows_sessions_arg() -> None:
+    """The regular stream runs whenever selected, with no separate enable switch."""
+    regular_task = ExtendedBackfillTask("2026-03-02", "regular", ("000001",))
+    regular_plan = RegularBackfillPlan(tasks=(regular_task,), skipped_adjusted=0, skipped_unknown_basis=0)
+
+    assert _select_backfill_tasks([], regular_plan, run_extended=False, run_regular=True) == [regular_task]
+    assert _select_backfill_tasks([], regular_plan, run_extended=False, run_regular=False) == []

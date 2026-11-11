@@ -684,7 +684,6 @@ async def _run_async(snapshot_date: str, profile: CollectionSettings) -> tuple[C
         snapshot_date,
         available_by=now,
         exclude=set(sparse_symbols),
-        enabled=profile.COLLECTION_RESEARCH_ROSTER_ENABLED,
     )
     return await run_aftermarket_book_capture(
         snapshot_date,
@@ -713,9 +712,6 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--date", default=None)
     args = parser.parse_args(argv)
     profile = CollectionSettings()
-    if not profile.COLLECTION_AFTERMARKET_BOOK_ENABLED:
-        logger.info("[DATA] stage=aftermarket_book status=SKIP reason=disabled")
-        return
     snapshot_date = args.date or datetime.now(SEOUL).date().isoformat()
     try:
         trading_day = date.fromisoformat(snapshot_date)

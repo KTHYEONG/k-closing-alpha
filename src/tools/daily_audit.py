@@ -529,10 +529,6 @@ def audit_collection_manifests(
         cohort = store.read_cohort(trading_date.isoformat(), available_by=audit_at)
     except FileNotFoundError:
         cohort = None
-    auction_enabled = bool(profile.COLLECTION_AUCTION_ENABLED)
-    altdata_enabled = bool(profile.COLLECTION_ALTDATA_ENABLED)
-    if cohort is None and not manifests and not auction_enabled and not altdata_enabled:
-        return ()
     issues: list[str] = []
     expected: tuple[str, ...] = cohort.eligible_symbols if cohort is not None else ()
     if cohort is None:
@@ -555,16 +551,10 @@ def audit_collection_manifests(
             issues.append(_collection_issue("decision", len(decision_manifests), "missing_decision_input"))
     if cohort is not None:
         issues.extend(_audit_regular_bars(manifests, expected, session_clock))
-    if auction_enabled:
-        issues.extend(_audit_auction_sweeps(manifests, expected, profile, session_clock, audit_at))
-    else:
-        issues.append(_collection_issue("auction", 0, "disabled"))
-    if profile.COLLECTION_AFTERMARKET_BOOK_ENABLED and session_clock == SessionClock.standard(trading_date):
+    issues.extend(_audit_auction_sweeps(manifests, expected, profile, session_clock, audit_at))
+    if session_clock == SessionClock.standard(trading_date):
         issues.extend(_audit_aftermarket_book(manifests))
-    if altdata_enabled:
-        issues.extend(_audit_slow_data(manifests, trading_date, audit_at))
-    else:
-        issues.append(_collection_issue("slow_data", 0, "disabled"))
+    issues.extend(_audit_slow_data(manifests, trading_date, audit_at))
     return tuple(issues)
 
 

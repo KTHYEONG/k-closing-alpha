@@ -98,7 +98,6 @@ async def run_auction_path_capture(
         snapshot_date,
         available_by=observed,
         exclude=set(roster),
-        enabled=profile.COLLECTION_RESEARCH_ROSTER_ENABLED,
     )
     deadline = _at_hhmmss(trading_day, str(settings.DB_AUCTION_PATH_DEADLINE_HHMMSS))
     run_id = f"auction-path-{snapshot_date}-{uuid.uuid4().hex[:8]}"
@@ -325,10 +324,6 @@ def main(argv: list[str] | None = None) -> None:
         trading_day = date.fromisoformat(snapshot_date)
     except ValueError:
         raise ValueError(f"Invalid snapshot_date: {snapshot_date!r}") from None
-    if not settings.DB_AUCTION_PATH_ENABLED:
-        record_run_outcome("auction_path", RUN_OUTCOME_SKIPPED, run_date=snapshot_date, reason="disabled")
-        logger.info("[DATA] stage=auction_path status=SKIP reason=disabled date=%s", snapshot_date)
-        return
     if not settings.DB_APP_KEY:
         record_run_outcome("auction_path", RUN_OUTCOME_SKIPPED, run_date=snapshot_date, reason="no_credentials")
         logger.info("[DATA] stage=auction_path status=SKIP reason=no_credentials date=%s", snapshot_date)

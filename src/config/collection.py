@@ -29,8 +29,6 @@ class CollectionSettings(EnvSettings):
 
     Attributes:
         COLLECTION_ROOT: Optional owner-local override, default None; resolved beneath HISTORY_DIR/capture.
-        COLLECTION_AUCTION_ENABLED: Enable independently budgeted sweeps, default False.
-        COLLECTION_ALTDATA_ENABLED: Enable incremental slow-data jobs, default False.
         COLLECTION_RESEARCH_SLOTS: Explicit research key slots, default empty.
         COLLECTION_AUCTION_HANDOFF_SLOTS: Non-leading decision-shard slots lent to auction research after
             the decision manifest exists, default empty (off).
@@ -67,7 +65,6 @@ class CollectionSettings(EnvSettings):
         COLLECTION_BACKFILL_STOP_HHMMSS: KST wall time after which no new task starts, default 065000.
         COLLECTION_EXTENDED_EXHAUSTED_DAILY_MAX: Audit WARN threshold on newly EXHAUSTED keys, default 100.
         COLLECTION_EXTENDED_EXHAUSTED_AUDIT_CUTOFF_HHMMSS: KST wall time bounding the audit window, default 230000.
-        COLLECTION_PIT_BACKFILL_ENABLED: Run the regular-session (decision-time) backfill stream, default True.
         COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO: Lower EOD chg bound of the fetch superset, default -1.0
             (direction-free: research reconstructs 15:20 state for every liquid name; still contains training chg_min).
         COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO: Exclusive upper EOD chg bound of the fetch superset, default 1.0
@@ -80,7 +77,6 @@ class CollectionSettings(EnvSettings):
             not starting '9'), default False because the training screens admit other classes (~2% of U0 rows).
         COLLECTION_OPEN_CONFIRM_SECONDS: Opening confirmation budget, default 180.
         COLLECTION_SESSION_OVERRIDES: Operator emergency session clocks resolved by src.data.session_calendar.resolve_session_day; not a second calendar.
-        COLLECTION_AFTERMARKET_BOOK_ENABLED: Enable evening aftermarket order-book capture, default False.
         COLLECTION_AFTERMARKET_BOOK_SLOTS: Explicit aftermarket book key slots, default empty.
         COLLECTION_AFTERMARKET_BOOK_DENSE_SECONDS: Dense aftermarket book spacing, default 60.
         COLLECTION_AFTERMARKET_BOOK_SPARSE_TIMES: Full-cohort sweep instants, default eleven evening times.
@@ -114,24 +110,19 @@ class CollectionSettings(EnvSettings):
             before a need is terminal, default 3.
         COLLECTION_TAPE_TERMINALIZE_MAX_SHARE: Max share of one sweep's attempted needs that may become terminal
             in a run, default 0.10.
-        COLLECTION_RESEARCH_ROSTER_ENABLED: Enable the 15:20 research roster capture, default False.
         COLLECTION_RESEARCH_ROSTER_MIN_TRADE_VALUE_100M: Roster trade-value floor in 100M KRW, default 100.0.
         COLLECTION_RESEARCH_ROSTER_MIN_MARKET_CAP_100M: Roster estimated market-cap floor in 100M KRW, default 500.0.
         COLLECTION_RESEARCH_ROSTER_MAX_PAGES: Ranking page budget (100 rows per page), default 6.
         COLLECTION_RESEARCH_ROSTER_MAX_MEMBERS: Roster capacity cap, default 400.
-        COLLECTION_POSTCLOSE_SNAPSHOT_ENABLED: Enable the post-close trade-strength snapshot, default False.
         COLLECTION_POSTCLOSE_SNAPSHOT_DEADLINE_HHMMSS: No new snapshot request starts at or after this
             KST wall time, default 153900; must precede the 15:40 aftermarket start.
         COLLECTION_POSTCLOSE_SNAPSHOT_CONCURRENCY: In-flight symbol limit for the snapshot, default 4.
 
     Raises:
-        ValueError: Invalid limits, duplicate slots, or enabled auctions without
-            declared research credentials.
+        ValueError: Invalid limits, duplicate slots, or handoff slots overlapping research slots.
     """
 
     COLLECTION_ROOT: Path | None = Field(default=None)
-    COLLECTION_AUCTION_ENABLED: bool = Field(default=False)
-    COLLECTION_ALTDATA_ENABLED: bool = Field(default=False)
     COLLECTION_RESEARCH_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
     COLLECTION_AUCTION_HANDOFF_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
     COLLECTION_ALTDATA_EXTRA_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
@@ -173,7 +164,6 @@ class CollectionSettings(EnvSettings):
     COLLECTION_BACKFILL_STOP_HHMMSS: str = Field(default="065000", pattern=r"^\d{6}$")
     COLLECTION_EXTENDED_EXHAUSTED_DAILY_MAX: int = Field(default=100, ge=0)
     COLLECTION_EXTENDED_EXHAUSTED_AUDIT_CUTOFF_HHMMSS: str = Field(default="230000", pattern=r"^\d{6}$")
-    COLLECTION_PIT_BACKFILL_ENABLED: bool = Field(default=True)
     COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO: float = Field(default=-1.0, ge=-1.0, le=1.0, allow_inf_nan=False)
     COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO: float = Field(default=1.0, ge=-1.0, le=1.0, allow_inf_nan=False)
     COLLECTION_PIT_BACKFILL_MIN_TRADE_VALUE_100M: float = Field(default=100.0, ge=0.0, allow_inf_nan=False)
@@ -181,7 +171,6 @@ class CollectionSettings(EnvSettings):
     COLLECTION_PIT_BACKFILL_COMMON_STOCK_ONLY: bool = Field(default=False)
     COLLECTION_OPEN_CONFIRM_SECONDS: int = Field(default=180, gt=30)
     COLLECTION_SESSION_OVERRIDES: dict[str, SessionClock] = Field(default_factory=dict)
-    COLLECTION_AFTERMARKET_BOOK_ENABLED: bool = Field(default=False)
     COLLECTION_AFTERMARKET_BOOK_SLOTS: Annotated[tuple[str, ...], NoDecode] = Field(default=())
     COLLECTION_AFTERMARKET_BOOK_DENSE_SECONDS: int = Field(default=60, gt=0)
     COLLECTION_AFTERMARKET_BOOK_SPARSE_TIMES: tuple[str, ...] = Field(
@@ -202,12 +191,10 @@ class CollectionSettings(EnvSettings):
     COLLECTION_TOSS_BACKFILL_BLACKOUT_WINDOWS: Annotated[tuple[str, ...], NoDecode] = Field(
         default=("0850-0940", "1510-1550")
     )
-    COLLECTION_RESEARCH_ROSTER_ENABLED: bool = Field(default=False)
     COLLECTION_RESEARCH_ROSTER_MIN_TRADE_VALUE_100M: float = Field(default=100.0, ge=0.0, allow_inf_nan=False)
     COLLECTION_RESEARCH_ROSTER_MIN_MARKET_CAP_100M: float = Field(default=500.0, ge=0.0, allow_inf_nan=False)
     COLLECTION_RESEARCH_ROSTER_MAX_PAGES: int = Field(default=6, gt=0, le=20)
     COLLECTION_RESEARCH_ROSTER_MAX_MEMBERS: int = Field(default=400, gt=0)
-    COLLECTION_POSTCLOSE_SNAPSHOT_ENABLED: bool = Field(default=False)
     COLLECTION_POSTCLOSE_SNAPSHOT_DEADLINE_HHMMSS: str = Field(default="153900", pattern=r"^\d{6}$")
     COLLECTION_POSTCLOSE_SNAPSHOT_CONCURRENCY: int = Field(default=4, gt=0, le=16)
 
@@ -319,13 +306,8 @@ class CollectionSettings(EnvSettings):
             raise ValueError("repair budget must be at least the normal page budget")
         if not self.COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO < self.COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO:
             raise ValueError("pit backfill change band must be non-empty")
-        if self.COLLECTION_AUCTION_ENABLED and len(self.COLLECTION_RESEARCH_SLOTS) == 0:
-            raise ValueError("enabled auctions require declared research credentials")
-        if self.COLLECTION_AUCTION_HANDOFF_SLOTS:
-            if not self.COLLECTION_AUCTION_ENABLED:
-                raise ValueError("auction handoff slots require enabled auction collection")
-            if set(self.COLLECTION_AUCTION_HANDOFF_SLOTS) & set(self.COLLECTION_RESEARCH_SLOTS):
-                raise ValueError("auction handoff slots must be disjoint from research slots")
+        if set(self.COLLECTION_AUCTION_HANDOFF_SLOTS) & set(self.COLLECTION_RESEARCH_SLOTS):
+            raise ValueError("auction handoff slots must be disjoint from research slots")
         for key, clock in self.COLLECTION_SESSION_OVERRIDES.items():
             try:
                 parsed = date.fromisoformat(key)

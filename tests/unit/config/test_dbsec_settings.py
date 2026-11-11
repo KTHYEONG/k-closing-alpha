@@ -29,8 +29,7 @@ def test_dbsec_credentials_registered_as_secrets() -> None:
     assert "DB_APP_SECRET" in SECRET_SETTING_FIELDS
 
 
-def test_dbsec_auction_path_defaults_disabled_and_rejects_bad_deadline(monkeypatch) -> None:
-    monkeypatch.delenv("DB_AUCTION_PATH_ENABLED", raising=False)
-    assert DbsecSettings().DB_AUCTION_PATH_ENABLED is False
+def test_dbsec_auction_path_rejects_bad_deadline() -> None:
+    assert "DB_AUCTION_PATH_ENABLED" not in DbsecSettings.model_fields
     with pytest.raises(ValidationError):
         DbsecSettings(DB_AUCTION_PATH_DEADLINE_HHMMSS="19:00")

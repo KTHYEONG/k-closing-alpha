@@ -41,14 +41,12 @@ def _isolate_ops_measurement(monkeypatch) -> None:
     monkeypatch.setattr(_sentinel, "measure_ops", lambda _at, **_kwargs: ())
 
 
-def _collection_profile(tmp_path, *, auction=False, altdata=False):
+def _collection_profile(tmp_path):
     from src.config.collection import CollectionSettings
 
     kwargs: dict = {
         "COLLECTION_ROOT": tmp_path / "capture",
-        "COLLECTION_AUCTION_ENABLED": auction,
-        "COLLECTION_ALTDATA_ENABLED": altdata,
-        "COLLECTION_RESEARCH_SLOTS": ("1",) if auction else (),
+        "COLLECTION_RESEARCH_SLOTS": ("1",),
         "_env_file": None,
     }
     return CollectionSettings(**kwargs)
@@ -212,6 +210,23 @@ def _publish_slow_manifest(store, day, run_id, *, status):
     manifest = CaptureManifest(
         schema_version=1,
         context=_capture_context(day, run_id, CaptureDataset.SHORTING, "altdata-backfill"),
+        cohort=None,
+        completed_at=datetime.fromisoformat(f"{day}T21:40:00+09:00"),
+        entries=(),
+        artifacts=(),
+        status=status,
+    )
+    return store.publish_manifest(manifest)
+
+
+def _publish_aftermarket_manifest(store, day, run_id, *, status):
+    from datetime import datetime
+
+    from src.data.capture_contracts import CaptureDataset, CaptureManifest
+
+    manifest = CaptureManifest(
+        schema_version=1,
+        context=_capture_context(day, run_id, CaptureDataset.ORDERBOOK, "aftermarket-book"),
         cohort=None,
         completed_at=datetime.fromisoformat(f"{day}T21:40:00+09:00"),
         entries=(),
@@ -712,6 +727,7 @@ def test_run_daily_audit_sends_exactly_one_digest_per_weekday(monkeypatch, tmp_p
     from src.data.capture_contracts import SessionClock
     from src.data.session_calendar import SessionDay, SessionKind
     from src.tools import daily_audit
+    monkeypatch.setattr(daily_audit, "audit_collection_manifests", lambda *a, **k: ())
 
     def _standard(trading_day, **_kwargs):
         return SessionDay(
@@ -1177,7 +1193,7 @@ def test_audit_collection_keeps_future_slow_data_pending(tmp_path) -> None:
     _publish_cohort_decision(store, day, ["005930"])
 
     # When: 20:15 감사는 21:35 슬로우데이터를 실패로 단정하지 않는다
-    issues = _audit(store, day, _collection_profile(tmp_path, altdata=True), _session_clock(day), _audit_moment(day))
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
 
     # Then
     assert not any(issue.startswith("collection:slow_data") for issue in issues)
@@ -1194,7 +1210,7 @@ def test_audit_collection_reports_overdue_slow_data_run(tmp_path) -> None:
     issues = _audit(
         store,
         "2026-09-17",
-        _collection_profile(tmp_path, altdata=True),
+        _collection_profile(tmp_path),
         _session_clock("2026-09-17"),
         _audit_moment("2026-09-18"),
     )
@@ -1217,7 +1233,7 @@ def test_audit_collection_reports_incomplete_slow_data_run(tmp_path) -> None:
     issues = _audit(
         store,
         day,
-        _collection_profile(tmp_path, altdata=True),
+        _collection_profile(tmp_path),
         _session_clock(day),
         _audit_moment("2026-09-18", "22:00:00"),
     )
@@ -1226,8 +1242,8 @@ def test_audit_collection_reports_incomplete_slow_data_run(tmp_path) -> None:
     assert "collection:slow_data:1:incomplete_run" in issues
 
 
-def test_audit_collection_marks_disabled_jobs_explicitly(tmp_path) -> None:
-    """Disabled is distinct from success."""
+def test_audit_always_checks_auction_and_slow_data(tmp_path) -> None:
+    """Auction and slow-data checks run for every day; a day without a cohort reports missing_cohort."""
     from src.data.capture_contracts import CaptureDataset
     from src.data.capture_store import CaptureStore
 
@@ -1237,13 +1253,15 @@ def test_audit_collection_marks_disabled_jobs_explicitly(tmp_path) -> None:
     _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"])
     _publish_chart_manifest(store, day, "run-ticks", CaptureDataset.TRADE_TICKS, ["005930"])
 
-    # When
-    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day, "22:00:00"))
 
-    # Then: 비활성 작업은 성공으로 보이지 않고 명시된다
-    assert "collection:auction:0:disabled" in issues
-    assert "collection:slow_data:0:disabled" in issues
-    assert "COMPLETE" not in " ".join(issues)
+    assert not [issue for issue in issues if issue.endswith(":disabled")]
+    assert any(":auction" in issue for issue in issues)
+    assert any(":slow_data:" in issue for issue in issues)
+
+    empty_issues = _audit(CaptureStore(tmp_path / "empty"), day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
+    assert any("missing_cohort" in issue for issue in empty_issues)
+    assert not [issue for issue in empty_issues if issue.endswith(":disabled")]
 
 
 def test_audit_collection_rejects_inconsistent_date_and_naive_cutoff(tmp_path) -> None:
@@ -1411,7 +1429,7 @@ def test_audit_collection_reconciles_enabled_auction_sweeps(tmp_path) -> None:
 
     day = "2026-09-18"
     clock = _session_clock(day)
-    profile = _collection_profile(tmp_path, auction=True)
+    profile = _collection_profile(tmp_path)
 
     symbols = ["005930", "000660"]
     store = CaptureStore(tmp_path / "capture")
@@ -1436,7 +1454,7 @@ def test_audit_ignores_research_manifests(tmp_path) -> None:
 
     day = "2026-09-18"
     clock = _session_clock(day)
-    profile = _collection_profile(tmp_path, auction=True)
+    profile = _collection_profile(tmp_path)
     symbols = ["005930"]
     store = CaptureStore(tmp_path / "capture")
     _publish_cohort_decision(store, day, symbols)
@@ -1487,7 +1505,7 @@ def test_audit_collection_reports_partial_auction_close_coverage(tmp_path) -> No
 
     day = "2026-09-18"
     clock = _session_clock(day)
-    profile = _collection_profile(tmp_path, auction=True)
+    profile = _collection_profile(tmp_path)
     store = CaptureStore(tmp_path / "capture")
     symbols = ["005930", "000660"]
     _publish_cohort_decision(store, day, symbols)
@@ -1554,7 +1572,7 @@ def test_audit_collection_reports_failed_auction_open_entries(tmp_path) -> None:
 
     day = "2026-09-18"
     clock = _session_clock(day)
-    profile = _collection_profile(tmp_path, auction=True)
+    profile = _collection_profile(tmp_path)
     store = CaptureStore(tmp_path / "capture")
     _publish_cohort_decision(store, day, ["005930"])
     _publish_chart_manifest(store, day, "run-bars", CaptureDataset.MINUTE_BARS, ["005930"])
@@ -1576,7 +1594,7 @@ def test_audit_collection_passes_clean_when_everything_certified(tmp_path) -> No
 
     day = "2026-09-18"
     clock = _session_clock(day)
-    profile = _collection_profile(tmp_path, auction=True, altdata=True)
+    profile = _collection_profile(tmp_path)
     store = CaptureStore(tmp_path / "capture")
     symbols = ["005930", "000660"]
     _publish_cohort_decision(store, day, symbols)
@@ -1585,6 +1603,7 @@ def test_audit_collection_passes_clean_when_everything_certified(tmp_path) -> No
     _publish_auction_close(store, day, "run-close", symbols, clock=clock)
     _publish_auction_open(store, day, "run-open", symbols, clock=clock)
     _publish_slow_manifest(store, day, "run-slow", status=CaptureStatus.COMPLETE)
+    _publish_aftermarket_manifest(store, day, "run-aftermarket", status=CaptureStatus.COMPLETE)
 
     # When
     issues = _audit(store, day, profile, clock, _audit_moment(day, "22:00:00"))
@@ -1667,7 +1686,7 @@ def test_audit_collection_accepts_no_open_trade_price_entries(tmp_path) -> None:
 
     day = "2026-09-18"
     clock = _session_clock(day)
-    profile = _collection_profile(tmp_path, auction=True)
+    profile = _collection_profile(tmp_path)
     store = CaptureStore(tmp_path / "capture")
     symbols = ["005930", "000660", "035420"]
     _publish_cohort_decision(store, day, symbols)
@@ -1700,7 +1719,7 @@ def test_audit_collection_flags_non_price_or_other_reason_no_trades_in_open(tmp_
 
     day = "2026-09-18"
     clock = _session_clock(day)
-    profile = _collection_profile(tmp_path, auction=True)
+    profile = _collection_profile(tmp_path)
     store = CaptureStore(tmp_path / "capture")
     symbols = ["005930", "000660", "035420"]
     _publish_cohort_decision(store, day, symbols)
@@ -2070,7 +2089,7 @@ def test_audit_collection_degraded_run_raises_no_slow_data_issue(tmp_path) -> No
     issues = _audit(
         store,
         day,
-        _collection_profile(tmp_path, altdata=True),
+        _collection_profile(tmp_path),
         _session_clock(day),
         _audit_moment(day, "22:00:00"),
     )
@@ -2095,7 +2114,7 @@ def test_audit_collection_failed_run_still_raises_incomplete_run(tmp_path) -> No
     issues = _audit(
         store,
         day,
-        _collection_profile(tmp_path, altdata=True),
+        _collection_profile(tmp_path),
         _session_clock(day),
         _audit_moment(day, "22:00:00"),
     )
@@ -2112,7 +2131,7 @@ def test_audit_collection_missing_run_on_trading_day_still_reported(tmp_path) ->
     issues = _audit(
         store,
         day,
-        _collection_profile(tmp_path, altdata=True),
+        _collection_profile(tmp_path),
         _session_clock(day),
         _audit_moment(day, "22:00:00"),
     )
@@ -2128,7 +2147,7 @@ def test_audit_collection_holiday_raises_no_slow_data_issue(tmp_path) -> None:
     assert daily_audit.classify_day(day, lambda _d: False) == daily_audit.DAY_HOLIDAY
     store = CaptureStore(tmp_path / "capture")
     _publish_cohort_decision(store, day, ["005930"])
-    issues = _audit(store, day, _collection_profile(tmp_path, altdata=True), _session_clock(day), _audit_moment(day))
+    issues = _audit(store, day, _collection_profile(tmp_path), _session_clock(day), _audit_moment(day))
     assert not any(issue.startswith("collection:slow_data") for issue in issues)
 
 
@@ -2608,6 +2627,7 @@ def test_run_daily_audit_survives_drain_failure(monkeypatch, caplog) -> None:
     from types import SimpleNamespace
 
     from src.tools import daily_audit
+    monkeypatch.setattr(daily_audit, "audit_collection_manifests", lambda *a, **k: ())
 
     def _boom(**kwargs):
         raise OSError("outbox unreadable")
@@ -2871,6 +2891,7 @@ def test_expiry_warning_escalates_digest() -> None:
 
 def test_run_daily_audit_passes_expiry_report(monkeypatch, tmp_path) -> None:
     from src.tools import daily_audit
+    monkeypatch.setattr(daily_audit, "audit_collection_manifests", lambda *a, **k: ())
     from src.tools.expiry_notices import ExpiryReport
 
     sent: list[tuple[str, str]] = []
@@ -3212,7 +3233,6 @@ def _aftermarket_profile(tmp_path):
 
     return CollectionSettings(
         COLLECTION_ROOT=tmp_path / "capture",
-        COLLECTION_AFTERMARKET_BOOK_ENABLED=True,
         _env_file=None,
     )
 
@@ -4714,6 +4734,7 @@ def test_run_daily_audit_persists_info_lines(monkeypatch, tmp_path) -> None:
     from src.data.capture_contracts import SessionClock
     from src.data.session_calendar import SessionDay, SessionKind
     from src.tools import daily_audit
+    monkeypatch.setattr(daily_audit, "audit_collection_manifests", lambda *a, **k: ())
 
     def _standard(trading_day, **_kwargs):
         return SessionDay(
@@ -6179,6 +6200,7 @@ def test_read_stored_partition_keeps_vendor_and_has_trade_when_stored(monkeypatc
 
 def test_run_daily_audit_archive_failure_does_not_block_ok_day(monkeypatch, tmp_path, caplog) -> None:
     from src.tools import daily_audit
+    monkeypatch.setattr(daily_audit, "audit_collection_manifests", lambda *a, **k: ())
 
     sent: list[tuple[str, str]] = []
 

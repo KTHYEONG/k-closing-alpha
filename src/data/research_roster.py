@@ -390,7 +390,6 @@ def research_extras(
     *,
     available_by: datetime,
     exclude: Collection[str],
-    enabled: bool,
 ) -> tuple[str, ...]:
     """Return roster members not already covered by the primary population, in roster order.
 
@@ -399,13 +398,10 @@ def research_extras(
         roster_date: ISO date whose roster is observed.
         available_by: Aware cutoff of information available to the caller.
         exclude: Symbols the primary population already covers.
-        enabled: Feature flag; False returns without reading the store.
 
     Returns:
-        Extra symbols; empty when disabled, or when the roster is missing or unreadable.
+        Extra symbols; empty when the roster is missing or unreadable.
     """
-    if not enabled:
-        return ()
     try:
         roster = read_research_roster(store, roster_date, available_by=available_by)
     except FileNotFoundError:

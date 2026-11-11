@@ -398,8 +398,6 @@ def test_vps_selectors_form_a_valid_runtime_configuration() -> None:
 
     profile = CollectionSettings(
         _env_file=None,
-        COLLECTION_AUCTION_ENABLED=env["COLLECTION_AUCTION_ENABLED"],
-        COLLECTION_ALTDATA_ENABLED=env["COLLECTION_ALTDATA_ENABLED"],
         COLLECTION_RESEARCH_SLOTS=env["COLLECTION_RESEARCH_SLOTS"],
     )
     research = resolve_research_credentials(env, slots=profile.COLLECTION_RESEARCH_SLOTS)
@@ -409,7 +407,6 @@ def test_vps_selectors_form_a_valid_runtime_configuration() -> None:
         _env_file=None, COLLECTION_ALTDATA_EXTRA_SLOTS=env["COLLECTION_ALTDATA_EXTRA_SLOTS"]
     ).COLLECTION_ALTDATA_EXTRA_SLOTS)
 
-    assert profile.COLLECTION_AUCTION_ENABLED and profile.COLLECTION_ALTDATA_ENABLED
     assert len(research) >= 1
     assert len(shards) >= 2
     assert len(extras) >= 1
@@ -455,13 +452,13 @@ def test_validate_runtime_env_accepts_the_declared_host_configuration(monkeypatc
     validate_runtime_env(_valid_env_text(), _kis_data_text())
 
 
-def test_validate_runtime_env_rejects_silently_disabled_collection() -> None:
+def test_validate_runtime_env_rejects_missing_research_slots() -> None:
     import pytest
 
     from src.tools.provision_env import ProvisioningError, validate_runtime_env
 
-    text = "\n".join(line for line in _valid_env_text().splitlines() if not line.startswith("COLLECTION_ALTDATA_ENABLED")) + "\n"
-    with pytest.raises(ProvisioningError, match="COLLECTION_ALTDATA_ENABLED"):
+    text = "\n".join(line for line in _valid_env_text().splitlines() if not line.startswith("COLLECTION_RESEARCH_SLOTS")) + "\n"
+    with pytest.raises(ProvisioningError, match="KIS slot resolution"):
         validate_runtime_env(text, _kis_data_text())
 
 
@@ -728,12 +725,13 @@ def test_build_runtime_fragment_succeeds_without_mock_keys(tmp_path) -> None:
     assert "KIS_MOCK_" not in fragment
 
 
-def test_vps_selectors_enable_research_roster_and_postclose() -> None:
+def test_selectors_exclude_enable_flags() -> None:
     from src.tools.provision_env import VPS_SELECTORS
 
     selectors = dict(VPS_SELECTORS)
-    assert selectors["COLLECTION_RESEARCH_ROSTER_ENABLED"] == "true"
-    assert selectors["COLLECTION_POSTCLOSE_SNAPSHOT_ENABLED"] == "true"
+    assert not [name for name in selectors if name.endswith("_ENABLED")]
+    assert selectors["KIS_TRADING_ENV"] == "mock"
+    assert "COLLECTION_RESEARCH_SLOTS" in selectors
 
 
 def test_runtime_env_spec_carries_live_order_limits() -> None:

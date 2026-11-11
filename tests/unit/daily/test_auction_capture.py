@@ -44,7 +44,6 @@ def _profile(tmp_path: Path, **overrides: Any):
 
     base: dict[str, Any] = {
         "COLLECTION_ROOT": tmp_path / "capture",
-        "COLLECTION_AUCTION_ENABLED": True,
         "COLLECTION_RESEARCH_SLOTS": ("5",),
         "COLLECTION_AUCTION_INTERVAL_SECONDS": 60,
         "COLLECTION_CONCURRENCY_PER_KEY": 8,
@@ -597,9 +596,6 @@ def test_validation_rejects_bad_inputs(tmp_path) -> None:
         _run(auction_capture.run_auction_capture("2026-09-17", phase="dawn", profile=profile, store=store, clients=[client], session_clock=clock, now_fn=lambda: now))  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="trading_date"):
         _run(auction_capture.run_auction_capture("2026-09-17", phase="close", profile=profile, store=store, clients=[client], session_clock=_clock("2026-09-16"), now_fn=lambda: now))
-    disabled = _profile(tmp_path).model_copy(update={"COLLECTION_AUCTION_ENABLED": False})
-    with pytest.raises(ValueError, match="enabled"):
-        _run(auction_capture.run_auction_capture("2026-09-17", phase="close", profile=disabled, store=store, clients=[client], session_clock=clock, now_fn=lambda: now))
     bare = _profile(tmp_path).model_copy(update={"COLLECTION_RESEARCH_SLOTS": ()})
     with pytest.raises(ValueError, match="research slots"):
         _run(auction_capture.run_auction_capture("2026-09-17", phase="close", profile=bare, store=store, clients=[client], session_clock=clock, now_fn=lambda: now))
@@ -892,16 +888,11 @@ def test_capture_root_and_positions_helpers(tmp_path, monkeypatch) -> None:
 
 
 def test_main_skip_and_success(tmp_path, monkeypatch, caplog) -> None:
-    """CLI skips disabled/holiday and runs configured phases."""
+    """CLI skips holidays and runs configured phases."""
     import logging
 
     from src.daily import auction_capture
 
-    monkeypatch.setattr(auction_capture, "CollectionSettings", lambda: _profile(tmp_path, COLLECTION_AUCTION_ENABLED=False))
-    with caplog.at_level(logging.INFO, logger=auction_capture.logger.name):
-        auction_capture.main(["--phase", "close"])
-    assert any("SKIP" in r.message for r in caplog.records)
-    caplog.clear()
     monkeypatch.setattr(auction_capture, "CollectionSettings", lambda: _profile(tmp_path))
     with caplog.at_level(logging.INFO, logger=auction_capture.logger.name):
         auction_capture.main(["--phase", "close", "--date", "2026-09-20"])
@@ -967,26 +958,16 @@ def test_main_logs_not_complete_detail_for_partial_manifest(tmp_path, monkeypatc
     assert detail and "ORDERBOOK:PARTIAL:vendor_failure" in detail[0] and "029460@15:25:00" in detail[0]
 
 
-def test_module_execution_actually_invokes_main(monkeypatch, caplog) -> None:
-    """실측: 2026-09-21 __main__ 가드 자체가 파일에 없어 `python -m ...`로 실행해도
-    main()이 전혀 호출되지 않고 조용히 성공 종료했다(kca-auction-open/close가 매번
-    "성공"으로 보이면서 실제로는 아무 것도 수집하지 않음). main()을 직접 호출하는
-    테스트만으로는 이 가드 누락을 잡지 못하므로, 모듈을 __main__으로 실행해 확인한다.
-    conftest의 autouse 픽스처가 COLLECTION_AUCTION_ENABLED를 지우므로 main()이 실제로
-    호출됐다면 SKIP 로그가 결정론적으로 찍힌다.
-    """
-    import logging
+def test_module_execution_actually_invokes_main(monkeypatch) -> None:
+    """Running the module as __main__ must reach main(), so a missing __main__ guard fails here."""
     import runpy
     import sys
 
-    monkeypatch.setattr(sys, "argv", ["auction_capture", "--phase", "open"])
+    import pytest
 
-    # __main__으로 재실행되는 코드는 __name__="__main__"이라 별도 logger 인스턴스를
-    # 얻으므로, 특정 logger name이 아니라 루트 레벨로 캡처해야 한다.
-    with caplog.at_level(logging.INFO):
+    monkeypatch.setattr(sys, "argv", ["auction_capture", "--phase", "open", "--date", "bad-date"])
+    with pytest.raises(ValueError, match="Invalid snapshot_date"):
         runpy.run_module("src.daily.auction_capture", run_name="__main__")
-
-    assert any("SKIP" in r.message and "disabled" in r.message for r in caplog.records)
 
 
 def test_run_async_builds_clients(tmp_path, monkeypatch) -> None:
@@ -1223,28 +1204,6 @@ def test_run_async_skips_closed_day_before_broker_session(tmp_path, monkeypatch)
 
     monkeypatch.setattr(auction_capture, "run_auction_capture", _must_not_run)
     assert asyncio.run(auction_capture._run_async("2026-10-09", "close", _profile(tmp_path))) is None
-
-
-def test_run_auction_capture_rejects_disabled_auction(tmp_path) -> None:
-    """A profile without the auction opt-in fails closed before any vendor call."""
-    import pytest
-
-    from src.daily import auction_capture
-
-    store = _store(tmp_path)
-    profile = _profile(tmp_path, COLLECTION_AUCTION_ENABLED=False)
-    clock = _clock("2026-09-17")
-    with pytest.raises(ValueError, match="enabled auction collection"):
-        _run(
-            auction_capture.run_auction_capture(
-                "2026-09-17",
-                phase="close",
-                profile=profile,
-                store=store,
-                clients=[],
-                session_clock=clock,
-            )
-        )
 
 
 def test_audit_and_capture_schedule_identical_rounds() -> None:
@@ -1809,13 +1768,13 @@ def _publish_research_roster(store: Any, trading_date: str, members: list[str], 
     publish_research_roster(store, roster, frame, raw_refs=(), completed_at=completed_at)
 
 
-def _close_run(root: Path, client: Any, *, enabled: bool, state: dict[str, dt.datetime] | None = None) -> tuple[Any, Any]:
+def _close_run(root: Path, client: Any, *, state: dict[str, dt.datetime] | None = None) -> tuple[Any, Any]:
     from src.daily import auction_capture
 
     store = _store(root)
     _publish_cohort(store, "2026-09-17", ["000001", "000002"])
     _publish_research_roster(store, "2026-09-17", ["000003"], completed_at=_seoul(2026, 9, 17, 15, 0))
-    profile = _profile(root, COLLECTION_RESEARCH_ROSTER_ENABLED=enabled)
+    profile = _profile(root)
     clock_state = state if state is not None else {"now": _seoul(2026, 9, 17, 15, 20)}
     manifest = _run(
         auction_capture.run_auction_capture(
@@ -1831,21 +1790,15 @@ def _close_run(root: Path, client: Any, *, enabled: bool, state: dict[str, dt.da
     return store, manifest
 
 
-def test_close_primary_manifest_unchanged_with_extras(tmp_path) -> None:
+def test_close_primary_manifest_with_extras(tmp_path) -> None:
     """Extras never alter the primary manifest and get their own sibling manifest."""
     from src.daily.auction_capture import close_rounds, program_rounds
     from src.data.capture_contracts import CaptureDataset, CaptureStatus
 
-    off_store, off = _close_run(tmp_path / "off", _FakeClient(calls=[]), enabled=False)
-    on_store, on = _close_run(tmp_path / "on", _FakeClient(calls=[]), enabled=True)
+    on_store, on = _close_run(tmp_path / "on", _FakeClient(calls=[]))
 
-    def _shape(manifest: Any) -> list[tuple[str, str, dt.datetime, str]]:
-        return sorted((e.symbol, e.dataset.value, e.scheduled_at, e.status.value) for e in manifest.entries)
-
-    assert _shape(on) == _shape(off)
     assert {e.symbol for e in on.entries} == {"000001", "000002"}
-    assert on.status == off.status == CaptureStatus.COMPLETE
-    assert on.context.cohort_id == off.context.cohort_id
+    assert on.status == CaptureStatus.COMPLETE
     research = [m for m in on_store.read_manifests("2026-09-17") if m.context.capture_reason == "auction-close-research"]
     assert len(research) == 1
     assert {e.symbol for e in research[0].entries} == {"000003"}
@@ -1854,7 +1807,6 @@ def test_close_primary_manifest_unchanged_with_extras(tmp_path) -> None:
         (CaptureDataset.PROGRAM, slot) for slot in program_rounds(clock)
     }
     assert {(e.dataset, e.scheduled_at) for e in research[0].entries} == expected
-    assert not [m for m in off_store.read_manifests("2026-09-17") if m.context.capture_reason.endswith("-research")]
 
 
 def test_close_extras_dispatched_after_cohort(tmp_path) -> None:
@@ -1862,7 +1814,7 @@ def test_close_extras_dispatched_after_cohort(tmp_path) -> None:
     from src.daily.auction_capture import close_rounds, program_rounds
 
     client = _FakeClient(calls=[])
-    _close_run(tmp_path, client, enabled=True)
+    _close_run(tmp_path, client)
 
     rounds = len(close_rounds(_clock("2026-09-17"), 60))
     orderbook = [code for kind, code in client.calls if kind == "orderbook"]
@@ -1893,7 +1845,7 @@ def test_close_deadline_hits_extras_first(tmp_path, monkeypatch) -> None:
                 state["now"] = round_deadline
             return await super().get_orderbook_snapshot(session, code, market_div_code)
 
-    store, manifest = _close_run(tmp_path, _DeadlineClient(calls=[]), enabled=True, state=state)
+    store, manifest = _close_run(tmp_path, _DeadlineClient(calls=[]), state=state)
 
     assert manifest.status == CaptureStatus.COMPLETE
     first_round = [e for e in manifest.entries if e.scheduled_at == round_start]
@@ -1917,7 +1869,7 @@ def test_open_uses_previous_day_roster(tmp_path, monkeypatch) -> None:
     _publish_research_roster(store, "2026-09-16", ["000009"], completed_at=_seoul(2026, 9, 16, 15, 20))
     _publish_research_roster(store, "2026-09-17", ["000008"], completed_at=_seoul(2026, 9, 17, 8, 0))
     monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), True, None))
-    profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=600, COLLECTION_RESEARCH_ROSTER_ENABLED=True)
+    profile = _profile(tmp_path, COLLECTION_OPEN_CONFIRM_SECONDS=600)
     clock = _clock("2026-09-17")
     state = {"now": _seoul(2026, 9, 17, 8, 30)}
 
@@ -1943,20 +1895,6 @@ def test_open_uses_previous_day_roster(tmp_path, monkeypatch) -> None:
     assert len(research) == 1
     assert {e.symbol for e in research[0].entries} == {"000009"}
     assert ("price", "000008") not in client.calls
-
-
-def test_flag_off_no_research_manifest(tmp_path) -> None:
-    """A disabled flag ignores a present roster entirely."""
-    client = _FakeClient(calls=[])
-    store, manifest = _close_run(tmp_path, client, enabled=False)
-
-    assert {code for kind, code in client.calls if kind == "orderbook"} == {"000001", "000002"}
-    assert {code for kind, code in client.calls if kind == "program"} == {"000001", "000002"}
-    assert {e.symbol for e in manifest.entries} == {"000001", "000002"}
-    assert not [m for m in store.read_manifests("2026-09-17") if m.context.capture_reason.endswith("-research")]
-
-
-# --- fair round order, orderbook-first program lane, round observability ---------------------------------
 
 
 def test_estimate_capacity_two_keys() -> None:
@@ -3248,6 +3186,7 @@ def test_input_wait_returns_early_and_rounds_keep_schedule(tmp_path) -> None:
 
     store = _store(tmp_path)
     state, base_sleep = _virtual_clock(_seoul(2026, 9, 17, 15, 20, 20))
+    _publish_research_roster(store, "2026-09-17", ["000003"], completed_at=_seoul(2026, 9, 17, 15, 0))
     polls = {"n": 0}
 
     async def _sleep(seconds: float) -> None:
@@ -3282,7 +3221,7 @@ def test_input_wait_returns_early_and_rounds_keep_schedule(tmp_path) -> None:
     assert min(observed) >= _seoul(2026, 9, 17, 15, 21, 0)
 
 
-def test_research_roster_gates_the_input_wait_when_enabled(tmp_path) -> None:
+def test_research_roster_gates_the_input_wait(tmp_path) -> None:
     from src.daily import auction_capture
 
     store = _store(tmp_path)
@@ -3293,7 +3232,6 @@ def test_research_roster_gates_the_input_wait_when_enabled(tmp_path) -> None:
         auction_capture._await_auction_inputs(
             store,
             "2026-09-17",
-            research_enabled=True,
             deadline=_seoul(2026, 9, 17, 15, 20, 30),
             now_fn=lambda: state["now"],
             sleeper=sleep,
@@ -3391,7 +3329,6 @@ def test_research_gate_opens_when_roster_is_readable(tmp_path, monkeypatch) -> N
         auction_capture._await_auction_inputs(
             store,
             "2026-09-17",
-            research_enabled=True,
             deadline=_seoul(2026, 9, 17, 15, 20, 30),
             now_fn=lambda: state["now"],
             sleeper=sleep,

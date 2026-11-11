@@ -27,17 +27,22 @@ def test_capture_root_follows_configured_data_directory(tmp_path: Path) -> None:
     assert settings.COLLECTION_ROOT is None
 
 
-def test_enabled_auctions_require_research_slots() -> None:
-    """Enabled auctions require declared research slots."""
-    with pytest.raises(ValueError, match="declared research credentials") as exc:
-        CollectionSettings(COLLECTION_AUCTION_ENABLED=True, _env_file=None)
-    assert "DATA_5" not in str(exc.value)
-    owned = CollectionSettings(
-        COLLECTION_AUCTION_ENABLED=True,
-        COLLECTION_RESEARCH_SLOTS=("1", "2"),
-        _env_file=None,
-    )
-    assert owned.COLLECTION_RESEARCH_SLOTS == ("1", "2")
+ROLLOUT_FLAGS = (
+    "COLLECTION_AUCTION_ENABLED",
+    "COLLECTION_ALTDATA_ENABLED",
+    "COLLECTION_PIT_BACKFILL_ENABLED",
+    "COLLECTION_AFTERMARKET_BOOK_ENABLED",
+    "COLLECTION_RESEARCH_ROSTER_ENABLED",
+    "COLLECTION_POSTCLOSE_SNAPSHOT_ENABLED",
+    "DB_AUCTION_PATH_ENABLED",
+)
+
+
+def test_rollout_flags_removed() -> None:
+    fields = CollectionSettings.model_fields
+    assert not any(name in fields for name in ROLLOUT_FLAGS)
+    assert "HISTORY_EVICTION_ENABLED" in fields
+    assert "COLLECTION_PIT_BACKFILL_COMMON_STOCK_ONLY" in fields
 
 
 def test_repair_and_normal_limits_agree() -> None:
@@ -82,8 +87,6 @@ def test_existing_exports_remain_stable() -> None:
     assert settings.COLLECTION_CHART_MAX_PAGES == 30
     for name in (
         "COLLECTION_ROOT",
-        "COLLECTION_AUCTION_ENABLED",
-        "COLLECTION_ALTDATA_ENABLED",
         "COLLECTION_RESEARCH_SLOTS",
         "COLLECTION_AUCTION_INTERVAL_SECONDS",
         "COLLECTION_REQUEST_TIMEOUT_SECONDS",
@@ -166,14 +169,6 @@ def test_stale_raw_env_value_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None
     """A stale COLLECTION_RAW_ENABLED env value cannot break construction."""
     monkeypatch.setenv("COLLECTION_RAW_ENABLED", "false")
     profile = CollectionSettings(_env_file=None)
-    assert profile.COLLECTION_AUCTION_ENABLED is False
-    assert profile.COLLECTION_ALTDATA_ENABLED is False
-
-
-def test_altdata_opt_in_no_longer_depends_on_raw_mode() -> None:
-    """Altdata opt-in succeeds without research slots."""
-    profile = CollectionSettings(COLLECTION_ALTDATA_ENABLED=True, _env_file=None)
-    assert profile.COLLECTION_ALTDATA_ENABLED is True
 
 
 def test_altdata_extra_slots_default_empty() -> None:
@@ -224,7 +219,6 @@ def test_aftermarket_book_defaults_support_evening_capture() -> None:
     """Aftermarket book defaults describe the evening capture contract."""
     profile = CollectionSettings(_env_file=None)
 
-    assert profile.COLLECTION_AFTERMARKET_BOOK_ENABLED is False
     assert profile.COLLECTION_AFTERMARKET_BOOK_SLOTS == ()
     assert profile.COLLECTION_AFTERMARKET_BOOK_DENSE_SECONDS == 60
     assert profile.COLLECTION_AFTERMARKET_BOOK_FLUSH_ROUNDS == 15
@@ -295,7 +289,6 @@ def test_stale_toss_backfill_env_key_is_ignored(monkeypatch: pytest.MonkeyPatch)
 def test_collection_pit_backfill_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default PIT backfill stream values load without error."""
     for key in (
-        "COLLECTION_PIT_BACKFILL_ENABLED",
         "COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO",
         "COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO",
         "COLLECTION_PIT_BACKFILL_MIN_TRADE_VALUE_100M",
@@ -305,13 +298,12 @@ def test_collection_pit_backfill_defaults(monkeypatch: pytest.MonkeyPatch) -> No
         monkeypatch.delenv(key, raising=False)
     profile = CollectionSettings(_env_file=None)
     assert (
-        profile.COLLECTION_PIT_BACKFILL_ENABLED,
         profile.COLLECTION_PIT_BACKFILL_MIN_CHANGE_RATIO,
         profile.COLLECTION_PIT_BACKFILL_MAX_CHANGE_RATIO,
         profile.COLLECTION_PIT_BACKFILL_MIN_TRADE_VALUE_100M,
         profile.COLLECTION_PIT_BACKFILL_MIN_MARKET_CAP_100M,
         profile.COLLECTION_PIT_BACKFILL_COMMON_STOCK_ONLY,
-    ) == (True, -1.0, 1.0, 100.0, 495.0, False)
+    ) == ( -1.0, 1.0, 100.0, 495.0, False)
 
 
 def test_collection_pit_backfill_rejects_empty_band() -> None:
@@ -333,7 +325,6 @@ def test_collection_pit_backfill_rejects_nan_threshold() -> None:
 def test_roster_defaults_off() -> None:
     profile = CollectionSettings(_env_file=None)
 
-    assert profile.COLLECTION_RESEARCH_ROSTER_ENABLED is False
     assert profile.COLLECTION_RESEARCH_ROSTER_MIN_TRADE_VALUE_100M == 100.0
     assert profile.COLLECTION_RESEARCH_ROSTER_MIN_MARKET_CAP_100M == 500.0
     assert profile.COLLECTION_RESEARCH_ROSTER_MAX_PAGES == 6
@@ -356,7 +347,6 @@ def test_roster_bounds_validated(overrides: dict[str, int]) -> None:
 def test_postclose_snapshot_defaults_off() -> None:
     profile = CollectionSettings(_env_file=None)
 
-    assert profile.COLLECTION_POSTCLOSE_SNAPSHOT_ENABLED is False
     assert profile.COLLECTION_POSTCLOSE_SNAPSHOT_DEADLINE_HHMMSS == "153900"
     assert profile.COLLECTION_POSTCLOSE_SNAPSHOT_CONCURRENCY == 4
 
@@ -379,7 +369,7 @@ def test_handoff_slots_parse_and_validate() -> None:
     """Handoff slots accept the shared spellings; empty means off; malformed lists are rejected."""
     from src.config.collection import CollectionSettings
 
-    base = {"COLLECTION_AUCTION_ENABLED": True, "COLLECTION_RESEARCH_SLOTS": ("3", "4"), "_env_file": None}
+    base = {"COLLECTION_RESEARCH_SLOTS": ("3", "4"), "_env_file": None}
     for raw, expected in (("5", ("5",)), ("[5]", ("5",)), ("", ())):
         parsed = CollectionSettings(COLLECTION_AUCTION_HANDOFF_SLOTS=raw, **base).COLLECTION_AUCTION_HANDOFF_SLOTS
         assert parsed == expected
@@ -394,16 +384,9 @@ def test_handoff_disjoint_from_research() -> None:
 
     with pytest.raises(ValueError, match="disjoint"):
         CollectionSettings(
-            COLLECTION_AUCTION_ENABLED=True,
             COLLECTION_RESEARCH_SLOTS=("3", "4"),
             COLLECTION_AUCTION_HANDOFF_SLOTS=("4",),
             _env_file=None,
         )
 
-
-def test_handoff_requires_auction_enabled() -> None:
-    from src.config.collection import CollectionSettings
-
-    with pytest.raises(ValueError, match="enabled auction"):
-        CollectionSettings(COLLECTION_AUCTION_HANDOFF_SLOTS=("5",), _env_file=None)
 

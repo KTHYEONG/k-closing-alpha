@@ -11,42 +11,9 @@ def _profile(tmp_path: Path, **overrides: Any):
 
     base: dict[str, Any] = {
         "COLLECTION_ROOT": tmp_path / "capture",
-        "COLLECTION_ALTDATA_ENABLED": True,
     }
     base.update(overrides)
     return CollectionSettings(**base)
-
-
-def test_main_returns_zero_when_disabled_not_a_failure(tmp_path, monkeypatch, caplog) -> None:
-    """실측 회귀: disabled 스킵 경로가 exit code 2(실패)를 반환해 systemd가 이를 진짜
-    실패로 취급, OnFailure 얼러트 이메일을 발송하던 버그(2026-09-18 kca-altdata-capture
-    실측). 같은 패턴의 auction_capture.main()은 이미 성공(0/None)으로 처리한다."""
-    import logging
-
-    from src.daily import altdata_capture
-
-    monkeypatch.setattr(altdata_capture, "CollectionSettings", lambda: _profile(tmp_path, COLLECTION_ALTDATA_ENABLED=False))
-    with caplog.at_level(logging.INFO, logger=altdata_capture.logger.name):
-        rc = altdata_capture.main([])
-
-    assert rc == 0
-    assert any("SKIP" in r.message for r in caplog.records)
-
-
-def test_main_returns_zero_when_altdata_disabled(tmp_path, monkeypatch, caplog) -> None:
-    import logging
-
-    from src.daily import altdata_capture
-
-    monkeypatch.setattr(
-        altdata_capture, "CollectionSettings",
-        lambda: _profile(tmp_path, COLLECTION_ALTDATA_ENABLED=False),
-    )
-    with caplog.at_level(logging.INFO, logger=altdata_capture.logger.name):
-        rc = altdata_capture.main([])
-
-    assert rc == 0
-    assert any("SKIP" in r.message for r in caplog.records)
 
 
 def test_main_rejects_invalid_date(tmp_path, monkeypatch) -> None:
@@ -647,22 +614,6 @@ def test_main_real_source_failure_still_fails(tmp_path, monkeypatch) -> None:
     altdata_capture, _calls = _harness_main(monkeypatch, tmp_path, manifest)
     rc = altdata_capture.main(["--date", "2026-09-18"], trading_day_fn=lambda _d: True)
     assert rc == 1
-
-
-def test_main_disabled_profile_stays_first(tmp_path, monkeypatch, caplog) -> None:
-    """Disabled profile stays first."""
-    import logging
-
-    from src.daily import altdata_capture
-
-    def _boom_oracle(_d: str) -> bool:
-        raise AssertionError("oracle must not be called when disabled")
-
-    monkeypatch.setattr(altdata_capture, "CollectionSettings", lambda: _profile(tmp_path, COLLECTION_ALTDATA_ENABLED=False))
-    with caplog.at_level(logging.INFO, logger=altdata_capture.logger.name):
-        rc = altdata_capture.main(["--date", "2026-09-24"], trading_day_fn=_boom_oracle)
-    assert rc == 0
-    assert "reason=disabled" in caplog.text
 
 
 def test_run_altdata_capture_universe_includes_new_listings(tmp_path, monkeypatch) -> None:

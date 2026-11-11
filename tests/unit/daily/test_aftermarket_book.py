@@ -655,7 +655,7 @@ def test_run_async_skips_non_trading_days(tmp_path: Path, monkeypatch: Any) -> N
 
 
 def test_main_skips_cleanly(tmp_path: Path, monkeypatch: Any) -> None:
-    """Disabled or non-standard days skip cleanly."""
+    """Non-standard days skip cleanly before any client is built."""
     import src.daily.aftermarket_book as book
     from src.data.capture_contracts import SessionClock
 
@@ -666,7 +666,6 @@ def test_main_skips_cleanly(tmp_path: Path, monkeypatch: Any) -> None:
     monkeypatch.setattr("src.api.kis.client.KisApiClient", _ExplodingClient)
 
     monkeypatch.setattr(book, "CollectionSettings", lambda *args: _profile(tmp_path))
-    book.main(["--date", "2026-09-29"])
 
     shifted = SessionClock(
         trading_date=dt.date(2026, 9, 29),
@@ -677,7 +676,6 @@ def test_main_skips_cleanly(tmp_path: Path, monkeypatch: Any) -> None:
     )
     enabled = _profile(
         tmp_path,
-        COLLECTION_AFTERMARKET_BOOK_ENABLED=True,
         COLLECTION_AFTERMARKET_BOOK_SLOTS=("2", "3"),
         COLLECTION_SESSION_OVERRIDES={"2026-09-29": shifted},
     )
@@ -692,7 +690,7 @@ def test_main_rejects_invalid_dates(tmp_path: Path, monkeypatch: Any) -> None:
 
     import src.daily.aftermarket_book as book
 
-    enabled = _profile(tmp_path, COLLECTION_AFTERMARKET_BOOK_ENABLED=True)
+    enabled = _profile(tmp_path)
     monkeypatch.setattr(book, "CollectionSettings", lambda *args: enabled)
 
     with pytest.raises(ValueError, match="Invalid snapshot_date"):
@@ -704,7 +702,7 @@ def test_main_skips_closed_sessions(tmp_path: Path, monkeypatch: Any) -> None:
     import src.daily.aftermarket_book as book
     from src.data.session_calendar import SessionDay, SessionKind
 
-    enabled = _profile(tmp_path, COLLECTION_AFTERMARKET_BOOK_ENABLED=True)
+    enabled = _profile(tmp_path)
     monkeypatch.setattr(book, "CollectionSettings", lambda *args: enabled)
     monkeypatch.setattr(
         book,
@@ -722,7 +720,7 @@ def test_main_reports_unverified_trading_days(tmp_path: Path, monkeypatch: Any) 
     from src.data.session_calendar import SessionDay, SessionKind
 
     day = dt.date(2026, 9, 29)
-    enabled = _profile(tmp_path, COLLECTION_AFTERMARKET_BOOK_ENABLED=True)
+    enabled = _profile(tmp_path)
     monkeypatch.setattr(book, "CollectionSettings", lambda *args: enabled)
     monkeypatch.setattr(
         book,
@@ -745,7 +743,7 @@ def test_main_logs_final_summary(tmp_path: Path, monkeypatch: Any) -> None:
     from src.data.capture_contracts import SessionClock
     from src.data.session_calendar import SessionDay, SessionKind
 
-    enabled = _profile(tmp_path, COLLECTION_AFTERMARKET_BOOK_ENABLED=True)
+    enabled = _profile(tmp_path)
     monkeypatch.setattr(book, "CollectionSettings", lambda *args: enabled)
     monkeypatch.setattr(
         book,

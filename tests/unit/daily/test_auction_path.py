@@ -68,7 +68,6 @@ class _FakeClient:
 
 def _live_settings(monkeypatch: Any, tmp_path: Path, **overrides: Any) -> None:
     values: dict[str, Any] = {
-        "DB_AUCTION_PATH_ENABLED": True,
         "DB_APP_KEY": "test-key",
         "DB_AUCTION_PATH_MAX_PAGES": 60,
         "DB_AUCTION_PATH_DEADLINE_HHMMSS": "190000",
@@ -147,14 +146,11 @@ def _run(monkeypatch: Any, tmp_path: Path, client: _FakeClient, symbols: list[st
     return asyncio.run(manifest)
 
 
-def test_auction_path_skips_when_disabled_or_without_key(tmp_path, monkeypatch) -> None:
-    _live_settings(monkeypatch, tmp_path, DB_AUCTION_PATH_ENABLED=False)
+def test_auction_path_skips_without_key(tmp_path, monkeypatch) -> None:
+    _live_settings(monkeypatch, tmp_path)
     _standard_day(monkeypatch)
     recorded = _recorded(monkeypatch)
     monkeypatch.setattr(auction_path, "_run_async", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no run")))
-
-    auction_path.main(["--date", DATE])
-    assert recorded and recorded[0][1] == "SKIPPED" and recorded[0][2]["reason"] == "disabled"
 
     _live_settings(monkeypatch, tmp_path, DB_APP_KEY="")
     recorded.clear()
@@ -546,7 +542,7 @@ def test_path_extras_in_partition_and_sibling_manifest(tmp_path, monkeypatch) ->
     manifest = asyncio.run(
         auction_path.run_auction_path_capture(
             snapshot_date=DATE,
-            profile=CollectionSettings(COLLECTION_RESEARCH_ROSTER_ENABLED=True),
+            profile=CollectionSettings(),
             client=client,  # type: ignore[arg-type]
             session=object(),
             store=store,

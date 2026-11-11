@@ -584,20 +584,11 @@ def _coverage(symbol: str | None, *, status: CaptureStatus = CaptureStatus.COMPL
     )
 
 
-class _ExplodingStore:
-    def read_manifests(self, snapshot_date: str) -> tuple[()]:
-        raise AssertionError("disabled extras must not read the store")
-
-
-def test_extras_disabled_no_read() -> None:
-    assert research_extras(_ExplodingStore(), "2026-11-04", available_by=COMPLETED, exclude=frozenset(), enabled=False) == ()  # type: ignore[arg-type]
-
-
 def test_extras_missing_roster_warns_empty(tmp_path: Path, caplog: Any) -> None:
     store = CaptureStore(tmp_path / "capture")
 
     with caplog.at_level(logging.WARNING, logger="src.data.research_roster"):
-        extras = research_extras(store, "2026-11-04", available_by=COMPLETED, exclude=frozenset(), enabled=True)
+        extras = research_extras(store, "2026-11-04", available_by=COMPLETED, exclude=frozenset())
 
     assert extras == ()
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
@@ -615,7 +606,6 @@ def test_extras_unreadable_evidence_warns_empty(tmp_path: Path, caplog: Any) -> 
             "2026-11-04",
             available_by=COMPLETED + timedelta(minutes=1),
             exclude=frozenset(),
-            enabled=True,
         )
 
     assert extras == ()
@@ -633,10 +623,15 @@ def test_extras_exclude_preserves_roster_order(tmp_path: Path) -> None:
         "2026-11-04",
         available_by=COMPLETED + timedelta(minutes=1),
         exclude={"000002"},
-        enabled=True,
     )
 
     assert extras == ("000001", "000003", "000004")
+
+
+def test_extras_signature_has_no_enabled_parameter() -> None:
+    import inspect
+
+    assert "enabled" not in inspect.signature(research_extras).parameters
 
 
 def test_split_keeps_symbolless_in_primary() -> None:

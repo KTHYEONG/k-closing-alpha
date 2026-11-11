@@ -294,12 +294,10 @@ async def run_postclose_snapshot(
         The published coverage manifest.
 
     Raises:
-        ValueError: Snapshot disabled, date mismatch, or observation before close plus one minute.
+        ValueError: Date mismatch, or observation before close plus one minute.
         FileExistsError: A snapshot partition for this date already exists; no request is sent.
         OSError: Raw or partition persistence failed.
     """
-    if not profile.COLLECTION_POSTCLOSE_SNAPSHOT_ENABLED:
-        raise ValueError("postclose snapshot disabled")
     if session_clock.trading_date.isoformat() != snapshot_date:
         raise ValueError("session clock date must equal snapshot_date")
     clock = now_fn or _now
@@ -324,7 +322,6 @@ async def run_postclose_snapshot(
         snapshot_date,
         available_by=observed,
         exclude=set(cohort),
-        enabled=profile.COLLECTION_RESEARCH_ROSTER_ENABLED,
     )
     targets = [(symbol, _COHORT) for symbol in cohort] + [(symbol, _RESEARCH) for symbol in extras]
     run_id = f"postclose-{snapshot_date}-{uuid.uuid4().hex[:8]}"
@@ -492,9 +489,6 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     profile = CollectionSettings()
     snapshot_date = args.date or _now().date().isoformat()
-    if not profile.COLLECTION_POSTCLOSE_SNAPSHOT_ENABLED:
-        _skip(snapshot_date, "disabled")
-        return
     session_day = resolve_session_day(date.fromisoformat(snapshot_date), overrides=profile.COLLECTION_SESSION_OVERRIDES)
     if session_day.kind is SessionKind.CLOSED:
         _skip(snapshot_date, "non_trading_day")

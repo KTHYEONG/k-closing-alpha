@@ -1464,9 +1464,6 @@ def main() -> None:  # pragma: no cover - CLI entry; credential/client wiring, l
         run_extended = str(args.sessions) in ("all", "extended")
         run_regular = str(args.sessions) in ("all", "regular")
         regular_plan: RegularBackfillPlan | None = None
-        if not profile.COLLECTION_PIT_BACKFILL_ENABLED:
-            logger.info("[DATA] stage=regular_backfill status=SKIP reason=disabled")
-            run_regular = False
         if run_regular:
             wide_columns = sorted(REQUIRED_SOURCE_COLUMNS | {"close_raw", "market"})
             wide_start = (as_of - timedelta(days=retention + int(MAX_PREV_TRADING_DAY_LOOKBACK))).isoformat()

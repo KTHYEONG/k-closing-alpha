@@ -140,12 +140,10 @@ async def run_research_roster(
         The published roster.
 
     Raises:
-        ValueError: Roster disabled, date mismatch, or observation outside the pre-auction window.
+        ValueError: Date mismatch, or observation outside the pre-auction window.
         RuntimeError: The ranking is unavailable and was not truncated; nothing is published.
         RawCaptureError: Raw page persistence failed.
     """
-    if not profile.COLLECTION_RESEARCH_ROSTER_ENABLED:
-        raise ValueError("research roster disabled")
     if session_clock.trading_date.isoformat() != snapshot_date:
         raise ValueError("session clock date must equal snapshot_date")
     clock = now_fn or _now
@@ -288,9 +286,6 @@ def main(argv: list[str] | None = None) -> None:
     profile = CollectionSettings()
     snapshot_date = args.date or _now().date().isoformat()
     trading_day = date.fromisoformat(snapshot_date)
-    if not profile.COLLECTION_RESEARCH_ROSTER_ENABLED:
-        _skip(snapshot_date, "disabled")
-        return
     session_day = resolve_session_day(trading_day, overrides=profile.COLLECTION_SESSION_OVERRIDES)
     if session_day.kind is SessionKind.CLOSED:
         _skip(snapshot_date, "non_trading_day")

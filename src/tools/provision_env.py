@@ -75,27 +75,20 @@ RUNTIME_ENV_SPEC: tuple[RuntimeEnvKey, ...] = (
     RuntimeEnvKey(target="OPENDART_API_KEY_2", sources=("OPENDART_API_KEY_2",), optional=True),
 )
 
-# VPS 전용 선택자. 워크스테이션 SSOT(~/.quant.env)에는 없고 호스트 운영 배선에만 의미가 있어
-# 코드가 단일 원천이다. VPS 파일에 손으로만 적어 두면 재프로비저닝이 조용히 지워
-# 수집 잡이 `disabled`로 침묵 종료한다(실측: 2026-09-24 auction/altdata 비활성화).
-# 값은 쉼표 목록으로 쓴다: docker --env-file은 따옴표를 그대로 넘기고 systemd
-# EnvironmentFile은 벗기므로 JSON 표기는 로더마다 다르게 읽힌다.
+# VPS-only slot selectors. The workstation SSOT (~/.quant.env) does not carry them; the code is their
+# single source, so re-provisioning regenerates them instead of relying on hand-written VPS lines.
+# Values are comma lists: docker --env-file keeps quotes while systemd EnvironmentFile strips them,
+# so JSON notation is read differently by each loader.
 #
 # Slot assignment SSOT: deploy/shared/kis_slot_assignments.toml (vendored from krx-alpha); tests enforce parity.
 VPS_SELECTORS: tuple[tuple[str, str], ...] = (
     ("KIS_TRADING_ENV", "mock"),
     ("KIS_DECISION_SHARD_SLOTS", "1,5"),
-    ("COLLECTION_AUCTION_ENABLED", "true"),
-    ("COLLECTION_ALTDATA_ENABLED", "true"),
     ("COLLECTION_RESEARCH_SLOTS", "3,4"),
     ("COLLECTION_AUCTION_HANDOFF_SLOTS", "5"),
     ("COLLECTION_ALTDATA_EXTRA_SLOTS", "2,3"),
     ("COLLECTION_BACKFILL_SLOTS", "2,3"),
-    ("COLLECTION_AFTERMARKET_BOOK_ENABLED", "true"),
     ("COLLECTION_AFTERMARKET_BOOK_SLOTS", "2,3"),
-    ("DB_AUCTION_PATH_ENABLED", "true"),
-    ("COLLECTION_RESEARCH_ROSTER_ENABLED", "true"),
-    ("COLLECTION_POSTCLOSE_SNAPSHOT_ENABLED", "true"),
 )
 
 # Slot assignment SSOT: deploy/shared/kis_slot_assignments.toml (vendored from krx-alpha); tests enforce parity.
@@ -343,23 +336,18 @@ def validate_runtime_env(env_text: str, kis_data_text: str) -> None:
     except ValidationError as exc:
         fields = ",".join(".".join(str(p) for p in err["loc"]) or err["msg"] for err in exc.errors())
         raise ProvisioningError(f"collection settings invalid: {fields}") from None
-    declared = dict(VPS_SELECTORS)
-    for flag in ("COLLECTION_AUCTION_ENABLED", "COLLECTION_ALTDATA_ENABLED"):
-        if flag in declared and bool(getattr(profile, flag)) != (declared[flag].lower() == "true"):
-            raise ProvisioningError(f"{flag} does not resolve to its declared value")
     try:
         resolve_host_issued_credentials(env)
         resolve_decision_shard_credentials(env)
-        if profile.COLLECTION_AUCTION_ENABLED:
-            resolve_research_credentials(env, slots=tuple(profile.COLLECTION_RESEARCH_SLOTS))
+        resolve_research_credentials(env, slots=tuple(profile.COLLECTION_RESEARCH_SLOTS))
         if profile.COLLECTION_ALTDATA_EXTRA_SLOTS:
             resolve_research_credentials(env, slots=tuple(profile.COLLECTION_ALTDATA_EXTRA_SLOTS))
     except ValueError as exc:
         raise ProvisioningError(f"KIS slot resolution fails: {exc}") from None
-    if profile.COLLECTION_ALTDATA_ENABLED and resolve_dart_key_pool(
+    if resolve_dart_key_pool(
         primary=env.get("OPENDART_API_KEY", ""), secondary=env.get("OPENDART_API_KEY_2", "")
     ).is_empty():
-        raise ProvisioningError("altdata enabled without any OpenDART key")
+        raise ProvisioningError("altdata requires at least one OpenDART key")
 
 
 def diff_env_names(before_text: str, after_text: str) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:

@@ -99,11 +99,9 @@ def run_altdata_capture(trading_date: date, *, profile: CollectionSettings, stor
     Returns:
         Aggregate manifest reconciling each configured source.
     Raises:
-        ValueError: Disabled profile or mismatched rolling bounds.
+        ValueError: Mismatched rolling bounds.
         RawCaptureError: Durable output failed.
     """
-    if not bool(profile.COLLECTION_ALTDATA_ENABLED):
-        raise ValueError("altdata capture requires enabled altdata collection")
     lookback = int(profile.COLLECTION_ALTDATA_LOOKBACK_DAYS)
     window_start, window_end = _rolling_bounds(trading_date, lookback)
     if pd.Timestamp(cfg.start).normalize() != window_start or pd.Timestamp(cfg.end).normalize() != window_end:
@@ -156,9 +154,6 @@ def main(argv: Sequence[str] | None = None, *, trading_day_fn: Callable[[str], b
     except ValueError:
         raise ValueError(f"Invalid date: {args.date!r}") from None
     profile = CollectionSettings()
-    if not bool(profile.COLLECTION_ALTDATA_ENABLED):
-        logger.info("[DATA] stage=altdata_capture status=SKIP reason=disabled")
-        return 0
     if trading_day.weekday() >= 5:
         logger.info("[DATA] stage=altdata_capture status=SKIP reason=weekend date=%s", trading_day.isoformat())
         return 0

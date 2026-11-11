@@ -36,7 +36,7 @@ def _clock() -> SessionClock:
 
 
 def _profile(tmp_path: Path, **overrides: Any) -> CollectionSettings:
-    base: dict[str, Any] = {"COLLECTION_ROOT": tmp_path / "capture", "COLLECTION_RESEARCH_ROSTER_ENABLED": True}
+    base: dict[str, Any] = {"COLLECTION_ROOT": tmp_path / "capture"}
     base.update(overrides)
     return CollectionSettings(**base)
 
@@ -157,13 +157,6 @@ def test_run_ranking_unavailable_publishes_nothing(tmp_path: Path) -> None:
     assert store.read_manifests(DATE) == ()
 
 
-def test_run_disabled_raises(tmp_path: Path) -> None:
-    kiwoom = _FakeKiwoom([[_row("005930", "50000")]])
-
-    with pytest.raises(ValueError, match="research roster disabled"):
-        _run(tmp_path, kiwoom, profile=CollectionSettings(COLLECTION_ROOT=tmp_path / "capture"))
-
-
 def test_shares_from_prev_day_only(tmp_path: Path) -> None:
     panel = tmp_path / "price_history.parquet"
     pd.DataFrame(
@@ -195,20 +188,6 @@ def test_latest_panel_date_before_stale(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="stale price_history"):
         roster_capture.latest_panel_date_before(DECISION, path=panel)
-
-
-def test_main_disabled_records_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("COLLECTION_RESEARCH_ROSTER_ENABLED", raising=False)
-    calls: list[tuple[str, str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        roster_capture,
-        "record_run_outcome",
-        lambda job, outcome, **kw: calls.append((job, outcome, kw)) or {},
-    )
-
-    roster_capture.main(["--date", DATE])
-
-    assert calls == [("research_roster", RUN_OUTCOME_SKIPPED, {"run_date": DATE, "reason": "disabled"})]
 
 
 def test_now_is_kst_aware() -> None:
@@ -263,7 +242,7 @@ def _main_fakes(
     truncated: bool = False,
     stale: bool = False,
 ) -> list[tuple[str, str, dict[str, Any]]]:
-    profile = _profile(tmp_path, COLLECTION_RESEARCH_ROSTER_ENABLED=True)
+    profile = _profile(tmp_path)
     calls: list[tuple[str, str, dict[str, Any]]] = []
     if pages is None:
         pages = [[_row("005930", "50000")], [_row("000660", "20000", "+90000")]]

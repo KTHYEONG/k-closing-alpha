@@ -114,7 +114,7 @@ def _history(monkeypatch: Any, tmp_path: Path) -> Path:
 
 
 def _profile(**overrides: Any) -> CollectionSettings:
-    values: dict[str, Any] = {"COLLECTION_POSTCLOSE_SNAPSHOT_ENABLED": True}
+    values: dict[str, Any] = {}
     values.update(overrides)
     return CollectionSettings(_env_file=None, **values)
 
@@ -263,7 +263,7 @@ def test_run_population_cohort_then_extras(tmp_path: Path) -> None:
     manifest = asyncio.run(
         run_postclose_snapshot(
             DATE,
-            profile=_profile(COLLECTION_RESEARCH_ROSTER_ENABLED=True),
+            profile=_profile(),
             store=store,
             client=client,
             session_clock=_session_clock(),
@@ -312,7 +312,7 @@ def test_run_deadline_marks_undispatched_partial(tmp_path: Path) -> None:
     manifest = asyncio.run(
         run_postclose_snapshot(
             DATE,
-            profile=_profile(COLLECTION_RESEARCH_ROSTER_ENABLED=True, COLLECTION_POSTCLOSE_SNAPSHOT_CONCURRENCY=1),
+            profile=_profile(COLLECTION_POSTCLOSE_SNAPSHOT_CONCURRENCY=1),
             store=store,
             client=client,
             session_clock=_session_clock(),
@@ -405,35 +405,10 @@ def test_run_refuses_second_capture_before_any_request(tmp_path: Path) -> None:
     assert client.tick_calls == []
 
 
-def test_main_disabled_skips(monkeypatch: Any) -> None:
-    recorded: list[tuple[str, str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        postclose_snapshot,
-        "record_run_outcome",
-        lambda job, outcome, **kwargs: recorded.append((job, outcome, kwargs)),
-    )
-    monkeypatch.setattr(postclose_snapshot, "CollectionSettings", lambda: CollectionSettings(_env_file=None))
-
-    postclose_snapshot.main(["--date", DATE])
-
-    assert recorded == [("postclose_snapshot", RUN_OUTCOME_SKIPPED, {"run_date": DATE, "reason": "disabled"})]
-
-
-def test_run_guards_disabled_and_clock_date_mismatch(tmp_path: Path) -> None:
+def test_run_guards_clock_date_mismatch(tmp_path: Path) -> None:
     store = CaptureStore(tmp_path / "capture")
     client = _FakeKis(ticks={})
 
-    with pytest.raises(ValueError, match="postclose snapshot disabled"):
-        asyncio.run(
-            run_postclose_snapshot(
-                DATE,
-                profile=CollectionSettings(_env_file=None),
-                store=store,
-                client=client,
-                session_clock=_session_clock(),
-                now_fn=_Clock(READY_NOW),
-            )
-        )
     with pytest.raises(ValueError, match="session clock date must equal snapshot_date"):
         asyncio.run(
             run_postclose_snapshot(
@@ -493,7 +468,7 @@ def test_run_failure_modes_for_ticks_investors_and_empty_estimates(tmp_path: Pat
     manifest = asyncio.run(
         run_postclose_snapshot(
             DATE,
-            profile=_profile(COLLECTION_RESEARCH_ROSTER_ENABLED=True),
+            profile=_profile(),
             store=store,
             client=client,
             session_clock=_session_clock(),
@@ -605,18 +580,4 @@ def test_main_oracle_failure_records_degraded(monkeypatch: Any) -> None:
 
     assert [outcome for _, outcome, _ in recorded] == [RUN_OUTCOME_DEGRADED]
 
-
-def test_main_disabled_without_date_uses_wall_clock(monkeypatch: Any) -> None:
-    recorded: list[tuple[str, str, dict[str, Any]]] = []
-    monkeypatch.setattr(postclose_snapshot, "CollectionSettings", lambda: CollectionSettings(_env_file=None))
-    monkeypatch.setattr(
-        postclose_snapshot,
-        "record_run_outcome",
-        lambda job, outcome, **kwargs: recorded.append((job, outcome, kwargs)),
-    )
-
-    postclose_snapshot.main([])
-
-    today = datetime.now(SEOUL).date().isoformat()
-    assert recorded == [("postclose_snapshot", RUN_OUTCOME_SKIPPED, {"run_date": today, "reason": "disabled"})]
 
