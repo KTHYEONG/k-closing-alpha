@@ -1,0 +1,9 @@
+# Config toggle registry enforced by tests/unit/test_flag_policy.py. Rules: .agents/rules/config-flags.md
+
+[[flag]]
+name = "HISTORY_EVICTION_ENABLED"
+kind = "safety_interlock"
+default = true
+reason = "Gates irreversible local history deletion; the only way to stop it without a deploy."
+exit_condition = ""
+review_by = ""
