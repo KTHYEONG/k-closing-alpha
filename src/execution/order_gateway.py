@@ -38,9 +38,25 @@ __all__ = [
     "OrderGateway",
     "PlannedSkip",
     "ReconcileReport",
+    "resend_enabled",
 ]
 
 logger = logging.getLogger(__name__)
+
+ENTRY_RESEND_SETTLE_SECONDS: float = 5.0
+ENTRY_RESEND_MARGIN_SECONDS: float = 60.0
+# Duplicate-BUY risk on the real account: flip only in a reviewed commit, after the mock
+# observation record (5 sessions, zero duplicate_suspect). Deliberately not an env var or setting.
+LIVE_RESEND_ENABLED: bool = False
+
+
+def resend_enabled(env: str) -> bool:
+    """Recovery resend is automatic in mock and gated by a code constant in live; any other env stays off."""
+    if env == "mock":
+        return True
+    if env == "live":
+        return LIVE_RESEND_ENABLED
+    return False
 
 
 class BrokerPort(Protocol):
@@ -65,8 +81,8 @@ class GatewayLimits:
     exit_resend_on_ambiguous: bool
     carryover_lookback_days: int = 5
     entry_resend_on_not_found: bool = False
-    entry_resend_settle_seconds: float = 0.0
-    entry_resend_margin_seconds: float = 60.0
+    entry_resend_settle_seconds: float = ENTRY_RESEND_SETTLE_SECONDS
+    entry_resend_margin_seconds: float = ENTRY_RESEND_MARGIN_SECONDS
 
 
 @dataclass(frozen=True)

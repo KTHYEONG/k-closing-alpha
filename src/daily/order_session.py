@@ -49,7 +49,14 @@ from src.execution.order_contract import (
     exit_intent_id,
     size_entry_orders,
 )
-from src.execution.order_gateway import BrokerPort, GatewayLimits, OrderGateway, PlannedSkip, ReconcileReport
+from src.execution.order_gateway import (
+    BrokerPort,
+    GatewayLimits,
+    OrderGateway,
+    PlannedSkip,
+    ReconcileReport,
+    resend_enabled,
+)
 from src.execution.order_journal import IntentState, IntentStatus, OpenLot, OrderJournal
 from src.strategy.store import StrategyStoreError, require_production_store
 from src.tools.run_outcome import (
@@ -116,7 +123,8 @@ def _gateway_now(now_fn: Callable[[], pd.Timestamp]) -> Callable[[], datetime]:
     return lambda: now_fn().to_pydatetime()
 
 
-def _limits_from_settings() -> GatewayLimits:
+def _limits_from_settings(env: str) -> GatewayLimits:
+    allow_resend = resend_enabled(env)
     return GatewayLimits(
         seed_capital_krw=settings.ORDER_SEED_CAPITAL,
         max_notional_per_order_krw=settings.ORDER_MAX_NOTIONAL_PER_ORDER_KRW,
@@ -124,10 +132,8 @@ def _limits_from_settings() -> GatewayLimits:
         send_max_attempts=settings.ORDER_SEND_MAX_ATTEMPTS,
         unknown_resolve_polls=settings.ORDER_UNKNOWN_RESOLVE_POLLS,
         unknown_resolve_interval_seconds=settings.ORDER_UNKNOWN_RESOLVE_INTERVAL_SECONDS,
-        exit_resend_on_ambiguous=settings.ORDER_EXIT_RESEND_ON_AMBIGUOUS,
-        entry_resend_on_not_found=settings.ORDER_ENTRY_RESEND_ON_NOT_FOUND,
-        entry_resend_settle_seconds=settings.ORDER_ENTRY_RESEND_SETTLE_SECONDS,
-        entry_resend_margin_seconds=settings.ORDER_ENTRY_RESEND_MARGIN_SECONDS,
+        exit_resend_on_ambiguous=allow_resend,
+        entry_resend_on_not_found=allow_resend,
         carryover_lookback_days=settings.ORDER_UNKNOWN_CARRYOVER_LOOKBACK_DAYS,
     )
 
@@ -306,7 +312,7 @@ async def _run_entry(
         return OrderSessionReport("entry", date_str, RUN_OUTCOME_SKIPPED, "before_window", {"env": env})
     if _hhmmss(now) >= ORDER_ENTRY_SUBMIT_DEADLINE_HHMMSS:
         return OrderSessionReport("entry", date_str, RUN_OUTCOME_DEGRADED, "entry_window_expired", {"env": env})
-    gateway = OrderGateway(broker, journal, _limits_from_settings(), run_id=run_id,
+    gateway = OrderGateway(broker, journal, _limits_from_settings(env), run_id=run_id,
                            now_fn=_gateway_now(now_fn), sleep_fn=sleep_fn)
     with journal.exclusive():
         if _has_entry_history(journal, date_str):
@@ -514,7 +520,7 @@ async def _run_exit(
     env: str,
     run_id: str,
 ) -> OrderSessionReport:
-    gateway = OrderGateway(broker, journal, _limits_from_settings(), run_id=run_id, now_fn=_gateway_now(now_fn),
+    gateway = OrderGateway(broker, journal, _limits_from_settings(env), run_id=run_id, now_fn=_gateway_now(now_fn),
                            sleep_fn=sleep_fn)
     lots = [lot for lot in journal.open_lots() if lot.trading_date < date_str]
     n_carryover: int | None = None
@@ -720,7 +726,7 @@ async def _run_reconcile(
         earliest, deadline_hhmmss = ORDER_EXIT_RECONCILE_EARLIEST_HHMMSS, ORDER_EXIT_RECONCILE_DEADLINE_HHMMSS
     today_str = now_fn().tz_convert("Asia/Seoul").strftime("%Y-%m-%d")
     backdated = date_str != today_str
-    gateway = OrderGateway(broker, journal, _limits_from_settings(), run_id=run_id, now_fn=_gateway_now(now_fn),
+    gateway = OrderGateway(broker, journal, _limits_from_settings(env), run_id=run_id, now_fn=_gateway_now(now_fn),
                            sleep_fn=sleep_fn)
     if not backdated:
         now = now_fn()
@@ -822,7 +828,7 @@ async def _run_cancel(
     now_fn: Callable[[], pd.Timestamp],
     sleep_fn: Callable[[float], Awaitable[None]],
 ) -> OrderSessionReport:
-    gateway = OrderGateway(broker, journal, _limits_from_settings(), run_id=run_id, now_fn=_gateway_now(now_fn),
+    gateway = OrderGateway(broker, journal, _limits_from_settings(env), run_id=run_id, now_fn=_gateway_now(now_fn),
                            sleep_fn=sleep_fn)
     await broker.ensure_token(sess)
     with journal.exclusive():

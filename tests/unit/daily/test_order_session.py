@@ -27,7 +27,7 @@ from src.execution.order_contract import (
     entry_intent_id,
     entry_limit_price,
 )
-from src.execution.order_journal import JournalEventKind, OrderJournal, intent_to_payload
+from src.execution.order_journal import IntentStatus, JournalEventKind, OrderJournal, intent_to_payload
 
 DAY = "2026-10-13"
 YESTERDAY = "2026-10-12"
@@ -1344,13 +1344,46 @@ def test_order_session_no_sends_on_example_store(mock_binding, runner, monkeypat
     broker.assert_quiet()
 
 
-def test_order_session_passes_entry_resend_limits(monkeypatch) -> None:
-    from src.config import settings
+def test_limits_follow_trading_env() -> None:
+    from src.execution.order_gateway import ENTRY_RESEND_MARGIN_SECONDS, ENTRY_RESEND_SETTLE_SECONDS
 
-    monkeypatch.setattr(settings, "ORDER_ENTRY_RESEND_ON_NOT_FOUND", True)
-    monkeypatch.setattr(settings, "ORDER_ENTRY_RESEND_SETTLE_SECONDS", 7.5)
-    monkeypatch.setattr(settings, "ORDER_ENTRY_RESEND_MARGIN_SECONDS", 90.0)
-    limits = sut._limits_from_settings()
-    assert limits.entry_resend_on_not_found is True
-    assert limits.entry_resend_settle_seconds == 7.5
-    assert limits.entry_resend_margin_seconds == 90.0
+    mock = sut._limits_from_settings("mock")
+    assert (mock.exit_resend_on_ambiguous, mock.entry_resend_on_not_found) == (True, True)
+    live = sut._limits_from_settings("live")
+    assert (live.exit_resend_on_ambiguous, live.entry_resend_on_not_found) == (False, False)
+    for limits in (mock, live):
+        assert limits.entry_resend_settle_seconds == ENTRY_RESEND_SETTLE_SECONDS
+        assert limits.entry_resend_margin_seconds == ENTRY_RESEND_MARGIN_SECONDS
+
+
+def _ambiguous_disconnect() -> SubmitResult:
+    return SubmitResult(verdict=SubmitVerdict.AMBIGUOUS, broker_order_no=None, broker_org_no=None,
+                        http_status=None, msg_cd="", msg="", latency_ms=23.0,
+                        transport_error="ServerDisconnectedError")
+
+
+def test_mock_entry_resend_recovers_end_to_end(mock_binding, runner) -> None:
+    broker = FakeBroker()
+    broker.submit_script = [_ambiguous_disconnect()]
+    journal = runner.journal()
+    report = runner.run("entry", DAY, broker=broker, journal=journal,
+                        clock=[ts("152700")] * 30, decisions=[three_picks()])
+    faulted = broker.submit_calls[0]
+    assert report.outcome == "OK"
+    assert broker.submit_calls.count(faulted) == 2
+    assert len(broker.submit_calls) == 4
+    assert journal.states()[faulted].status is IntentStatus.ACKED
+
+
+def test_live_entry_never_resends(monkeypatch, runner) -> None:
+    monkeypatch.setattr(sut, "resolve_trading_binding", lambda: _binding("live"))
+    broker = FakeBroker()
+    broker.submit_script = [_ambiguous_disconnect()]
+    journal = runner.journal("live")
+    report = runner.run("entry", DAY, broker=broker, journal=journal,
+                        clock=[ts("152700")] * 30, decisions=[three_picks()])
+    faulted = broker.submit_calls[0]
+    assert (report.outcome, report.reason) == ("DEGRADED", "entry_incomplete")
+    assert broker.submit_calls.count(faulted) == 1
+    assert journal.states()[faulted].status is IntentStatus.NOT_FOUND
+

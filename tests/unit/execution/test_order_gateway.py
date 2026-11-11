@@ -21,7 +21,15 @@ from src.execution.order_contract import (
     SubmitResult,
     SubmitVerdict,
 )
-from src.execution.order_gateway import GatewayLimits, OrderGateway, PlannedSkip
+from src.execution import order_gateway
+from src.execution.order_gateway import (
+    ENTRY_RESEND_MARGIN_SECONDS,
+    ENTRY_RESEND_SETTLE_SECONDS,
+    GatewayLimits,
+    OrderGateway,
+    PlannedSkip,
+    resend_enabled,
+)
 from src.execution.order_journal import (
     IntentStatus,
     JournalEventKind,
@@ -1698,3 +1706,23 @@ def test_entry_resend_allowed_requires_consistent_journal(tmp_path: Path) -> Non
         assert gateway._entry_resend_allowed(entry, deadline) is True
         journal.append(JournalEventKind.SEND, iid, {"attempt": 2}, run_id="r")
         assert gateway._entry_resend_allowed(entry, deadline) is False
+
+
+def test_resend_enabled_by_environment() -> None:
+    assert resend_enabled("mock") is True
+    assert resend_enabled("live") is order_gateway.LIVE_RESEND_ENABLED is False
+    assert resend_enabled("off") is False
+    assert resend_enabled("bogus") is False
+
+
+def test_live_resend_stays_off_unless_constant_flipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(order_gateway, "LIVE_RESEND_ENABLED", True)
+    assert resend_enabled("live") is True
+
+
+def test_gateway_limits_defaults_come_from_constants() -> None:
+    limits = _limits()
+    assert limits.entry_resend_settle_seconds == ENTRY_RESEND_SETTLE_SECONDS
+    assert limits.entry_resend_margin_seconds == ENTRY_RESEND_MARGIN_SECONDS
+    assert limits.entry_resend_on_not_found is False
+
