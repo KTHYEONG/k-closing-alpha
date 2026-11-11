@@ -231,7 +231,11 @@ class KisTradingClient:
 
     def create_session(self) -> aiohttp.ClientSession:
         """Return a session whose total timeout is http_timeout_seconds."""
-        return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._timeout))
+        # Fresh connection per request: a pooled connection the broker already closed must never carry an order POST.
+        return aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self._timeout),
+            connector=aiohttp.TCPConnector(force_close=True),
+        )
 
     async def ensure_token(self, session: aiohttp.ClientSession, *, rejected_token: str | None = None) -> None:
         """Load or issue the binding's access token; raises on issuance failure."""
@@ -301,12 +305,14 @@ class KisTradingClient:
                 except Exception:
                     latency_ms = (monotonic() - started) * 1000.0
                     return self._finish_send(intent_id, tr_id, SubmitVerdict.AMBIGUOUS, None, None, "", "", status, latency_ms)
-        except aiohttp.ClientConnectorError:
+        except aiohttp.ClientConnectorError as exc:
             latency_ms = (monotonic() - started) * 1000.0
-            return self._finish_send(intent_id, tr_id, SubmitVerdict.NOT_SENT, None, None, "", "", None, latency_ms)
-        except (aiohttp.ClientError, TimeoutError):
+            return self._finish_send(intent_id, tr_id, SubmitVerdict.NOT_SENT, None, None, "", "", None, latency_ms,
+                                     transport_error=type(exc).__name__)
+        except (aiohttp.ClientError, TimeoutError) as exc:
             latency_ms = (monotonic() - started) * 1000.0
-            return self._finish_send(intent_id, tr_id, SubmitVerdict.AMBIGUOUS, None, None, "", "", status, latency_ms)
+            return self._finish_send(intent_id, tr_id, SubmitVerdict.AMBIGUOUS, None, None, "", "", status, latency_ms,
+                                     transport_error=type(exc).__name__)
         latency_ms = (monotonic() - started) * 1000.0
         verdict = classify_order_response(status, payload) if isinstance(payload, dict) and status is not None else SubmitVerdict.AMBIGUOUS
         msg_cd = str(payload.get("msg_cd", "")) if isinstance(payload, dict) else ""
@@ -338,9 +344,11 @@ class KisTradingClient:
         msg: str,
         status: int | None,
         latency_ms: float,
+        *,
+        transport_error: str = "",
     ) -> SubmitResult:
         logger.info(
-            "[EXEC] stage=kis_order env=%s intent_id=%s tr_id=%s verdict=%s http=%s msg_cd=%s latency_ms=%.3f",
+            "[EXEC] stage=kis_order env=%s intent_id=%s tr_id=%s verdict=%s http=%s msg_cd=%s latency_ms=%.3f transport_error=%s",
             self.binding.env,
             intent_id,
             tr_id,
@@ -348,6 +356,7 @@ class KisTradingClient:
             status if status is not None else "",
             msg_cd,
             latency_ms,
+            transport_error,
         )
         return SubmitResult(
             verdict=verdict,
@@ -357,6 +366,7 @@ class KisTradingClient:
             msg_cd=msg_cd,
             msg=msg,
             latency_ms=latency_ms,
+            transport_error=transport_error,
         )
 
     async def fetch_daily_orders(self, session: aiohttp.ClientSession, trading_date: str) -> list[BrokerOrder]:

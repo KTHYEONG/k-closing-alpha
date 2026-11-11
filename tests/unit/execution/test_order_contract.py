@@ -325,3 +325,18 @@ def test_infinite_predictions_keep_numeric_ranking() -> None:
         EntryPick("005930", 1.0, float("inf"), 100_000, 100_000),
     ]
     assert size_entry_orders(picks, 150_000, 150_000) == {"005930": 1, "000660": 0}
+
+
+def test_resend_transport_error_names_exist_in_aiohttp() -> None:
+    import aiohttp
+
+    from src.execution.order_contract import ENTRY_RESEND_TRANSPORT_ERRORS, SubmitResult
+
+    assert ENTRY_RESEND_TRANSPORT_ERRORS
+    for name in ENTRY_RESEND_TRANSPORT_ERRORS:
+        cls = getattr(aiohttp, name)
+        assert isinstance(cls, type) and issubclass(cls, aiohttp.ClientError)
+    assert "TimeoutError" not in ENTRY_RESEND_TRANSPORT_ERRORS
+    result = SubmitResult(verdict=SubmitVerdict.ACCEPTED, broker_order_no="1", broker_org_no="001",
+                          http_status=200, msg_cd="0", msg="", latency_ms=1.0)
+    assert result.transport_error == ""

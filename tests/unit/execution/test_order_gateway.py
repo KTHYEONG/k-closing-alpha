@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,13 @@ from src.execution.order_contract import (
     SubmitVerdict,
 )
 from src.execution.order_gateway import GatewayLimits, OrderGateway, PlannedSkip
-from src.execution.order_journal import IntentStatus, JournalEventKind, OrderJournal, intent_to_payload
+from src.execution.order_journal import (
+    IntentStatus,
+    JournalEventKind,
+    OrderJournal,
+    derive_intent_state,
+    intent_to_payload,
+)
 
 _KST = timezone(timedelta(hours=9))
 
@@ -1401,3 +1408,293 @@ def test_carryover_contradiction_raises_after_processing(tmp_path: Path) -> None
         with pytest.raises(BrokerReadError, match="contradicts"):
             asyncio.run(gateway.resolve_carryover(object(), "2026-10-13"))
         assert journal.states()[_entry().intent_id].status is IntentStatus.ACKED
+
+
+_ENTRY_RESEND: dict[str, Any] = {"entry_resend_on_not_found": True, "entry_resend_settle_seconds": 5.0,
+                                 "entry_resend_margin_seconds": 60.0}
+_DEADLINE_1H = timedelta(hours=1)
+
+
+def _disconnect(error: str = "ServerDisconnectedError", http: int | None = None) -> SubmitResult:
+    return SubmitResult(verdict=SubmitVerdict.AMBIGUOUS, broker_order_no=None, broker_org_no=None,
+                        http_status=http, msg_cd="", msg="", latency_ms=23.0, transport_error=error)
+
+
+class HaltingBroker(FakeBroker):
+    """Creates the journal HALT marker during the first POST, as an operator halt would."""
+
+    def __init__(self, journal_dir: Path) -> None:
+        super().__init__()
+        self._journal_dir = journal_dir
+
+    async def submit_order(self, session: Any, intent: OrderIntent) -> SubmitResult:
+        (self._journal_dir / "HALT").touch()
+        return await super().submit_order(session, intent)
+
+
+def _seed_filled_entry(journal: OrderJournal, entry: OrderIntent) -> None:
+    journal.append(JournalEventKind.INTENT, entry.intent_id, intent_to_payload(entry), run_id="r")
+    journal.append(JournalEventKind.SEND, entry.intent_id, {"attempt": 1}, run_id="r")
+    journal.append(JournalEventKind.RESULT, entry.intent_id,
+                   {"attempt": 1, "verdict": "accepted", "broker_order_no": "e-seed",
+                    "broker_org_no": "001", "http_status": 200, "msg_cd": "0",
+                    "msg": "", "latency_ms": 1.0}, run_id="r")
+    journal.append(JournalEventKind.BROKER_STATE, entry.intent_id,
+                   {"order_qty": 10, "filled_qty": 10, "filled_amount_krw": 100,
+                    "remaining_qty": 0, "cancelled": False, "rejected_qty": 0, "final": True}, run_id="r")
+
+
+def test_entry_resend_disabled_by_default(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    broker.submit_script = [_disconnect(), _result(SubmitVerdict.ACCEPTED, "777")]
+    broker.daily_script = [[], [], []]
+    gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1), _now())
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), _entry().intent_id, deadline=_now() + _DEADLINE_1H))
+        assert state.status is IntentStatus.NOT_FOUND
+    assert len(broker.submit_calls) == 1
+
+
+def test_entry_resend_once_after_disconnect(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    broker.submit_script = [_disconnect(), _result(SubmitVerdict.ACCEPTED, "777")]
+    broker.daily_script = [[], [], []]
+    gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1, **_ENTRY_RESEND), _now())
+    iid = _entry().intent_id
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), iid, deadline=_now() + _DEADLINE_1H))
+        assert state.status is IntentStatus.ACKED
+        assert state.broker_order_no == "777"
+        sends = [e for e in journal.load() if e.intent_id == iid and e.kind is JournalEventKind.SEND]
+    assert len(broker.submit_calls) == 2
+    assert [s.payload["attempt"] for s in sends] == [1, 2]
+    assert "baseline_order_nos" in sends[0].payload
+    assert "baseline_order_nos" not in sends[1].payload
+
+
+def test_entry_resend_adopts_late_order_instead_of_sending(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    broker.submit_script = [_disconnect()]
+    broker.daily_script = [[], [], [_broker_order("12345")]]
+    gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1, **_ENTRY_RESEND), _now())
+    iid = _entry().intent_id
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), iid, deadline=_now() + _DEADLINE_1H))
+        assert state.status is IntentStatus.ACKED
+        assert state.broker_order_no == "12345"
+        assert sum(1 for e in journal.load() if e.kind is JournalEventKind.SEND) == 1
+    assert len(broker.submit_calls) == 1
+
+
+def test_entry_resend_conflict_when_two_candidates(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    broker = FakeBroker()
+    broker.submit_script = [_disconnect()]
+    broker.daily_script = [[], [], [_broker_order("12345"), _broker_order("12346")]]
+    gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1, **_ENTRY_RESEND), _now())
+    iid = _entry().intent_id
+    with journal.exclusive(), caplog.at_level("WARNING"):
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), iid, deadline=_now() + _DEADLINE_1H))
+        assert state.status is IntentStatus.UNKNOWN
+        kinds = [e.kind for e in journal.load()]
+        assert JournalEventKind.RESOLVE_CONFLICT in kinds
+        assert JournalEventKind.NOT_FOUND not in kinds
+    assert len(broker.submit_calls) == 1
+    assert any("resend_conflict" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
+
+
+@pytest.mark.parametrize("failure", [_disconnect("TimeoutError"), _disconnect("", http=200), _disconnect("")])
+def test_entry_resend_not_for_timeout_or_status_or_unlisted_error(tmp_path: Path, failure: SubmitResult) -> None:
+    broker = FakeBroker()
+    broker.submit_script = [failure, _result(SubmitVerdict.ACCEPTED, "777")]
+    broker.daily_script = [[], [], []]
+    gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1, **_ENTRY_RESEND), _now())
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), _entry().intent_id, deadline=_now() + _DEADLINE_1H))
+        assert state.status is IntentStatus.NOT_FOUND
+    assert len(broker.submit_calls) == 1
+
+
+def test_entry_resend_blocked_when_final_read_fails(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    broker.submit_script = [_disconnect(), _result(SubmitVerdict.ACCEPTED, "777")]
+    broker.daily_script = [[], [], RuntimeError("read down")]
+    gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1, **_ENTRY_RESEND), _now())
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), _entry().intent_id, deadline=_now() + _DEADLINE_1H))
+        assert state.status is not IntentStatus.ACKED
+    assert len(broker.submit_calls) == 1
+
+
+def test_entry_resend_blocked_by_margin_halt_cap(tmp_path: Path) -> None:
+    def _run(limits: GatewayLimits, deadline: datetime, broker: FakeBroker, journal: OrderJournal | None = None) -> int:
+        gateway, jr = _gateway(tmp_path / str(id(broker)), broker, limits, _now(), journal)
+        with jr.exclusive():
+            gateway.plan([_entry()], [])
+            state = asyncio.run(gateway.submit(object(), _entry().intent_id, deadline=deadline))
+            assert state.status is not IntentStatus.ACKED
+        return len(broker.submit_calls)
+
+    margin_broker = FakeBroker()
+    margin_broker.submit_script = [_disconnect(), _result(SubmitVerdict.ACCEPTED, "777")]
+    margin_broker.daily_script = [[], [], []]
+    assert _run(_limits(unknown_resolve_polls=1, **_ENTRY_RESEND), _now() + timedelta(seconds=30),
+                margin_broker) == 1
+
+    cap_broker = FakeBroker()
+    cap_broker.submit_script = [_disconnect(), _result(SubmitVerdict.ACCEPTED, "777")]
+    cap_broker.daily_script = [[], [], []]
+    assert _run(_limits(unknown_resolve_polls=1, max_sends_per_run=1, **_ENTRY_RESEND),
+                _now() + _DEADLINE_1H, cap_broker) == 1
+
+    journal_dir = tmp_path / "halt"
+    halt_journal = OrderJournal(journal_dir, "mock", lock_timeout_seconds=5.0)
+    halt_broker = HaltingBroker(halt_journal._dir)
+    halt_broker.submit_script = [_disconnect(), _result(SubmitVerdict.ACCEPTED, "777")]
+    halt_broker.daily_script = [[], [], []]
+    assert _run(_limits(unknown_resolve_polls=1, **_ENTRY_RESEND), _now() + _DEADLINE_1H,
+                halt_broker, halt_journal) == 1
+
+
+def test_entry_resend_never_for_sell_with_entry_flag_only(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    broker.submit_script = [_disconnect(), _result(SubmitVerdict.ACCEPTED, "s2")]
+    broker.daily_script = [[], []]
+    gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1, **_ENTRY_RESEND), _now())
+    entry = _entry()
+    ex = _exit(entry.intent_id, qty=4, intent_id="exit-entry-flag")
+    with journal.exclusive():
+        _seed_filled_entry(journal, entry)
+        journal.append(JournalEventKind.INTENT, ex.intent_id, intent_to_payload(ex), run_id="r")
+        state = asyncio.run(gateway.submit(object(), ex.intent_id, deadline=_now() + _DEADLINE_1H))
+        assert state.status is IntentStatus.NOT_FOUND
+    assert len(broker.submit_calls) == 1
+
+
+def test_entry_resend_at_most_once(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    broker.submit_script = [_disconnect(), _disconnect()]
+    broker.daily_script = [[], [], []]
+    gateway, journal = _gateway(tmp_path, broker,
+                                _limits(unknown_resolve_polls=1, send_max_attempts=3, **_ENTRY_RESEND), _now())
+    iid = _entry().intent_id
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), iid, deadline=_now() + _DEADLINE_1H))
+        assert state.status is IntentStatus.UNKNOWN
+    assert len(broker.submit_calls) == 2
+
+
+def test_entry_rerun_after_spent_resend_never_sends_again(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    broker.submit_script = [_disconnect(), _result(SubmitVerdict.NOT_SENT, None), _result(SubmitVerdict.ACCEPTED, "777")]
+    broker.daily_script = [[], [], [], [], []]
+    gateway, journal = _gateway(tmp_path, broker,
+                                _limits(unknown_resolve_polls=1, send_max_attempts=3, **_ENTRY_RESEND), _now())
+    iid = _entry().intent_id
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        first = asyncio.run(gateway.submit(object(), iid, deadline=_now() + _DEADLINE_1H))
+        assert first.n_sends == 2
+        again = asyncio.run(gateway.submit(object(), iid, deadline=_now() + _DEADLINE_1H))
+        assert again.n_sends == 2
+    assert len(broker.submit_calls) == 2
+
+
+def test_result_payload_records_transport_error(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    broker.submit_script = [_disconnect(), _result(SubmitVerdict.ACCEPTED, "777")]
+    broker.daily_script = [[], [], []]
+    gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1, **_ENTRY_RESEND), _now())
+    iid = _entry().intent_id
+    with journal.exclusive():
+        gateway.plan([_entry()], [])
+        asyncio.run(gateway.submit(object(), iid, deadline=_now() + _DEADLINE_1H))
+        events = [e for e in journal.load() if e.intent_id == iid]
+    results = [e for e in events if e.kind is JournalEventKind.RESULT]
+    assert results[0].payload["transport_error"] == "ServerDisconnectedError"
+    assert results[1].payload["transport_error"] == ""
+    legacy = [dataclasses.replace(e, payload={k: v for k, v in e.payload.items() if k != "transport_error"})
+              if e.kind is JournalEventKind.RESULT else e for e in events]
+    assert derive_intent_state(legacy).status is IntentStatus.ACKED
+
+
+def test_reconcile_flags_duplicate_suspect(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    broker = FakeBroker()
+    broker.daily_script = [[_broker_order("B1")]]
+    gateway, journal = _gateway(tmp_path, broker, _limits(), _now())
+    entry = _entry()
+    iid = entry.intent_id
+    with journal.exclusive():
+        journal.append(JournalEventKind.INTENT, iid, intent_to_payload(entry), run_id="r")
+        journal.append(JournalEventKind.SEND, iid, {"attempt": 1, "baseline_order_nos": []}, run_id="r")
+        journal.append(JournalEventKind.RESULT, iid,
+                       {"attempt": 1, "verdict": "ambiguous", "broker_order_no": None, "broker_org_no": None,
+                        "http_status": None, "msg_cd": "", "msg": "", "latency_ms": 23.0,
+                        "transport_error": "ServerDisconnectedError"}, run_id="r")
+        journal.append(JournalEventKind.SEND, iid, {"attempt": 2}, run_id="r")
+        journal.append(JournalEventKind.RESULT, iid,
+                       {"attempt": 2, "verdict": "accepted", "broker_order_no": "A1", "broker_org_no": "001",
+                        "http_status": 200, "msg_cd": "0", "msg": "", "latency_ms": 1.0,
+                        "transport_error": ""}, run_id="r")
+        before = len(journal.load())
+        with caplog.at_level("WARNING"):
+            report = asyncio.run(gateway.reconcile(object(), "2026-10-12", finalize=False))
+        assert len(journal.load()) == before
+    assert report.n_foreign_orders == 1
+    assert any("duplicate_suspect" in r.getMessage() and "B1" in r.getMessage() and iid in r.getMessage()
+               for r in caplog.records)
+
+
+class HaltOnFinalReadBroker(FakeBroker):
+    """Creates the journal HALT marker during the post-settle order read (third daily read)."""
+
+    def __init__(self, journal_dir: Path) -> None:
+        super().__init__()
+        self._journal_dir = journal_dir
+        self._reads = 0
+
+    async def fetch_daily_orders(self, session: Any, trading_date: str) -> list[BrokerOrder]:
+        self._reads += 1
+        if self._reads == 3:
+            (self._journal_dir / "HALT").touch()
+        return await super().fetch_daily_orders(session, trading_date)
+
+
+def test_entry_resend_recheck_after_settle_refuses_when_halted(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    journal = OrderJournal(tmp_path, "mock", lock_timeout_seconds=5.0)
+    broker = HaltOnFinalReadBroker(journal._dir)
+    broker.submit_script = [_disconnect(), _result(SubmitVerdict.ACCEPTED, "777")]
+    broker.daily_script = [[], [], []]
+    gateway, journal = _gateway(tmp_path, broker, _limits(unknown_resolve_polls=1, **_ENTRY_RESEND), _now(), journal)
+    with journal.exclusive(), caplog.at_level("WARNING"):
+        gateway.plan([_entry()], [])
+        state = asyncio.run(gateway.submit(object(), _entry().intent_id, deadline=_now() + _DEADLINE_1H))
+        assert state.status is IntentStatus.NOT_FOUND
+    assert len(broker.submit_calls) == 1
+    assert any("entry_resend_recheck" in r.getMessage() for r in caplog.records)
+
+
+def test_entry_resend_allowed_requires_consistent_journal(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _limits(**_ENTRY_RESEND), _now())
+    entry = _entry()
+    iid = entry.intent_id
+    deadline = _now() + _DEADLINE_1H
+    with journal.exclusive():
+        journal.append(JournalEventKind.INTENT, iid, intent_to_payload(entry), run_id="r")
+        assert gateway._entry_resend_allowed(entry, deadline) is False
+        journal.append(JournalEventKind.SEND, iid, {"attempt": 1}, run_id="r")
+        assert gateway._entry_resend_allowed(entry, deadline) is False
+        journal.append(JournalEventKind.RESULT, iid,
+                       {"attempt": 1, "verdict": "ambiguous", "broker_order_no": None, "broker_org_no": None,
+                        "http_status": None, "msg_cd": "", "msg": "", "latency_ms": 23.0,
+                        "transport_error": "ServerDisconnectedError"}, run_id="r")
+        assert gateway._entry_resend_allowed(entry, deadline) is True
+        journal.append(JournalEventKind.SEND, iid, {"attempt": 2}, run_id="r")
+        assert gateway._entry_resend_allowed(entry, deadline) is False

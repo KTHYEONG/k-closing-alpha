@@ -23,6 +23,20 @@ def test_ambient_kis_env_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
     assert KisTradingSettings(_env_file=None).KIS_TRADING_ENV == "off"
 
 
+def test_entry_resend_defaults_fail_closed() -> None:
+    settings = KisTradingSettings(_env_file=None)
+    assert settings.ORDER_ENTRY_RESEND_ON_NOT_FOUND is False
+    assert settings.ORDER_ENTRY_RESEND_SETTLE_SECONDS == 5.0
+    assert settings.ORDER_ENTRY_RESEND_MARGIN_SECONDS == 60.0
+
+
+@pytest.mark.parametrize("field", ["ORDER_ENTRY_RESEND_SETTLE_SECONDS", "ORDER_ENTRY_RESEND_MARGIN_SECONDS"])
+@pytest.mark.parametrize("value", [-1.0, float("inf"), float("nan")])
+def test_entry_resend_seconds_reject_negative_and_non_finite(field: str, value: float) -> None:
+    with pytest.raises(ValidationError):
+        KisTradingSettings(**{field: value}, _env_file=None)
+
+
 def test_per_order_cap_cannot_exceed_seed() -> None:
     with pytest.raises(ValidationError):
         KisTradingSettings(

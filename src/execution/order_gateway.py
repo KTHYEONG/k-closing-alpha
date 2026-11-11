@@ -6,11 +6,12 @@ import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import date as _date
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Protocol
 
 from src.api.kis.trading import BrokerReadError
 from src.execution.order_contract import (
+    ENTRY_RESEND_TRANSPORT_ERRORS,
     BrokerOrder,
     BrokerPosition,
     OrderIntent,
@@ -63,6 +64,9 @@ class GatewayLimits:
     unknown_resolve_interval_seconds: float
     exit_resend_on_ambiguous: bool
     carryover_lookback_days: int = 5
+    entry_resend_on_not_found: bool = False
+    entry_resend_settle_seconds: float = 0.0
+    entry_resend_margin_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -214,6 +218,9 @@ class OrderGateway:
             return state
         assert state.intent is not None
         intent = state.intent
+        if intent.phase is OrderPhase.ENTRY and state.n_sends >= 2 and self._was_not_found(intent_id):
+            # The one entry resend after NOT_FOUND is spent; a rerun must not reopen sending.
+            return state
         if self._journal.is_halted():
             self._journal.append(JournalEventKind.SKIP, intent_id, self._skip_payload(intent, "halted"),
                                  run_id=self._run_id)
@@ -264,7 +271,8 @@ class OrderGateway:
                 {"attempt": attempt, "verdict": result.verdict.value,
                  "broker_order_no": result.broker_order_no, "broker_org_no": result.broker_org_no,
                  "http_status": result.http_status, "msg_cd": result.msg_cd,
-                 "msg": result.msg, "latency_ms": result.latency_ms},
+                 "msg": result.msg, "latency_ms": result.latency_ms,
+                 "transport_error": result.transport_error},
                 run_id=self._run_id,
             )
             logger.info("[EXEC] stage=submit intent_id=%s run_id=%s kind=result verdict=%s",
@@ -354,6 +362,14 @@ class OrderGateway:
             if st.broker_order_no:
                 bound_final.add(normalize_order_no(st.broker_order_no))
         n_foreign = sum(1 for o in snapshot if normalize_order_no(o.order_no) not in bound_final)
+        for order in snapshot:
+            for intent_id in day_ids:
+                st = states[intent_id]
+                if st.intent is None or st.n_sends < 2:
+                    continue
+                if match_candidates(st.intent, [order], bound_final, baseline=st.baseline_order_nos):
+                    logger.warning("[RISK] stage=reconcile intent_id=%s run_id=%s duplicate_suspect order_no=%s",
+                                   intent_id, self._run_id, order.order_no)
         positions = await self._broker.fetch_positions(session)
         holding: dict[str, int] = {p.symbol: p.holding_qty for p in positions}
         shortfalls: list[tuple[str, int, int]] = []
@@ -625,6 +641,13 @@ class OrderGateway:
                 await self._sleep_fn(interval)
         if read_failed:
             return self._journal.states()[intent.intent_id]
+        entry_plan = "no_resend"
+        if self._entry_resend_allowed(intent, deadline):
+            # Settle and re-read BEFORE NOT_FOUND is journaled: a late or conflicting order must leave the
+            # intent UNKNOWN (reconcile adopts only UNKNOWN), which a later NOT_FOUND event would mask.
+            entry_plan = await self._entry_final_check(session, intent)
+            if entry_plan == "handled":
+                return self._journal.states()[intent.intent_id]
         span = float(max(0, polls - 1)) * float(interval)
         self._journal.append(JournalEventKind.NOT_FOUND, intent.intent_id,
                              {"n_polls": polls, "span_seconds": span}, run_id=self._run_id)
@@ -648,24 +671,87 @@ class OrderGateway:
                     sellable = pos.sellable_qty
                     break
             if sellable >= intent.qty and self._now_fn() < deadline:
-                attempt = self._journal.states()[intent.intent_id].n_sends + 1
-                self._journal.append(JournalEventKind.SEND, intent.intent_id,
-                                     {"attempt": attempt}, run_id=self._run_id)
-                logger.info("[EXEC] stage=submit intent_id=%s run_id=%s kind=send attempt=%s resend=exit",
-                            intent.intent_id, self._run_id, attempt)
-                result = await self._safe_submit(session, intent)
-                self._sends_made += 1
-                self._journal.append(
-                    JournalEventKind.RESULT, intent.intent_id,
-                    {"attempt": attempt, "verdict": result.verdict.value,
-                     "broker_order_no": result.broker_order_no, "broker_org_no": result.broker_org_no,
-                     "http_status": result.http_status, "msg_cd": result.msg_cd,
-                     "msg": result.msg, "latency_ms": result.latency_ms},
-                    run_id=self._run_id,
-                )
-                logger.info("[EXEC] stage=submit intent_id=%s run_id=%s kind=result verdict=%s resend=exit",
-                            intent.intent_id, self._run_id, result.verdict.value)
+                await self._resend_once(session, intent, tag="exit")
+        if entry_plan == "resend":
+            if self._entry_resend_allowed(intent, deadline):
+                await self._resend_once(session, intent, tag="entry")
+            else:
+                logger.warning("[RISK] stage=submit intent_id=%s run_id=%s refusal=entry_resend_recheck",
+                               intent.intent_id, self._run_id)
         return self._journal.states()[intent.intent_id]
+
+    async def _resend_once(self, session: Any, intent: OrderIntent, *, tag: str) -> SubmitResult:
+        """Journal one extra send without a baseline (the original baseline stays authoritative)."""
+        attempt = self._journal.states()[intent.intent_id].n_sends + 1
+        self._journal.append(JournalEventKind.SEND, intent.intent_id, {"attempt": attempt}, run_id=self._run_id)
+        logger.info("[EXEC] stage=submit intent_id=%s run_id=%s kind=send attempt=%s resend=%s",
+                    intent.intent_id, self._run_id, attempt, tag)
+        result = await self._safe_submit(session, intent)
+        self._sends_made += 1
+        self._journal.append(
+            JournalEventKind.RESULT, intent.intent_id,
+            {"attempt": attempt, "verdict": result.verdict.value,
+             "broker_order_no": result.broker_order_no, "broker_org_no": result.broker_org_no,
+             "http_status": result.http_status, "msg_cd": result.msg_cd,
+             "msg": result.msg, "latency_ms": result.latency_ms,
+             "transport_error": result.transport_error},
+            run_id=self._run_id,
+        )
+        logger.info("[EXEC] stage=submit intent_id=%s run_id=%s kind=result verdict=%s resend=%s",
+                    intent.intent_id, self._run_id, result.verdict.value, tag)
+        return result
+
+    def _entry_resend_allowed(self, intent: OrderIntent, deadline: datetime) -> bool:
+        """Pure state checks: only a provably undelivered first entry send may be resent, once."""
+        if not self._limits.entry_resend_on_not_found:
+            return False
+        if intent.phase is not OrderPhase.ENTRY or intent.side is not OrderSide.BUY:
+            return False
+        if self._journal.is_halted():
+            return False
+        if self._journal.states()[intent.intent_id].n_sends != 1:
+            return False
+        if self._sends_made >= self._limits.max_sends_per_run:
+            return False
+        results = [e for e in self._journal.load()
+                   if e.intent_id == intent.intent_id and e.kind is JournalEventKind.RESULT]
+        if not results:
+            return False
+        last = results[-1].payload
+        if str(last.get("verdict", "")) != SubmitVerdict.AMBIGUOUS.value or last.get("http_status") is not None:
+            return False
+        if str(last.get("transport_error", "")) not in ENTRY_RESEND_TRANSPORT_ERRORS:
+            return False
+        return self._now_fn() + timedelta(seconds=self._limits.entry_resend_margin_seconds) < deadline
+
+    async def _entry_final_check(self, session: Any, intent: OrderIntent) -> str:
+        """Settle and re-read the day orders once; return "handled" (adopted/conflict), "resend" or "no_resend"."""
+        await self._sleep_fn(self._limits.entry_resend_settle_seconds)
+        try:
+            snapshot = await self._broker.fetch_daily_orders(session, intent.trading_date)
+        except Exception:
+            logger.exception("[EXEC] stage=submit intent_id=%s run_id=%s resend_final_read_failed",
+                             intent.intent_id, self._run_id)
+            return "no_resend"
+        states = self._journal.states()
+        bound: set[str] = {normalize_order_no(st.broker_order_no) for st in states.values() if st.broker_order_no}
+        candidates = self._candidates(intent, snapshot, bound,
+                                      baseline=states[intent.intent_id].baseline_order_nos)
+        if len(candidates) == 1:
+            order = candidates[0]
+            self._journal.append(JournalEventKind.ADOPT, intent.intent_id,
+                                 {"broker_order_no": order.order_no, "broker_org_no": order.org_no},
+                                 run_id=self._run_id)
+            logger.info("[EXEC] stage=submit intent_id=%s run_id=%s kind=adopt order_no=%s",
+                        intent.intent_id, self._run_id, order.order_no)
+            return "handled"
+        if len(candidates) > 1:
+            self._journal.append(JournalEventKind.RESOLVE_CONFLICT, intent.intent_id,
+                                 {"n_candidates": len(candidates)}, run_id=self._run_id)
+            logger.warning("[RISK] stage=submit intent_id=%s run_id=%s resend_conflict n=%s",
+                           intent.intent_id, self._run_id, len(candidates))
+            return "handled"
+        return "resend"
 
     def _state_date(self, state: IntentState) -> str | None:
         if state.intent is not None:

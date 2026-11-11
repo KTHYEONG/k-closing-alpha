@@ -982,3 +982,65 @@ def test_live_binding_accepts_explicit_order_limits_from_env(monkeypatch: pytest
 def test_mock_binding_keeps_default_order_limits() -> None:
     """Mock rehearsal still runs on code defaults."""
     assert _mock_binding().env == "mock"
+
+
+def test_transport_error_recorded_on_disconnect(tmp_path, caplog) -> None:
+    binding = _mock_binding(KIS_MOCK_APP_KEY="TEKEY99", KIS_MOCK_APP_SECRET="TESEC99")
+    client, _, _ = _trading_client(binding, tmp_path)
+    session = scripted_session([FakeBrokerResponse(enter_error=aiohttp.ServerDisconnectedError(), status=200)])
+    with caplog.at_level(logging.INFO):
+        result = asyncio.run(client.submit_order(session, _limit_buy()))  # type: ignore[arg-type]
+    assert result.verdict is SubmitVerdict.AMBIGUOUS
+    assert result.http_status is None
+    assert result.transport_error == "ServerDisconnectedError"
+    line = next(rec.message for rec in caplog.records if "stage=kis_order" in rec.message)
+    assert "transport_error=ServerDisconnectedError" in line
+    assert "TEKEY99" not in line and "TESEC99" not in line
+
+
+def test_transport_error_recorded_on_connector_failure(tmp_path) -> None:
+    client, _, _ = _trading_client(_mock_binding(), tmp_path)
+    session = scripted_session(
+        [FakeBrokerResponse(enter_error=aiohttp.ClientConnectorError(None, OSError("down")), status=200)]
+    )
+    result = asyncio.run(client.submit_order(session, _limit_buy()))  # type: ignore[arg-type]
+    assert result.verdict is SubmitVerdict.NOT_SENT
+    assert result.transport_error == "ClientConnectorError"
+
+
+def test_transport_error_empty_on_success_and_decode_failure(tmp_path) -> None:
+    client, _, _ = _trading_client(_mock_binding(), tmp_path)
+    accepted = scripted_session([FakeBrokerResponse(body=_accept_body(), status=200)])
+    ok = asyncio.run(client.submit_order(accepted, _limit_buy()))  # type: ignore[arg-type]
+    assert ok.verdict is SubmitVerdict.ACCEPTED
+    assert ok.transport_error == ""
+    client2, _, _ = _trading_client(_mock_binding(), tmp_path / "decode")
+    decode = scripted_session([FakeBrokerResponse(body={"rt_cd": "0"}, status=200, json_error=ValueError("bad"))])
+    bad = asyncio.run(client2.submit_order(decode, _limit_buy()))  # type: ignore[arg-type]
+    assert bad.verdict is SubmitVerdict.AMBIGUOUS
+    assert bad.http_status == 200
+    assert bad.transport_error == ""
+
+
+def test_order_session_closes_connections(tmp_path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    real_connector = aiohttp.TCPConnector
+
+    class _SpyConnector(real_connector):  # type: ignore[misc, valid-type]
+        def __init__(self, *args, **kwargs) -> None:
+            captured.update(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(aiohttp, "TCPConnector", _SpyConnector)
+    client, _, _ = _trading_client(_mock_binding(), tmp_path)
+
+    async def _run() -> None:
+        session = client.create_session()
+        try:
+            assert isinstance(session.connector, real_connector)
+            assert session.timeout.total == 5.0
+        finally:
+            await session.close()
+
+    asyncio.run(_run())
+    assert captured.get("force_close") is True

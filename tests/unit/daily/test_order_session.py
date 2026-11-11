@@ -1342,3 +1342,15 @@ def test_order_session_no_sends_on_example_store(mock_binding, runner, monkeypat
     report = runner.run("entry", DAY, broker=broker, journal=journal, clock=[ts("152115")], decisions=[three_picks()])
     assert (report.outcome, report.reason) == ("DEGRADED", "strategy_store_unavailable")
     broker.assert_quiet()
+
+
+def test_order_session_passes_entry_resend_limits(monkeypatch) -> None:
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "ORDER_ENTRY_RESEND_ON_NOT_FOUND", True)
+    monkeypatch.setattr(settings, "ORDER_ENTRY_RESEND_SETTLE_SECONDS", 7.5)
+    monkeypatch.setattr(settings, "ORDER_ENTRY_RESEND_MARGIN_SECONDS", 90.0)
+    limits = sut._limits_from_settings()
+    assert limits.entry_resend_on_not_found is True
+    assert limits.entry_resend_settle_seconds == 7.5
+    assert limits.entry_resend_margin_seconds == 90.0

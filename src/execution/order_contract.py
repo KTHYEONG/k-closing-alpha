@@ -17,6 +17,7 @@ from src.execution.cost_model import krx_tick_size
 from src.execution.paper_broker import side_fee_krw
 
 __all__ = [
+    "ENTRY_RESEND_TRANSPORT_ERRORS",
     "BrokerOrder",
     "BrokerPosition",
     "EntryPick",
@@ -36,6 +37,12 @@ __all__ = [
 ]
 
 _SYMBOL_RE = re.compile(r"^[0-9A-Z]{6}$")
+
+ENTRY_RESEND_TRANSPORT_ERRORS: frozenset[str] = frozenset(
+    {"ServerDisconnectedError", "ClientOSError", "ClientConnectionResetError"}
+)
+"""Transport failures meaning the request never reached the broker application (connection already closed or reset).
+Timeouts are excluded on purpose: a timed-out request may still be processed by the broker."""
 
 
 class OrderSide(StrEnum):
@@ -121,6 +128,7 @@ class SubmitResult:
     msg_cd: str
     msg: str
     latency_ms: float
+    transport_error: str = ""
 
 
 @dataclass(frozen=True)

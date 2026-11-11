@@ -125,6 +125,9 @@ def _limits_from_settings() -> GatewayLimits:
         unknown_resolve_polls=settings.ORDER_UNKNOWN_RESOLVE_POLLS,
         unknown_resolve_interval_seconds=settings.ORDER_UNKNOWN_RESOLVE_INTERVAL_SECONDS,
         exit_resend_on_ambiguous=settings.ORDER_EXIT_RESEND_ON_AMBIGUOUS,
+        entry_resend_on_not_found=settings.ORDER_ENTRY_RESEND_ON_NOT_FOUND,
+        entry_resend_settle_seconds=settings.ORDER_ENTRY_RESEND_SETTLE_SECONDS,
+        entry_resend_margin_seconds=settings.ORDER_ENTRY_RESEND_MARGIN_SECONDS,
         carryover_lookback_days=settings.ORDER_UNKNOWN_CARRYOVER_LOOKBACK_DAYS,
     )
 
