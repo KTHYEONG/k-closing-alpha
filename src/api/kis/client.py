@@ -455,6 +455,9 @@ class KisApiClient:
         key_id = kis_key_id(self.app_key or "")
         http_429 = tps_limit = auth_rejected = 0
         last_msg_cd = ""
+        if not self.token and session is not None:
+            # A fresh client holds no token; sending "Bearer None" earns a vendor EGW00121 and masks real rotations.
+            await self.ensure_token(session)
         for attempt in range(5):
             await self.rate_limiter.acquire()
             try:

@@ -540,8 +540,6 @@ def test_handle_request_without_token_adopts_cache(tmp_path, monkeypatch) -> Non
 
         async def json(self):
             calls["n"] += 1
-            if calls["n"] == 1:
-                return {"rt_cd": "1", "msg_cd": "EGW00121", "msg1": "token expired"}
             return {"rt_cd": "0", "output": {}}
 
     class _Ctx:
@@ -559,7 +557,8 @@ def test_handle_request_without_token_adopts_cache(tmp_path, monkeypatch) -> Non
     out = asyncio.run(client._handle_request(get_session.get, "http://x", headers={"tr_id": "T"}))
 
     assert out["rt_cd"] == "0"
-    assert seen == {"rejected_token": ""}
+    assert seen == {}
+    assert calls["n"] == 1
     assert get_session.posts == 0
     assert client.token == "T2"
 

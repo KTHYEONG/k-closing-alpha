@@ -531,6 +531,90 @@ def test_handle_request_rotates_token_on_auth_rejection(tmp_path, monkeypatch, c
     assert any("status=AUTH_REJECTED" in rec.message for rec in caplog.records)
 
 
+def _recording_session(sent: list[str], posts: list[int], issued: str):
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status = 200
+
+        async def json(self):
+            return self._payload
+
+    class _Ctx:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self._resp
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _Session:
+        def get(self, _url, **kw):
+            auth = kw["headers"]["authorization"]
+            sent.append(auth)
+            if auth in ("Bearer None", "Bearer "):
+                return _Ctx(_Resp({"rt_cd": "1", "msg_cd": "EGW00121", "msg1": "token invalid"}))
+            return _Ctx(_Resp({"rt_cd": "0", "msg_cd": "MCA00000", "output": []}))
+
+        def post(self, _url, **_kw):
+            posts.append(1)
+            return _Ctx(_Resp({"access_token": issued, "expires_in": 86400}))
+
+    return _Session()
+
+
+class _NoLimit:
+    async def acquire(self):
+        return None
+
+
+def test_handle_request_primes_cached_token_before_first_send(tmp_path, monkeypatch, caplog) -> None:
+    import asyncio
+    import logging
+    from datetime import UTC, datetime, timedelta
+
+    from src.api.kis.client import KisApiClient
+
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(tmp_path / "kis_token.json"))
+    now = datetime.now(UTC)
+    client._write_token_file("CACHED", (now + timedelta(days=1)).isoformat(), (now - timedelta(hours=1)).isoformat())
+    monkeypatch.setattr(client, "rate_limiter", _NoLimit())
+    sent: list[str] = []
+    posts: list[int] = []
+    session = _recording_session(sent, posts, "UNUSED")
+
+    with caplog.at_level(logging.INFO):
+        out = asyncio.run(client._handle_request(session.get, "https://x", headers={"tr_id": "T"}))
+
+    assert out["rt_cd"] == "0"
+    assert sent == ["Bearer CACHED"]
+    assert posts == []
+    assert not any("AUTH_REJECTED" in rec.message or "ADOPTED_ROTATED" in rec.message for rec in caplog.records)
+
+
+def test_handle_request_issues_once_before_first_send_without_cache(tmp_path, monkeypatch, caplog) -> None:
+    import asyncio
+    import logging
+
+    from src.api.kis.client import KisApiClient
+
+    client = KisApiClient(app_key="k", app_secret="s", token_file=str(tmp_path / "kis_token.json"))
+    monkeypatch.setattr(client, "rate_limiter", _NoLimit())
+    sent: list[str] = []
+    posts: list[int] = []
+    session = _recording_session(sent, posts, "FRESH")
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(client._handle_request(session.get, "https://x", headers={"tr_id": "T"}))
+        asyncio.run(client._handle_request(session.get, "https://x", headers={"tr_id": "T"}))
+
+    assert sent == ["Bearer FRESH", "Bearer FRESH"]
+    assert posts == [1]
+    assert not any("AUTH_REJECTED" in rec.message for rec in caplog.records)
+
+
 async def _no_sleep(_delay):
     return None
 
