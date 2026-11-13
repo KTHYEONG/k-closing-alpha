@@ -10,7 +10,7 @@ import math
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -18,6 +18,7 @@ import pandas as pd
 
 from src.api.kis.trading import (
     BrokerReadError,
+    BrokerTokenError,
     KisTradingClient,
     TradingDisabledError,
     resolve_trading_binding,
@@ -77,6 +78,11 @@ ORDER_JOB_CANCEL: str = "order_cancel"
 ORDER_PHASES: tuple[str, ...] = ("entry", "exit", "reconcile-entry", "reconcile-exit", "cancel")
 ORDER_DECISION_POLL_SECONDS: float = 2.0
 ORDER_RECONCILE_POLL_SECONDS: float = 10.0
+# KIS issues at most one token per minute per app key; a reconcile loop must not retry issuance faster.
+ORDER_TOKEN_RETRY_MIN_SECONDS: float = 60.0
+REASON_PRIOR_UNRESOLVED: str = "prior_orders_unresolved"
+# Prior-date catch-up must leave the exit window (08:40-08:59) to the sells; dates not started by then wait a run.
+ORDER_PRIOR_CATCH_UP_BUDGET_SECONDS: float = 120.0
 ORDER_MAX_PRESTART_WAIT_SECONDS: float = 120.0
 
 _JOB_BY_PHASE: dict[str, str] = {
@@ -116,6 +122,61 @@ def _log_read_failure(*, env: str, phase: str, run_id: str, step: str, exc: Brok
     cause = type(exc.__cause__).__name__ if exc.__cause__ is not None else ""
     logger.warning("[EXEC] stage=broker_read env=%s phase=%s run_id=%s step=%s status=failed detail=%s cause=%s",
                    env, phase, run_id, step, exc, cause)
+
+
+@dataclass(frozen=True)
+class PriorCatchUp:
+    """Outcome of the prior-date catch-up pass that precedes exit and reconcile runs."""
+
+    reports: tuple[ReconcileReport, ...] = ()
+    failed_dates: tuple[str, ...] = ()
+    token_failed: bool = False
+
+    @property
+    def final_report(self) -> ReconcileReport | None:
+        """The last date's report: its shortfall/exposure check sees the journal after every prior date was bound.
+
+        Earlier dates' checks run mid-sequence (a prior buy bound before the next day's sell) and are not verdicts.
+        """
+        return self.reports[-1] if self.reports and not self.failed_dates else None
+
+
+async def _catch_up_prior(
+    *, gateway: OrderGateway, broker: SessionBrokerPort, journal: OrderJournal, sess: Any,
+    date_str: str, env: str, phase: str, run_id: str, now_fn: Callable[[], pd.Timestamp],
+) -> PriorCatchUp:
+    """Best-effort finalization of prior-date unresolved orders; never raises BrokerReadError."""
+    if not gateway.prior_unresolved_dates(date_str, bound_only=True):
+        return PriorCatchUp()
+    try:
+        await broker.ensure_token(sess)
+    except BrokerReadError as exc:
+        _log_read_failure(env=env, phase=phase, run_id=run_id, step="prior_catch_up_token", exc=exc)
+        return PriorCatchUp(token_failed=True)
+    budget = _gateway_now(now_fn)() + timedelta(seconds=ORDER_PRIOR_CATCH_UP_BUDGET_SECONDS)
+    try:
+        with journal.exclusive():
+            reports, failed = await gateway.reconcile_prior_dates(sess, date_str, budget_deadline=budget)
+    except BrokerTokenError as exc:
+        _log_read_failure(env=env, phase=phase, run_id=run_id, step="prior_catch_up_token", exc=exc)
+        return PriorCatchUp(failed_dates=gateway.prior_unresolved_dates(date_str, bound_only=True), token_failed=True)
+    logger.info("[EXEC] stage=prior_catch_up env=%s phase=%s run_id=%s dates=%s failed=%s", env, phase, run_id,
+                [r.trading_date for r in reports], list(failed))
+    return PriorCatchUp(reports=reports, failed_dates=failed)
+
+
+def _with_prior_check(report: OrderSessionReport, gateway: OrderGateway, date_str: str) -> OrderSessionReport:
+    """Page a run that ends OK or with nothing to do while a prior-date order is still unresolved."""
+    pending = gateway.prior_unresolved_dates(date_str)
+    if not pending:
+        return report
+    metrics = {**dict(report.metrics), "prior_unresolved_dates": list(pending)}
+    quiet = report.outcome == RUN_OUTCOME_OK or (
+        report.outcome == RUN_OUTCOME_SKIPPED and report.reason in ("no_open_positions", "no_orders"))
+    if quiet:
+        return OrderSessionReport(report.phase, report.trading_date, RUN_OUTCOME_DEGRADED, REASON_PRIOR_UNRESOLVED,
+                                  metrics)
+    return OrderSessionReport(report.phase, report.trading_date, report.outcome, report.reason, metrics)
 
 
 def _hhmmss(moment: pd.Timestamp) -> str:
@@ -533,6 +594,26 @@ async def _run_exit(
 ) -> OrderSessionReport:
     gateway = OrderGateway(broker, journal, _limits_from_settings(env), run_id=run_id, now_fn=_gateway_now(now_fn),
                            sleep_fn=sleep_fn)
+    # A buy whose same-day reconcile never read the broker has no lot yet; bind its fills before selling.
+    await _catch_up_prior(gateway=gateway, broker=broker, journal=journal, sess=sess, date_str=date_str,
+                          env=env, phase="exit", run_id=run_id, now_fn=now_fn)
+    report = await _run_exit_body(date_str=date_str, now_fn=now_fn, sleep_fn=sleep_fn, broker=broker,
+                                  journal=journal, sess=sess, env=env, run_id=run_id, gateway=gateway)
+    return _with_prior_check(report, gateway, date_str)
+
+
+async def _run_exit_body(
+    *,
+    date_str: str,
+    now_fn: Callable[[], pd.Timestamp],
+    sleep_fn: Callable[[float], Awaitable[None]],
+    broker: SessionBrokerPort,
+    journal: OrderJournal,
+    sess: Any,
+    env: str,
+    run_id: str,
+    gateway: OrderGateway,
+) -> OrderSessionReport:
     lots = [lot for lot in journal.open_lots() if lot.trading_date < date_str]
     n_carryover: int | None = None
     if not lots:
@@ -749,20 +830,38 @@ async def _run_reconcile(
             if gap > ORDER_MAX_PRESTART_WAIT_SECONDS:
                 return OrderSessionReport(phase, date_str, RUN_OUTCOME_SKIPPED, "before_window", {"env": env})
             await sleep_fn(max(0.0, gap))
+    caught = await _catch_up_prior(gateway=gateway, broker=broker, journal=journal, sess=sess, date_str=date_str,
+                                   env=env, phase=phase, run_id=run_id, now_fn=now_fn)
     # The entry-scope pass is the only one that finalizes a same-day sell remainder, so it must also run on a
     # day without entry orders while such a sell is still working.
     sweeps_sells = scope is OrderPhase.ENTRY and _has_working_orders(journal, date_str)
     if not _scope_intents(journal, date_str, scope) and not sweeps_sells:
-        return OrderSessionReport(phase, date_str, RUN_OUTCOME_SKIPPED, "no_orders",
-                                  {"env": env, "scope": scope.value})
+        # Nothing else in this run would report what the catch-up saw (or could not see).
+        if caught.failed_dates:
+            return OrderSessionReport(phase, date_str, RUN_OUTCOME_DEGRADED, "prior_catch_up_unreadable", {
+                "env": env, "scope": scope.value, "failed_dates": list(caught.failed_dates)})
+        final = caught.final_report
+        if final is not None and (final.position_shortfalls or final.unknown_exposures):
+            return OrderSessionReport(phase, date_str, RUN_OUTCOME_DEGRADED, "prior_position_mismatch", {
+                "env": env, "scope": scope.value,
+                "position_shortfalls": [list(t) for t in final.position_shortfalls],
+                "unknown_exposures": [list(t) for t in final.unknown_exposures]})
+        return _with_prior_check(
+            OrderSessionReport(phase, date_str, RUN_OUTCOME_SKIPPED, "no_orders", {"env": env, "scope": scope.value}),
+            gateway, date_str)
     last_report: ReconcileReport | None = None
     last_failed = False
     n_carryover = 0
+    token_retry_at: pd.Timestamp | None = (
+        now_fn() + pd.Timedelta(seconds=ORDER_TOKEN_RETRY_MIN_SECONDS) if caught.token_failed else None)
     while True:
         now = now_fn()
         past_deadline = backdated or _hhmmss(now) >= deadline_hhmmss
         finalize = backdated or (scope is OrderPhase.ENTRY and past_deadline)
         try:
+            if token_retry_at is not None and now < token_retry_at:
+                # A plain read error on purpose: a BrokerTokenError here would push token_retry_at out forever.
+                raise BrokerReadError("token: retry paced")
             await broker.ensure_token(sess)
             with journal.exclusive():
                 n_carryover += await gateway.resolve_carryover(sess, date_str)
@@ -772,6 +871,9 @@ async def _run_reconcile(
             logger.warning("[EXEC] stage=reconcile env=%s phase=%s run_id=%s status=read_failed detail=%s",
                            env, phase, run_id, exc)
             last_failed = True
+            if isinstance(exc, BrokerTokenError):
+                # Direct ensure or a refresh after an auth rejection: either one is an issuance attempt.
+                token_retry_at = now + pd.Timedelta(seconds=ORDER_TOKEN_RETRY_MIN_SECONDS)
         if not last_failed and last_report is not None and _all_final(journal, date_str, scope):
             break
         if past_deadline:
@@ -811,13 +913,19 @@ async def _run_reconcile(
             if decision_basis > 0:
                 metrics["entry_fill_vs_decision_bp"] = (
                     sum(st.filled_amount_krw for st in relevant) / decision_basis - 1) * 1e4
+    pending = gateway.prior_unresolved_dates(date_str)
+    if pending:
+        metrics["prior_unresolved_dates"] = list(pending)
     complete = (all(st.status is IntentStatus.FILLED for st in relevant) and last_report.n_unknown == 0
                 and last_report.n_missing_at_broker == 0 and not last_report.position_shortfalls
-                and last_report.n_unknown_unresolved_total == 0)
+                and last_report.n_unknown_unresolved_total == 0 and not last_report.unknown_exposures
+                and not pending)
     if complete:
         return OrderSessionReport(phase, date_str, RUN_OUTCOME_OK, "reconcile_complete", metrics)
     if last_report.unknown_exposures:
         reason = "unknown_exposure"
+    elif pending:
+        reason = REASON_PRIOR_UNRESOLVED
     elif last_report.n_unknown > 0:
         reason = "unknown_orders"
     elif last_report.n_missing_at_broker > 0:

@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from src.api.kis.trading import BrokerReadError
+from src.api.kis.trading import BrokerReadError, BrokerTokenError
 from src.execution.order_contract import (
     BrokerOrder,
     BrokerPosition,
@@ -1726,3 +1726,108 @@ def test_gateway_limits_defaults_come_from_constants() -> None:
     assert limits.entry_resend_margin_seconds == ENTRY_RESEND_MARGIN_SECONDS
     assert limits.entry_resend_on_not_found is False
 
+
+
+def _acked_buy(journal: OrderJournal, date: str, order_no: str, qty: int = 10) -> OrderIntent:
+    intent = _entry(intent_id=f"{date}:005930:entry", qty=qty, date=date)
+    journal.append(JournalEventKind.INTENT, intent.intent_id, intent_to_payload(intent), run_id="r")
+    journal.append(JournalEventKind.SEND, intent.intent_id, {"attempt": 1}, run_id="r")
+    journal.append(JournalEventKind.RESULT, intent.intent_id,
+                   {"attempt": 1, "verdict": "accepted", "broker_order_no": order_no,
+                    "broker_org_no": "001", "http_status": 200, "msg_cd": "0",
+                    "msg": "", "latency_ms": 1.0}, run_id="r")
+    return intent
+
+
+def test_prior_unresolved_dates_selects_bound_or_unknown_at_any_prior_date(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _carryover_limits(), _now())
+    with journal.exclusive():
+        _acked_buy(journal, "2026-10-12", "y1")
+        _unknown_with_send(journal, _entry(intent_id="2026-10-11:005930:entry", date="2026-10-11"))
+        filled = _acked_buy(journal, "2026-10-10", "f1")
+        journal.append(JournalEventKind.BROKER_STATE, filled.intent_id,
+                       {"order_qty": 10, "filled_qty": 10, "filled_amount_krw": 100_000, "remaining_qty": 0,
+                        "cancelled": False, "rejected_qty": 0, "final": True}, run_id="r")
+        missing = _entry(intent_id="2026-10-11:000660:entry", date="2026-10-11")
+        _unknown_with_send(journal, missing)
+        journal.append(JournalEventKind.NOT_FOUND, missing.intent_id, {}, run_id="r")
+        _acked_buy(journal, "2026-10-04", "old")
+        _acked_buy(journal, "2026-10-13", "today")
+    assert journal.states()[missing.intent_id].status is IntentStatus.NOT_FOUND
+    # 2026-10-04 is past the 5-day carry-over lookback and must still be listed (long market holidays).
+    assert gateway.prior_unresolved_dates("2026-10-13") == ("2026-10-04", "2026-10-11", "2026-10-12")
+    assert gateway.prior_unresolved_dates("2026-10-13", bound_only=True) == ("2026-10-04", "2026-10-12")
+
+
+def test_reconcile_prior_dates_requires_lock(tmp_path: Path) -> None:
+    gateway, _ = _gateway(tmp_path, FakeBroker(), _carryover_limits(), _now())
+    with pytest.raises(RuntimeError):
+        asyncio.run(gateway.reconcile_prior_dates(object(), "2026-10-13"))
+
+
+def test_reconcile_prior_dates_finalizes_acked_entry_into_a_lot(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _carryover_limits(), _now())
+    with journal.exclusive():
+        intent = _acked_buy(journal, "2026-10-12", "y1")
+        broker.daily_script = [[_broker_order("y1", qty=10, price=10000, filled=10)]]
+        broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=10)]
+        reports, failed = asyncio.run(gateway.reconcile_prior_dates(object(), "2026-10-13"))
+        assert [(r.trading_date, r.n_filled, r.position_shortfalls) for r in reports] == [("2026-10-12", 1, ())]
+        assert failed == ()
+        state = journal.states()[intent.intent_id]
+        assert state.status is IntentStatus.FILLED and state.final
+        assert [(lot.symbol, lot.qty) for lot in journal.open_lots()] == [("005930", 10)]
+        assert asyncio.run(gateway.reconcile_prior_dates(object(), "2026-10-13")) == ((), ())
+
+
+def test_reconcile_counts_prior_acked_buy_as_exposure(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _carryover_limits(), _now())
+    with journal.exclusive():
+        _acked_buy(journal, "2026-10-12", "y1")
+        broker.daily_script = [[]]
+        broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=10)]
+        report = asyncio.run(gateway.reconcile(object(), "2026-10-13", finalize=False))
+        assert report.unknown_exposures == (("005930", 10, 10),)
+        broker.daily_script = [[]]
+        same_day = asyncio.run(gateway.reconcile(object(), "2026-10-12", finalize=False))
+        assert same_day.unknown_exposures == ()
+
+
+def test_reconcile_prior_dates_isolates_a_failing_date(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _carryover_limits(), _now())
+    with journal.exclusive():
+        _acked_buy(journal, "2026-07-01", "old")
+        recent = _acked_buy(journal, "2026-10-12", "y1")
+        broker.daily_script = [BrokerReadError("daily orders: vendor rejected the read"),
+                               [_broker_order("y1", qty=10, price=10000, filled=10)]]
+        broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=10)]
+        reports, failed = asyncio.run(gateway.reconcile_prior_dates(object(), "2026-10-13"))
+        assert failed == ("2026-07-01",)
+        assert [r.trading_date for r in reports] == ["2026-10-12"]
+        assert journal.states()[recent.intent_id].final
+
+
+def test_reconcile_prior_dates_defers_dates_past_the_budget(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _carryover_limits(), _now())
+    with journal.exclusive():
+        _acked_buy(journal, "2026-10-12", "y1")
+        reports, failed = asyncio.run(gateway.reconcile_prior_dates(object(), "2026-10-13", budget_deadline=_now()))
+        assert (reports, failed) == ((), ("2026-10-12",))
+        assert broker.daily_calls == 0
+
+
+def test_reconcile_prior_dates_stops_on_a_token_failure(tmp_path: Path) -> None:
+    broker = FakeBroker()
+    gateway, journal = _gateway(tmp_path, broker, _carryover_limits(), _now())
+    with journal.exclusive():
+        _acked_buy(journal, "2026-10-11", "a1")
+        _acked_buy(journal, "2026-10-12", "y1")
+        broker.daily_script = [BrokerTokenError("token: ensure failed: RuntimeError")] * 2
+        with pytest.raises(BrokerTokenError):
+            asyncio.run(gateway.reconcile_prior_dates(object(), "2026-10-13"))
+        assert broker.daily_calls == 1

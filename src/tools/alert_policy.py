@@ -124,7 +124,7 @@ INCIDENT_TEXTS: Mapping[IncidentKind, IncidentText] = MappingProxyType(
         IncidentKind.ORDER_RECONCILE_ENTRY: IncidentText(
             summary="매수 체결 대사 불일치",
             what="종가 매수 체결과 장부가 일치하지 않습니다(미확인 주문·잔고 부족 등).",
-            auto_action="없음(대사 단계는 자동 재실행하지 않음).",
+            auto_action="다음 영업일 08:40 매도와 대사 실행이 매도 전에 미확정 매수를 증권사 체결 내역으로 다시 대사합니다.",
             action="오늘 18:00 전에 증권사 앱의 체결 내역과 잔고를 확인하세요.",
         ),
         IncidentKind.ORDER_RECONCILE_EXIT: IncidentText(

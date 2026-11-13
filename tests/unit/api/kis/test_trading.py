@@ -19,6 +19,7 @@ from src.api.kis.trading import (
     TR_SUFFIX_REVISE_CANCEL,
     TR_SUFFIX_SELL,
     BrokerReadError,
+    BrokerTokenError,
     KisTradingClient,
     TradingBinding,
     TradingConfigError,
@@ -511,6 +512,7 @@ def test_ensure_token_failure_is_a_broker_read_error(tmp_path, monkeypatch, erro
     with pytest.raises(BrokerReadError) as err:
         asyncio.run(client.ensure_token(object()))  # type: ignore[arg-type]
     assert str(err.value) == f"token: ensure failed: {type(error).__name__}"
+    assert isinstance(err.value, BrokerTokenError)
     assert err.value.__cause__ is error
 
 
@@ -548,7 +550,7 @@ def test_account_read_with_failed_refresh_names_the_token_cause(tmp_path) -> Non
         token_bodies=[{"rt_cd": "1", "msg_cd": "XXXX"}],
         token_path="/oauth2/tokenP",
     )
-    with pytest.raises(BrokerReadError, match=r"^token: ensure failed: RuntimeError$"):
+    with pytest.raises(BrokerTokenError, match=r"^token: ensure failed: RuntimeError$"):
         asyncio.run(client.fetch_orderable_cash(session, symbol="005930", limit_price=70000))  # type: ignore[arg-type]
 
 

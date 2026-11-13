@@ -9,7 +9,7 @@ from datetime import date as _date
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
-from src.api.kis.trading import BrokerReadError
+from src.api.kis.trading import BrokerReadError, BrokerTokenError
 from src.execution.order_contract import (
     ENTRY_RESEND_TRANSPORT_ERRORS,
     BrokerOrder,
@@ -404,11 +404,16 @@ class OrderGateway:
         )
         unknown_buy: dict[str, int] = {}
         for st in states.values():
-            if st.intent is None or st.status is not IntentStatus.UNKNOWN:
+            if st.intent is None or st.intent.side is not OrderSide.BUY:
                 continue
-            if st.intent.side is not OrderSide.BUY:
+            if st.status is IntentStatus.UNKNOWN:
+                unresolved = st.intent.qty
+            elif st.intent.trading_date < trading_date and st.broker_order_no and not st.final:
+                # A prior-day buy whose fills were never bound: shares can sit at the broker with no journal lot.
+                unresolved = st.intent.qty - st.filled_qty
+            else:
                 continue
-            unknown_buy[st.intent.symbol] = unknown_buy.get(st.intent.symbol, 0) + st.intent.qty
+            unknown_buy[st.intent.symbol] = unknown_buy.get(st.intent.symbol, 0) + unresolved
         exposures: list[tuple[str, int, int]] = []
         for symbol in sorted(unknown_buy):
             excess = holding.get(symbol, 0) - journal_qty.get(symbol, 0)
@@ -435,6 +440,52 @@ class OrderGateway:
             n_unknown_unresolved_total=n_unknown_unresolved_total,
             unknown_exposures=tuple(exposures),
         )
+
+    def prior_unresolved_dates(self, as_of_date: str, *, bound_only: bool = False) -> tuple[str, ...]:
+        """Return every trading date before as_of_date holding a non-final bound or UNKNOWN intent.
+
+        No lookback bound: a long market holiday can push the previous session past any calendar window, and an
+        unresolved buy must never age out of detection. ``bound_only`` keeps only intents with a broker order
+        number (UNKNOWN ones are adopted by resolve_carryover within its lookback).
+        """
+        dates: set[str] = set()
+        for st in self._journal.states().values():
+            if st.intent is None or st.final or st.intent.trading_date >= as_of_date:
+                continue
+            if not st.broker_order_no and (bound_only or st.status is not IntentStatus.UNKNOWN):
+                continue
+            dates.add(st.intent.trading_date)
+        return tuple(sorted(dates))
+
+    async def reconcile_prior_dates(
+        self, session: Any, as_of_date: str, *, budget_deadline: datetime | None = None,
+    ) -> tuple[tuple[ReconcileReport, ...], tuple[str, ...]]:
+        """Finalize prior-date bound intents from the broker's daily orders; returns (reports, failed dates).
+
+        Orders of a past session are terminal, so each date is reconciled with finalize=True, exactly like the
+        operator's backdated ``--date`` run. A read failure on one date is logged and never blocks later dates.
+        Dates go oldest first (a prior buy must be bound before the next day's sell of it, or the journal sees exits
+        exceeding fills); dates not started by ``budget_deadline`` are reported failed (deferred), so a backlog never
+        eats the caller's order window.
+        """
+        self._require_lock()
+        reports: list[ReconcileReport] = []
+        failed: list[str] = []
+        for prior in self.prior_unresolved_dates(as_of_date, bound_only=True):
+            if budget_deadline is not None and self._now_fn() >= budget_deadline:
+                logger.warning("[EXEC] stage=prior_catch_up trading_date=%s run_id=%s status=deferred_budget",
+                               prior, self._run_id)
+                failed.append(prior)
+                continue
+            try:
+                reports.append(await self.reconcile(session, prior, finalize=True))
+            except BrokerTokenError:
+                raise  # not date-specific: every later date would retry issuance
+            except BrokerReadError as exc:
+                logger.warning("[EXEC] stage=prior_catch_up trading_date=%s run_id=%s status=read_failed detail=%s",
+                               prior, self._run_id, exc)
+                failed.append(prior)
+        return tuple(reports), tuple(failed)
 
     async def resolve_carryover(self, session: Any, as_of_date: str) -> int:
         """Adopt broker orders for prior-date UNKNOWN intents; return how many were adopted."""

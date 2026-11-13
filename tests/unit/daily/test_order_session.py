@@ -11,7 +11,7 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from src.api.kis.trading import BrokerReadError, TradingBinding, TradingDisabledError
+from src.api.kis.trading import BrokerReadError, BrokerTokenError, TradingBinding, TradingDisabledError
 from src.daily import order_session as sut
 from src.data.session_calendar import SessionDay, SessionKind
 from src.execution.order_contract import (
@@ -66,6 +66,7 @@ class FakeBroker:
         self.positions_error: Exception | None = None
         self.cancel_calls: list[str] = []
         self.journal_probe: Any | None = None
+        self.daily_by_date: dict[str, list[BrokerOrder] | Exception] = {}
 
     async def ensure_token(self, session: Any) -> None:
         self.ensure_calls += 1
@@ -98,6 +99,11 @@ class FakeBroker:
 
     async def fetch_daily_orders(self, session: Any, trading_date: str) -> list[BrokerOrder]:
         self.daily_calls += 1
+        if trading_date in self.daily_by_date:
+            dated = self.daily_by_date[trading_date]
+            if isinstance(dated, Exception):
+                raise dated
+            return list(dated)
         if not self.daily_script:
             return []
         item = self.daily_script.pop(0)
@@ -735,9 +741,194 @@ def test_reconcile_retries_after_a_real_token_failure(mock_binding, runner, tmp_
     _add_acked(journal, _entry_intent("005930", DAY, 10, 70_000), "n1")
     broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=10)]
     broker.daily_script = [[_broker_row("n1", "005930", OrderSide.BUY, 10, 70_000, 10, 700_000)]]
-    report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=[ts("153100")] * 10)
+    clock = [pd.Timestamp(f"{DAY} 15:31:00", tz="Asia/Seoul") + pd.Timedelta(seconds=10 * i) for i in range(60)]
+    report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=clock)
     assert report.outcome == "OK"
     assert broker.ensure_calls == 2
+
+
+def _ten_second_clock(start: str, n: int) -> list[pd.Timestamp]:
+    return [pd.Timestamp(f"{DAY} {start}", tz="Asia/Seoul") + pd.Timedelta(seconds=10 * i) for i in range(n)]
+
+
+def test_reconcile_paces_token_retries(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_acked(journal, _entry_intent("005930", DAY, 10, 70_000), "n1")
+    broker.ensure_error = BrokerTokenError("token: ensure failed: RuntimeError")
+    report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal,
+                        clock=_ten_second_clock("15:31:00", 70))
+    assert (report.outcome, report.reason) == ("DEGRADED", "broker_unreadable")
+    # 15:31:00 -> 15:40:00 is 540 s: one try per ORDER_TOKEN_RETRY_MIN_SECONDS, not one per 10 s poll.
+    assert broker.ensure_calls <= 540 // int(sut.ORDER_TOKEN_RETRY_MIN_SECONDS) + 1
+    assert broker.ensure_calls >= 2
+
+
+def test_reconcile_entry_catches_up_prior_day(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_acked(journal, _entry_intent("005930", YESTERDAY, 10, 70_000), "y1")
+    broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=10)]
+    broker.daily_by_date[YESTERDAY] = [_broker_row("y1", "005930", OrderSide.BUY, 10, 70_000, 10, 700_000)]
+    report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=[ts("153100")] * 10)
+    assert (report.outcome, report.reason) == ("SKIPPED", "no_orders")
+    state = journal.states()[entry_intent_id(YESTERDAY, "005930")]
+    assert state.final and state.filled_qty == 10
+    assert [(lot.symbol, lot.qty) for lot in journal.open_lots()] == [("005930", 10)]
+
+
+def test_reconcile_no_orders_with_unresolved_prior_pages(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_acked(journal, _entry_intent("005930", YESTERDAY, 10, 70_000), "y1")
+    broker.daily_by_date[YESTERDAY] = []
+    report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=[ts("153100")] * 10)
+    assert (report.outcome, report.reason) == ("DEGRADED", "prior_orders_unresolved")
+    assert report.metrics["prior_unresolved_dates"] == [YESTERDAY]
+
+
+def test_no_prior_work_means_no_broker_call(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_filled_entry(journal, entry_intent_id(YESTERDAY, "005930"), "005930", YESTERDAY, 10, 70_000)
+    report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=[ts("153100")] * 10)
+    assert (report.outcome, report.reason) == ("SKIPPED", "no_orders")
+    broker.assert_quiet()
+
+
+def test_exit_catches_up_a_missed_entry_reconcile_and_sells(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_acked(journal, _entry_intent("005930", YESTERDAY, 10, 70_000), "y1")
+    broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=10)]
+    broker.daily_by_date[YESTERDAY] = [_broker_row("y1", "005930", OrderSide.BUY, 10, 70_000, 10, 700_000)]
+    report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("084010")] * 30)
+    assert (report.outcome, report.reason) == ("OK", "exit_complete")
+    assert broker.submit_calls == [sut.exit_intent_id(entry_intent_id(YESTERDAY, "005930"), DAY)]
+
+
+def test_exit_with_unresolvable_prior_buy_pages(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_acked(journal, _entry_intent("005930", YESTERDAY, 10, 70_000), "y1")
+    broker.daily_by_date[YESTERDAY] = []
+    report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("084010")] * 30)
+    assert (report.outcome, report.reason) == ("DEGRADED", "prior_orders_unresolved")
+    assert report.metrics["prior_unresolved_dates"] == [YESTERDAY]
+    assert broker.submit_calls == []
+
+
+def test_exit_catch_up_read_failure_is_best_effort(mock_binding, runner, caplog) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    two_days_ago = "2026-10-11"
+    _add_filled_entry(journal, entry_intent_id(YESTERDAY, "000660"), "000660", YESTERDAY, 4, 50_000)
+    _add_acked(journal, _entry_intent("005930", two_days_ago, 10, 70_000), "a1")
+    broker.positions = [BrokerPosition(symbol="000660", holding_qty=4, sellable_qty=4)]
+    broker.daily_by_date[two_days_ago] = BrokerReadError("daily orders: vendor rejected the read")
+    with caplog.at_level(logging.WARNING):
+        report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("084010")] * 30)
+    assert broker.submit_calls == [sut.exit_intent_id(entry_intent_id(YESTERDAY, "000660"), DAY)]
+    assert (report.outcome, report.reason) == ("DEGRADED", "prior_orders_unresolved")
+    assert "stage=prior_catch_up trading_date=2026-10-11" in caplog.text and "status=read_failed" in caplog.text
+
+
+def test_reconcile_with_orders_and_unresolved_prior_pages(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_acked(journal, _entry_intent("000660", YESTERDAY, 4, 50_000), "y1")
+    _add_acked(journal, _entry_intent("005930", DAY, 10, 70_000), "n1")
+    broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=10)]
+    broker.daily_by_date[YESTERDAY] = []
+    broker.daily_by_date[DAY] = [_broker_row("n1", "005930", OrderSide.BUY, 10, 70_000, 10, 700_000)]
+    report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=[ts("153100")] * 10)
+    assert (report.outcome, report.reason) == ("DEGRADED", "prior_orders_unresolved")
+    assert report.metrics["prior_unresolved_dates"] == [YESTERDAY]
+    assert report.metrics["unknown_exposures"] == []
+
+
+def test_exit_degraded_keeps_reason_and_lists_prior_unresolved(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_filled_entry(journal, entry_intent_id(YESTERDAY, "005930"), "005930", YESTERDAY, 10, 70_000)
+    _add_acked(journal, _entry_intent("000660", YESTERDAY, 4, 50_000), "y1")
+    broker.daily_by_date[YESTERDAY] = []
+    report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("085900")] * 4)
+    assert (report.outcome, report.reason) == ("DEGRADED", "exit_window_expired")
+    assert report.metrics["prior_unresolved_dates"] == [YESTERDAY]
+
+
+def test_exit_catches_up_a_buy_from_before_a_long_holiday(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    before_holiday = "2026-10-02"
+    _add_acked(journal, _entry_intent("005930", before_holiday, 10, 70_000), "h1")
+    broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=10)]
+    broker.daily_by_date[before_holiday] = [_broker_row("h1", "005930", OrderSide.BUY, 10, 70_000, 10, 700_000)]
+    report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("084010")] * 30)
+    assert (report.outcome, report.reason) == ("OK", "exit_complete")
+    assert broker.submit_calls == [sut.exit_intent_id(entry_intent_id(before_holiday, "005930"), DAY)]
+
+
+def test_reconcile_no_orders_reports_prior_position_mismatch(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_acked(journal, _entry_intent("005930", YESTERDAY, 10, 70_000), "y1")
+    broker.positions = []
+    broker.daily_by_date[YESTERDAY] = [_broker_row("y1", "005930", OrderSide.BUY, 10, 70_000, 10, 700_000)]
+    report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=[ts("153100")] * 10)
+    assert (report.outcome, report.reason) == ("DEGRADED", "prior_position_mismatch")
+    assert report.metrics["position_shortfalls"] == [["005930", 10, 0]]
+
+
+def test_catch_up_token_failure_paces_the_reconcile_loop(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_acked(journal, _entry_intent("000660", YESTERDAY, 4, 50_000), "y1")
+    _add_acked(journal, _entry_intent("005930", DAY, 10, 70_000), "n1")
+    broker.ensure_error = BrokerTokenError("token: ensure failed: RuntimeError")
+    clock = _ten_second_clock("15:31:00", 3) + _ten_second_clock("15:41:00", 5)
+    report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=clock)
+    assert (report.outcome, report.reason) == ("DEGRADED", "broker_unreadable")
+    # The catch-up's failed issuance counts: the loop waits a full minute instead of retrying at 15:31:10.
+    assert broker.ensure_calls == 1
+
+
+def test_reconcile_no_orders_reports_unreadable_catch_up(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_acked(journal, _entry_intent("005930", YESTERDAY, 10, 70_000), "y1")
+    broker.daily_by_date[YESTERDAY] = [_broker_row("y1", "005930", OrderSide.BUY, 10, 70_000, 10, 700_000)]
+    broker.positions_error = BrokerReadError("balance: vendor rejected the read")
+    report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=[ts("153100")] * 10)
+    # The fills were bound before the holdings read failed, so no date is pending, yet the check never ran.
+    assert journal.states()[entry_intent_id(YESTERDAY, "005930")].final
+    assert (report.outcome, report.reason) == ("DEGRADED", "prior_catch_up_unreadable")
+    assert report.metrics["failed_dates"] == [YESTERDAY]
+
+
+def test_catch_up_judges_holdings_after_the_last_prior_date(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    two_days_ago = "2026-10-11"
+    buy = _entry_intent("005930", two_days_ago, 10, 70_000)
+    _add_acked(journal, buy, "b1")
+    sell = OrderIntent(intent_id=sut.exit_intent_id(buy.intent_id, YESTERDAY), trading_date=YESTERDAY,
+                       phase=OrderPhase.EXIT, symbol="005930", side=OrderSide.SELL, order_type=OrderType.MARKET,
+                       qty=10, limit_price=None, decision_price=None, parent_intent_id=buy.intent_id)
+    _add_acked(journal, sell, "s1")
+    broker.positions = []
+    broker.daily_by_date[two_days_ago] = [_broker_row("b1", "005930", OrderSide.BUY, 10, 70_000, 10, 700_000)]
+    broker.daily_by_date[YESTERDAY] = [_broker_row("s1", "005930", OrderSide.SELL, 10, 0, 10, 710_000)]
+    report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=[ts("153100")] * 10)
+    # Mid-sequence the bought lot exceeds the (already sold) holding; only the end state is a verdict.
+    assert (report.outcome, report.reason) == ("SKIPPED", "no_orders")
+    assert journal.open_lots() == []
+
+
+def test_reconcile_paces_a_failed_refresh_inside_a_read(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_acked(journal, _entry_intent("005930", DAY, 10, 70_000), "n1")
+    broker.daily_script = [BrokerTokenError("token: ensure failed: RuntimeError")] * 80
+    report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal,
+                        clock=_ten_second_clock("15:31:00", 70))
+    assert (report.outcome, report.reason) == ("DEGRADED", "broker_unreadable")
+    assert broker.daily_calls <= 540 // int(sut.ORDER_TOKEN_RETRY_MIN_SECONDS) + 1
+
+
+def test_catch_up_refresh_failure_marks_token_and_pages(mock_binding, runner) -> None:
+    broker, journal = FakeBroker(), runner.journal()
+    _add_acked(journal, _entry_intent("005930", YESTERDAY, 10, 70_000), "y1")
+    broker.daily_by_date[YESTERDAY] = BrokerTokenError("token: ensure failed: RuntimeError")
+    report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=[ts("153100")] * 10)
+    assert (report.outcome, report.reason) == ("DEGRADED", "prior_catch_up_unreadable")
+    assert report.metrics["failed_dates"] == [YESTERDAY]
 
 
 def test_reconcile_reports_unreadable_broker(mock_binding, runner) -> None:

@@ -76,6 +76,10 @@ class BrokerReadError(RuntimeError):
     """An account read failed or returned data that cannot be trusted."""
 
 
+class BrokerTokenError(BrokerReadError):
+    """No usable access token could be loaded or issued (direct ensure or a refresh after an auth rejection)."""
+
+
 @dataclass(frozen=True)
 class TradingBinding:
     """Immutable binding of one trading environment to its endpoint, credentials and TR prefix."""
@@ -252,7 +256,7 @@ class KisTradingClient:
         except Exception as exc:
             # Any failure, including a malformed issuance reply (TypeError/AttributeError while parsing it); cancellation
             # is a BaseException and passes. Only the type: the error message carries the raw vendor reply.
-            raise BrokerReadError(f"token: ensure failed: {type(exc).__name__}") from exc
+            raise BrokerTokenError(f"token: ensure failed: {type(exc).__name__}") from exc
 
     async def submit_order(self, session: aiohttp.ClientSession, intent: OrderIntent) -> SubmitResult:
         """Send exactly one order POST and classify it; never raises for transport or vendor errors."""
