@@ -505,11 +505,15 @@ class KisTradingClient:
         return min(candidates)
 
     async def fetch_price_limits(self, session: aiohttp.ClientSession, symbol: str) -> PriceLimits:
-        """Return the symbol's last price and same-day price band; raises BrokerReadError."""
+        """Return the symbol's last price and same-day price band; raises BrokerReadError (BrokerTokenError on token)."""
         try:
             res = await self.api_client.get_current_price(
                 session, symbol, market_div_code=KRX_CLOSE_MARKET_DIV_CODE, allow_market_div_fallback=False
             )
+        except RuntimeError as exc:
+            # The data client refreshes a rejected token itself and lets issuance failures (RuntimeError family)
+            # escape; classify them as token failures so callers pace retries to the issuance limit.
+            raise BrokerTokenError(f"price limits: token refresh failed: {type(exc).__name__}") from exc
         except Exception as exc:
             raise BrokerReadError("price limits: quote request failed") from exc
         if not isinstance(res, dict) or res.get("rt_cd") != "0":
@@ -644,6 +648,9 @@ class KisTradingClient:
             raise BrokerReadError(f"{stage}: body is not an object http={response.status}")
         if str(body.get("msg_cd", "")) == "EGW00201":
             raise BrokerReadError(f"{stage}: rate limit was not absorbed")
+        if is_auth_rejected("kis", response.status, body):
+            # The transport already refreshed once and replayed; another try would issue again, so pace it.
+            raise BrokerTokenError(f"{stage}: auth rejected after refresh {self._vendor_detail(response)}")
         if body.get("rt_cd") != "0":
             raise BrokerReadError(f"{stage}: vendor rejected the read {self._vendor_detail(response)}")
         return body

@@ -11,7 +11,7 @@ import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -28,6 +28,7 @@ from src.config.market_session import (
     DECISION_WINDOW_END_HHMMSS,
     ORDER_ENTRY_DECISION_WAIT_DEADLINE_HHMMSS,
     ORDER_ENTRY_EARLIEST_HHMMSS,
+    ORDER_ENTRY_PRECHECK_RETRY_UNTIL_HHMMSS,
     ORDER_ENTRY_RECONCILE_DEADLINE_HHMMSS,
     ORDER_ENTRY_RECONCILE_EARLIEST_HHMMSS,
     ORDER_ENTRY_SUBMIT_DEADLINE_HHMMSS,
@@ -81,6 +82,13 @@ ORDER_RECONCILE_POLL_SECONDS: float = 10.0
 # KIS issues at most one token per minute per app key; a reconcile loop must not retry issuance faster.
 ORDER_TOKEN_RETRY_MIN_SECONDS: float = 60.0
 REASON_PRIOR_UNRESOLVED: str = "prior_orders_unresolved"
+# Read-only entry pre-checks retry at this cadence until ORDER_ENTRY_PRECHECK_RETRY_UNTIL_HHMMSS; the attempt cap
+# bounds the loop even if the clock does not advance.
+ORDER_ENTRY_PRECHECK_RETRY_SECONDS: float = 5.0
+ORDER_ENTRY_PRECHECK_MAX_ATTEMPTS: int = 60
+# Per-pick quote retries stay few: the data client can hide a failed token refresh behind a generic failure, so this
+# cap bounds the issuance attempts such a hidden failure could trigger.
+ORDER_ENTRY_PRICE_PRECHECK_MAX_ATTEMPTS: int = 3
 # Prior-date catch-up must leave the exit window (08:40-08:59) to the sells; dates not started by then wait a run.
 ORDER_PRIOR_CATCH_UP_BUDGET_SECONDS: float = 120.0
 ORDER_MAX_PRESTART_WAIT_SECONDS: float = 120.0
@@ -177,6 +185,60 @@ def _with_prior_check(report: OrderSessionReport, gateway: OrderGateway, date_st
         return OrderSessionReport(report.phase, report.trading_date, RUN_OUTCOME_DEGRADED, REASON_PRIOR_UNRESOLVED,
                                   metrics)
     return OrderSessionReport(report.phase, report.trading_date, report.outcome, report.reason, metrics)
+
+
+_T = TypeVar("_T")
+
+
+@dataclass
+class _TokenPacer:
+    """Run-wide token pacing shared by every entry pre-check read, so a token failure on one read holds all of them."""
+
+    blocked_until: pd.Timestamp | None = None
+    last_error: BrokerTokenError | None = None
+
+
+async def _read_with_retry(
+    read: Callable[[], Awaitable[_T]], *, step: str, env: str, run_id: str,
+    now_fn: Callable[[], pd.Timestamp], sleep_fn: Callable[[float], Awaitable[None]],
+    pacer: _TokenPacer | None = None, max_attempts: int = ORDER_ENTRY_PRECHECK_MAX_ATTEMPTS,
+) -> _T:
+    """Run a read-only pre-trade read, retrying BrokerReadError until the entry pre-check cutoff; re-raises the last.
+
+    A token failure (here or on an earlier read sharing ``pacer``) blocks every read for ORDER_TOKEN_RETRY_MIN_SECONDS;
+    a read whose token window opens only past the cutoff is not attempted and re-raises that token failure.
+    """
+    pacer = pacer if pacer is not None else _TokenPacer()
+    attempt = 0
+    while True:
+        if pacer.blocked_until is not None and pacer.last_error is not None:
+            now = now_fn()
+            if now < pacer.blocked_until:
+                if _hhmmss(pacer.blocked_until) >= ORDER_ENTRY_PRECHECK_RETRY_UNTIL_HHMMSS:
+                    raise pacer.last_error
+                await sleep_fn((pacer.blocked_until - now).total_seconds())
+                if _hhmmss(now_fn()) >= ORDER_ENTRY_PRECHECK_RETRY_UNTIL_HHMMSS:
+                    raise pacer.last_error
+        attempt += 1
+        try:
+            return await read()
+        except BrokerReadError as exc:
+            _log_read_failure(env=env, phase="entry", run_id=run_id, step=step, exc=exc)
+            failed_at = now_fn()
+            if isinstance(exc, BrokerTokenError):
+                pacer.blocked_until = failed_at + pd.Timedelta(seconds=ORDER_TOKEN_RETRY_MIN_SECONDS)
+                pacer.last_error = exc
+                wait = ORDER_TOKEN_RETRY_MIN_SECONDS
+            else:
+                wait = ORDER_ENTRY_PRECHECK_RETRY_SECONDS
+            next_at = failed_at + pd.Timedelta(seconds=wait)
+            if attempt >= max_attempts or _hhmmss(next_at) >= ORDER_ENTRY_PRECHECK_RETRY_UNTIL_HHMMSS:
+                raise
+            logger.warning("[EXEC] stage=entry_precheck env=%s run_id=%s step=%s attempt=%d status=retry wait_s=%.1f",
+                           env, run_id, step, attempt, wait)
+            await sleep_fn(wait)
+            if _hhmmss(now_fn()) >= ORDER_ENTRY_PRECHECK_RETRY_UNTIL_HHMMSS:
+                raise  # a late wake-up must not start an attempt past the cutoff
 
 
 def _hhmmss(moment: pd.Timestamp) -> str:
@@ -420,18 +482,16 @@ async def _run_entry(
                 journal=journal, intent_ids=[], n_picks=len(picks), n_skipped=len(halted),
                 capital=0, date_str=date_str, env=env, ready_at=ready_at,
                 t_first=moment, t_last=moment, deadline=deadline, run_id=run_id, post_send=None)
-        try:
+        async def _read_cash() -> int:
             await broker.ensure_token(sess)
-        except BrokerReadError as exc:
-            _log_read_failure(env=env, phase="entry", run_id=run_id, step="token", exc=exc)
-            return OrderSessionReport(
-                "entry", date_str, RUN_OUTCOME_DEGRADED, "orderable_cash_unreadable",
-                {"env": env, "n_picks": len(picks)},
-            )
+            return await broker.fetch_orderable_cash(sess, symbol=top["symbol"], limit_price=top["close"])
+
+        pacer = _TokenPacer()
         try:
-            cash = await broker.fetch_orderable_cash(sess, symbol=top["symbol"], limit_price=top["close"])
-        except BrokerReadError as exc:
-            _log_read_failure(env=env, phase="entry", run_id=run_id, step="orderable_cash", exc=exc)
+            # Without the cash figure a buy could exceed it (미수), so a read that never succeeds still buys nothing.
+            cash = await _read_with_retry(_read_cash, step="orderable_cash", env=env, run_id=run_id,
+                                          now_fn=now_fn, sleep_fn=sleep_fn, pacer=pacer)
+        except BrokerReadError:
             return OrderSessionReport(
                 "entry", date_str, RUN_OUTCOME_DEGRADED, "orderable_cash_unreadable",
                 {"env": env, "n_picks": len(picks)},
@@ -440,8 +500,12 @@ async def _run_entry(
         priced: list[EntryPick] = []
         skips: list[PlannedSkip] = []
         for pick in picks:
+            symbol: str = pick["symbol"]
             try:
-                limits = await broker.fetch_price_limits(sess, pick["symbol"])
+                limits = await _read_with_retry(
+                    functools.partial(broker.fetch_price_limits, sess, symbol), step=f"price_limits:{symbol}",
+                    env=env, run_id=run_id, now_fn=now_fn, sleep_fn=sleep_fn, pacer=pacer,
+                    max_attempts=ORDER_ENTRY_PRICE_PRECHECK_MAX_ATTEMPTS)
                 price = entry_limit_price(pick["close"], settings.ORDER_ENTRY_LIMIT_BUFFER_BP, limits.upper)
             except (BrokerReadError, ValueError):
                 skips.append(PlannedSkip(

@@ -952,6 +952,29 @@ def test_account_read_transport_failure_names_only_the_exception_type(tmp_path) 
     assert isinstance(err.value.__cause__, aiohttp.ClientPayloadError)
 
 
+def test_price_limits_token_failure_is_a_token_error(tmp_path, monkeypatch) -> None:
+    client, api, _ = _trading_client(_mock_binding(), tmp_path)
+
+    async def _issuance_failed(*_a: object, **_kw: object) -> dict:
+        raise RuntimeError("토큰 발급 실패: {'msg1': 'vendor text'}")
+
+    monkeypatch.setattr(api, "get_current_price", _issuance_failed)
+    with pytest.raises(BrokerTokenError, match=r"^price limits: token refresh failed: RuntimeError$"):
+        asyncio.run(client.fetch_price_limits(object(), "005930"))  # type: ignore[arg-type]
+
+
+def test_auth_rejected_after_refresh_is_a_token_error(tmp_path) -> None:
+    client, _, _ = _trading_client(_mock_binding(), tmp_path, bearer="OLD")
+    rejected = {"rt_cd": "1", "msg_cd": "EGW00123", "msg1": "expired"}
+    session = scripted_session(
+        [FakeBrokerResponse(body=rejected, status=200), FakeBrokerResponse(body=rejected, status=200)],
+        token_bodies=[{"access_token": "NEW", "expires_in": 86400}],
+        token_path="/oauth2/tokenP",
+    )
+    with pytest.raises(BrokerTokenError, match="buying power: auth rejected after refresh"):
+        asyncio.run(client.fetch_orderable_cash(session, symbol="005930", limit_price=70000))  # type: ignore[arg-type]
+
+
 def test_price_limits_validated(tmp_path) -> None:
     client, _, _ = _trading_client(_mock_binding(), tmp_path)
     body = {"rt_cd": "0", "output": {"stck_prpr": "263000", "stck_mxpr": "349000", "stck_llam": "188000"}}

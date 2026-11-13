@@ -110,6 +110,9 @@ MAX_PREV_TRADING_DAY_LOOKBACK: int = 15
 ORDER_ENTRY_EARLIEST_HHMMSS: str = DECISION_WINDOW_START_HHMMSS
 ORDER_ENTRY_DECISION_WAIT_DEADLINE_HHMMSS: str = REALTIME_REQUOTE_DEADLINE_HHMMSS
 ORDER_ENTRY_SUBMIT_DEADLINE_HHMMSS: str = "152900"
+# Last moment a failed read-only entry pre-check (token, orderable cash, price band) is retried: leaves time to
+# submit and for the operator page to be actionable before the submit deadline.
+ORDER_ENTRY_PRECHECK_RETRY_UNTIL_HHMMSS: str = "152600"
 ORDER_EXIT_EARLIEST_HHMMSS: str = "084000"
 ORDER_EXIT_SUBMIT_DEADLINE_HHMMSS: str = "085900"
 ORDER_ENTRY_RECONCILE_EARLIEST_HHMMSS: str = "153030"

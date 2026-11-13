@@ -67,6 +67,8 @@ class FakeBroker:
         self.cancel_calls: list[str] = []
         self.journal_probe: Any | None = None
         self.daily_by_date: dict[str, list[BrokerOrder] | Exception] = {}
+        self.cash_script: list[Exception] = []
+        self.price_fail_once: dict[str, Exception] = {}
 
     async def ensure_token(self, session: Any) -> None:
         self.ensure_calls += 1
@@ -75,12 +77,16 @@ class FakeBroker:
 
     async def fetch_orderable_cash(self, session: Any, *, symbol: str, limit_price: int) -> int:
         self.cash_calls += 1
+        if self.cash_script:
+            raise self.cash_script.pop(0)
         if self.cash_error is not None:
             raise self.cash_error
         return self.cash_value
 
     async def fetch_price_limits(self, session: Any, symbol: str) -> PriceLimits:
         self.price_calls.append(symbol)
+        if symbol in self.price_fail_once:
+            raise self.price_fail_once.pop(symbol)
         if symbol in self.price_errors:
             raise self.price_errors[symbol]
         return PriceLimits(symbol=symbol, last=10_000, upper=self.upper, lower=100)
@@ -434,6 +440,155 @@ def test_unreadable_cash_plans_nothing(mock_binding, runner, caplog) -> None:
     assert "step=orderable_cash status=failed detail=buying power: vendor rejected the read msg_cd=EGW00203" in caplog.text
     assert broker.submit_calls == []
     assert [e for e in journal.load() if e.payload.get("trading_date") == DAY] == []
+
+
+def _entry_clock(start: str, n: int = 400, step_s: float = 5.0) -> list[pd.Timestamp]:
+    return [pd.Timestamp(f"{DAY} {start}", tz="Asia/Seoul") + pd.Timedelta(seconds=step_s * i) for i in range(n)]
+
+
+def _early_picks() -> pd.DataFrame:
+    return decision([("005930", 1 / 3, 263_000, 0.9), ("000660", 1 / 3, 50_000, 0.5), ("005380", 1 / 3, 9_990, 0.1)],
+                    decided="152100")
+
+
+def test_entry_retries_transient_cash_read(mock_binding, runner) -> None:
+    broker = FakeBroker()
+    broker.cash_script = [BrokerReadError("buying power: vendor rejected the read msg_cd='EGW00203'")]
+    report = runner.run("entry", DAY, broker=broker, journal=runner.journal(),
+                        clock=_entry_clock("15:21:30"), decisions=[_early_picks()])
+    assert report.outcome == "OK"
+    assert broker.cash_calls == 2
+    assert len(broker.submit_calls) == 3
+    assert sut.ORDER_ENTRY_PRECHECK_RETRY_SECONDS in runner.sleeps
+
+
+@pytest.mark.parametrize(
+    ("times", "expected_attempts"),
+    [
+        # fail 15:25:54.9 -> next 15:25:59.9 < 15:26:00: one more try; fail at 15:25:59.9 -> next 15:26:04.9: stop.
+        (["15:25:54.900", "15:25:59.900", "15:25:59.900"], 2),
+        # fail 15:25:55 -> next 15:26:00 == cutoff: no retry.
+        (["15:25:55"], 1),
+        # retry scheduled before the cutoff but the wake-up lands past it: no attempt starts.
+        (["15:25:50", "15:26:00.500"], 1),
+    ],
+)
+def test_read_with_retry_respects_the_cutoff_boundary(times, expected_attempts) -> None:
+    clock = iter(pd.Timestamp(f"{DAY} {t}", tz="Asia/Seoul") for t in times)
+    calls: list[int] = []
+
+    async def _read() -> int:
+        calls.append(1)
+        raise BrokerReadError("buying power: vendor rejected the read")
+
+    async def _sleep(_s: float) -> None:
+        return None
+
+    with pytest.raises(BrokerReadError):
+        asyncio.run(sut._read_with_retry(_read, step="orderable_cash", env="mock", run_id="r",
+                                         now_fn=lambda: next(clock), sleep_fn=_sleep))
+    assert len(calls) == expected_attempts
+
+
+def test_paced_read_waking_past_the_cutoff_is_not_attempted() -> None:
+    at = lambda t: pd.Timestamp(f"{DAY} {t}", tz="Asia/Seoul")  # noqa: E731
+    token_error = BrokerTokenError("token: ensure failed: RuntimeError")
+    pacer = sut._TokenPacer(blocked_until=at("15:25:58"), last_error=token_error)
+    clock = iter([at("15:25:50"), at("15:26:01")])
+    calls: list[int] = []
+
+    async def _read() -> int:
+        calls.append(1)
+        return 1
+
+    async def _sleep(_s: float) -> None:
+        return None
+
+    with pytest.raises(BrokerTokenError):
+        asyncio.run(sut._read_with_retry(_read, step="price_limits:005930", env="mock", run_id="r",
+                                         now_fn=lambda: next(clock), sleep_fn=_sleep, pacer=pacer))
+    assert calls == []
+
+
+def test_entry_gives_up_cash_at_cutoff(mock_binding, runner) -> None:
+    broker = FakeBroker()
+    broker.cash_error = BrokerReadError("buying power: vendor rejected the read")
+    report = runner.run("entry", DAY, broker=broker, journal=runner.journal(),
+                        clock=_entry_clock("15:25:40"), decisions=[_early_picks()])
+    assert (report.outcome, report.reason) == ("DEGRADED", "orderable_cash_unreadable")
+    assert broker.submit_calls == []
+    # 15:25:40 -> 15:26:00 leaves room for a handful of 5 s retries, never one started past the cutoff.
+    assert 1 <= broker.cash_calls <= 5
+
+
+def test_entry_paces_token_failure(mock_binding, runner) -> None:
+    broker = FakeBroker()
+    broker.cash_script = [BrokerTokenError("token: ensure failed: RuntimeError")]
+    report = runner.run("entry", DAY, broker=broker, journal=runner.journal(),
+                        clock=_entry_clock("15:21:30"), decisions=[_early_picks()])
+    assert report.outcome == "OK"
+    assert runner.sleeps.count(sut.ORDER_TOKEN_RETRY_MIN_SECONDS) == 1
+    assert sut.ORDER_ENTRY_PRECHECK_RETRY_SECONDS not in runner.sleeps
+
+
+def test_entry_retries_transient_price_limit(mock_binding, runner) -> None:
+    broker = FakeBroker()
+    broker.price_fail_once["000660"] = BrokerReadError("price limits: quote request failed")
+    report = runner.run("entry", DAY, broker=broker, journal=runner.journal(),
+                        clock=_entry_clock("15:21:30"), decisions=[_early_picks()])
+    assert report.outcome == "OK"
+    assert broker.price_calls.count("000660") == 2
+    assert len(broker.submit_calls) == 3
+
+
+def test_entry_price_value_error_is_not_retried(mock_binding, runner) -> None:
+    broker = FakeBroker()
+    broker.upper = 100  # below every decision price: entry_limit_price raises ValueError
+    report = runner.run("entry", DAY, broker=broker, journal=runner.journal(),
+                        clock=_entry_clock("15:21:30"), decisions=[_early_picks()])
+    assert broker.submit_calls == []
+    assert sorted(broker.price_calls) == sorted(["005930", "000660", "005380"])
+    assert report.outcome == "DEGRADED"
+
+
+def test_token_failure_on_one_pick_holds_the_other_picks(mock_binding, runner) -> None:
+    broker = FakeBroker()
+    broker.price_errors["005930"] = BrokerTokenError("price limits: token refresh failed: RuntimeError")
+    report = runner.run("entry", DAY, broker=broker, journal=runner.journal(),
+                        clock=_entry_clock("15:25:20"), decisions=[_early_picks()])
+    # The token window reopens only past the cutoff, so no other quote may trigger another issuance.
+    assert broker.price_calls == ["005930"]
+    assert broker.submit_calls == []
+    assert report.outcome == "DEGRADED"
+
+
+def test_token_failure_waits_then_prices_the_next_pick(mock_binding, runner) -> None:
+    broker = FakeBroker()
+    broker.price_fail_once["005930"] = BrokerTokenError("price limits: token refresh failed: RuntimeError")
+    report = runner.run("entry", DAY, broker=broker, journal=runner.journal(),
+                        clock=_entry_clock("15:21:30"), decisions=[_early_picks()])
+    assert report.outcome == "OK"
+    assert len(broker.submit_calls) == 3
+    assert runner.sleeps.count(sut.ORDER_TOKEN_RETRY_MIN_SECONDS) == 1
+
+
+def test_price_retries_are_capped_per_pick(mock_binding, runner) -> None:
+    broker = FakeBroker()
+    broker.price_errors["000660"] = BrokerReadError("price limits: quote was rejected")
+    report = runner.run("entry", DAY, broker=broker, journal=runner.journal(),
+                        clock=_entry_clock("15:21:30"), decisions=[_early_picks()])
+    assert broker.price_calls.count("000660") == sut.ORDER_ENTRY_PRICE_PRECHECK_MAX_ATTEMPTS
+    assert len(broker.submit_calls) == 2
+    assert report.outcome == "DEGRADED"
+
+
+def test_retry_is_bounded_by_attempts_on_a_frozen_clock(mock_binding, runner) -> None:
+    broker = FakeBroker()
+    broker.cash_error = BrokerReadError("buying power: vendor rejected the read")
+    report = runner.run("entry", DAY, broker=broker, journal=runner.journal(),
+                        clock=[ts("152130")] * 30, decisions=[_early_picks()])
+    assert (report.outcome, report.reason) == ("DEGRADED", "orderable_cash_unreadable")
+    assert broker.cash_calls == sut.ORDER_ENTRY_PRECHECK_MAX_ATTEMPTS
 
 
 def test_unpriceable_pick_is_skipped(mock_binding, runner) -> None:
