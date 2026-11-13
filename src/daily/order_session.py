@@ -111,6 +111,13 @@ class OrderSessionReport:
     metrics: Mapping[str, Any]
 
 
+def _log_read_failure(*, env: str, phase: str, run_id: str, step: str, exc: BrokerReadError) -> None:
+    """Log why a broker read failed; the run outcome keeps only the reason code."""
+    cause = type(exc.__cause__).__name__ if exc.__cause__ is not None else ""
+    logger.warning("[EXEC] stage=broker_read env=%s phase=%s run_id=%s step=%s status=failed detail=%s cause=%s",
+                   env, phase, run_id, step, exc, cause)
+
+
 def _hhmmss(moment: pd.Timestamp) -> str:
     return str(moment.tz_convert("Asia/Seoul").strftime("%H%M%S"))
 
@@ -354,14 +361,16 @@ async def _run_entry(
                 t_first=moment, t_last=moment, deadline=deadline, run_id=run_id, post_send=None)
         try:
             await broker.ensure_token(sess)
-        except BrokerReadError:
+        except BrokerReadError as exc:
+            _log_read_failure(env=env, phase="entry", run_id=run_id, step="token", exc=exc)
             return OrderSessionReport(
                 "entry", date_str, RUN_OUTCOME_DEGRADED, "orderable_cash_unreadable",
                 {"env": env, "n_picks": len(picks)},
             )
         try:
             cash = await broker.fetch_orderable_cash(sess, symbol=top["symbol"], limit_price=top["close"])
-        except BrokerReadError:
+        except BrokerReadError as exc:
+            _log_read_failure(env=env, phase="entry", run_id=run_id, step="orderable_cash", exc=exc)
             return OrderSessionReport(
                 "entry", date_str, RUN_OUTCOME_DEGRADED, "orderable_cash_unreadable",
                 {"env": env, "n_picks": len(picks)},
@@ -402,7 +411,8 @@ async def _run_entry(
         try:
             await gateway.reconcile(sess, date_str, finalize=False)
             post_send: str | None = None
-        except BrokerReadError:
+        except BrokerReadError as exc:
+            _log_read_failure(env=env, phase="entry", run_id=run_id, step="post_send_reconcile", exc=exc)
             post_send = "unreadable"
     return _finish_entry_report(
         journal=journal, intent_ids=[i.intent_id for i in intents], n_picks=len(picks),
@@ -433,7 +443,8 @@ async def _submit_stored_entry(
     if stored:
         try:
             await gateway.reconcile(sess, date_str, finalize=False)
-        except BrokerReadError:
+        except BrokerReadError as exc:
+            _log_read_failure(env=env, phase="entry", run_id=run_id, step="post_send_reconcile", exc=exc)
             post_send = "unreadable"
     notional = sum(intent.qty * intent.limit_price for intent in stored if intent.limit_price is not None)
     n_plan_skips = _planned_skip_count(journal, date_str, OrderPhase.ENTRY)
@@ -590,13 +601,15 @@ async def _run_exit(
                 n_carryover_adopted=n_carryover)
         try:
             await broker.ensure_token(sess)
-        except BrokerReadError:
+        except BrokerReadError as exc:
+            _log_read_failure(env=env, phase="exit", run_id=run_id, step="token", exc=exc)
             return OrderSessionReport(
                 "exit", date_str, RUN_OUTCOME_DEGRADED, "positions_unreadable",
                 {"env": env, "n_lots": len(fresh_lots)})
         try:
             positions = await broker.fetch_positions(sess)
-        except BrokerReadError:
+        except BrokerReadError as exc:
+            _log_read_failure(env=env, phase="exit", run_id=run_id, step="positions", exc=exc)
             return OrderSessionReport(
                 "exit", date_str, RUN_OUTCOME_DEGRADED, "positions_unreadable",
                 {"env": env, "n_lots": len(fresh_lots)})
@@ -626,7 +639,8 @@ async def _run_exit(
         try:
             await gateway.reconcile(sess, date_str, finalize=False)
             post_send: str | None = None
-        except BrokerReadError:
+        except BrokerReadError as exc:
+            _log_read_failure(env=env, phase="exit", run_id=run_id, step="post_send_reconcile", exc=exc)
             post_send = "unreadable"
         report = _finish_exit_report(
             journal=journal, lots=fresh_lots, exit_ids=[i.intent_id for i in intents],
@@ -754,9 +768,9 @@ async def _run_reconcile(
                 n_carryover += await gateway.resolve_carryover(sess, date_str)
                 last_report = await gateway.reconcile(sess, date_str, finalize=finalize)
             last_failed = False
-        except BrokerReadError:
-            logger.warning("[EXEC] stage=reconcile env=%s phase=%s run_id=%s status=read_failed",
-                           env, phase, run_id)
+        except BrokerReadError as exc:
+            logger.warning("[EXEC] stage=reconcile env=%s phase=%s run_id=%s status=read_failed detail=%s",
+                           env, phase, run_id, exc)
             last_failed = True
         if not last_failed and last_report is not None and _all_final(journal, date_str, scope):
             break

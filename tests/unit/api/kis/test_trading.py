@@ -856,6 +856,36 @@ def test_orderable_cash_without_parseable_figure_fails(tmp_path) -> None:
         asyncio.run(client.fetch_orderable_cash(session, symbol="005930", limit_price=70000))  # type: ignore[arg-type]
 
 
+def test_orderable_cash_vendor_rejection_names_redacted_vendor_reply(tmp_path) -> None:
+    client, _, _ = _trading_client(_mock_binding(), tmp_path)
+    body = {"rt_cd": "1", "msg_cd": "EGW00203", "msg1": "OPS router error for account 12345678"}
+    session = scripted_session([FakeBrokerResponse(body=body, status=500)])
+    with pytest.raises(BrokerReadError) as err:
+        asyncio.run(client.fetch_orderable_cash(session, symbol="005930", limit_price=70000))  # type: ignore[arg-type]
+    text = str(err.value)
+    assert "buying power: vendor rejected the read" in text
+    assert "http=500" in text and "rt_cd='1'" in text and "msg_cd='EGW00203'" in text and "OPS router error" in text
+    assert "12345678" not in text
+
+
+def test_orderable_cash_missing_output_names_vendor_reply(tmp_path) -> None:
+    client, _, _ = _trading_client(_mock_binding(), tmp_path)
+    session = scripted_session([FakeBrokerResponse(body={"rt_cd": "0", "msg_cd": "20310000"}, status=200)])
+    with pytest.raises(BrokerReadError, match="output is missing http=200 rt_cd='0' msg_cd='20310000'"):
+        asyncio.run(client.fetch_orderable_cash(session, symbol="005930", limit_price=70000))  # type: ignore[arg-type]
+
+
+def test_account_read_transport_failure_names_only_the_exception_type(tmp_path) -> None:
+    client, _, _ = _trading_client(_mock_binding(), tmp_path)
+    broken = FakeBrokerResponse(body=None, status=502,
+                                json_error=aiohttp.ClientPayloadError("bad body for ?CANO=12345678"))
+    session = scripted_session([broken])
+    with pytest.raises(BrokerReadError) as err:
+        asyncio.run(client.fetch_orderable_cash(session, symbol="005930", limit_price=70000))  # type: ignore[arg-type]
+    assert str(err.value) == "account read failed on transport: ClientPayloadError"
+    assert isinstance(err.value.__cause__, aiohttp.ClientPayloadError)
+
+
 def test_price_limits_validated(tmp_path) -> None:
     client, _, _ = _trading_client(_mock_binding(), tmp_path)
     body = {"rt_cd": "0", "output": {"stck_prpr": "263000", "stck_mxpr": "349000", "stck_llam": "188000"}}

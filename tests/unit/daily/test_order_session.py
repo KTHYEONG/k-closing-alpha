@@ -416,13 +416,16 @@ def test_seed_caps_capital_below_broker_cash(mock_binding, runner, monkeypatch) 
     assert report.metrics["planned_notional_krw"] <= 10_000_000
 
 
-def test_unreadable_cash_plans_nothing(mock_binding, runner) -> None:
+def test_unreadable_cash_plans_nothing(mock_binding, runner, caplog) -> None:
     broker = FakeBroker()
-    broker.cash_error = BrokerReadError("no cash")
+    broker.cash_error = BrokerReadError("buying power: vendor rejected the read msg_cd=EGW00203")
     journal = runner.journal()
-    report = runner.run("entry", DAY, broker=broker, journal=journal,
-                        clock=[ts("152700")] * 30, decisions=[three_picks()])
+    with caplog.at_level(logging.WARNING):
+        report = runner.run("entry", DAY, broker=broker, journal=journal,
+                            clock=[ts("152700")] * 30, decisions=[three_picks()])
     assert (report.outcome, report.reason) == ("DEGRADED", "orderable_cash_unreadable")
+    assert "stage=broker_read env=mock phase=entry" in caplog.text
+    assert "step=orderable_cash status=failed detail=buying power: vendor rejected the read msg_cd=EGW00203" in caplog.text
     assert broker.submit_calls == []
     assert [e for e in journal.load() if e.payload.get("trading_date") == DAY] == []
 
@@ -999,17 +1002,21 @@ def test_exit_before_window_is_skipped(mock_binding, runner) -> None:
     broker.assert_quiet()
 
 
-def test_exit_token_and_position_failures_plan_nothing(mock_binding, runner) -> None:
+def test_exit_token_and_position_failures_plan_nothing(mock_binding, runner, caplog) -> None:
     broker, journal = FakeBroker(), runner.journal()
     _add_filled_entry(journal, entry_intent_id(YESTERDAY, "005930"), "005930", YESTERDAY, 10, 70_000)
     broker.ensure_error = BrokerReadError("token down")
-    report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("084010")] * 10)
+    with caplog.at_level(logging.WARNING):
+        report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("084010")] * 10)
     assert (report.outcome, report.reason) == ("DEGRADED", "positions_unreadable")
+    assert "phase=exit" in caplog.text and "step=token status=failed detail=token down" in caplog.text
     broker.ensure_error = None
     broker.positions_error = BrokerReadError("balance down")
     runner.recorded.clear()
-    report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("084010")] * 10)
+    with caplog.at_level(logging.WARNING):
+        report = runner.run("exit", DAY, broker=broker, journal=journal, clock=[ts("084010")] * 10)
     assert (report.outcome, report.reason) == ("DEGRADED", "positions_unreadable")
+    assert "step=positions status=failed detail=balance down" in caplog.text
     assert broker.submit_calls == []
 
 

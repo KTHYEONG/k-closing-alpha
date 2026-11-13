@@ -48,6 +48,7 @@ TR_SUFFIX_DAILY_ORDERS: str = "TTC0081R"
 TR_SUFFIX_BUYING_POWER: str = "TTC8908R"
 ORDER_EXCHANGE_CODE: str = "KRX"
 MAX_CONTINUATION_PAGES: int = 10
+VENDOR_MSG_MAX_CHARS: int = 160
 
 _ALLOWED_SUFFIXES: frozenset[str] = frozenset(
     {
@@ -480,7 +481,7 @@ class KisTradingClient:
         body = self._checked_body(response, "buying power")
         output = body.get("output")
         if not isinstance(output, dict):
-            raise BrokerReadError("buying power: output is missing")
+            raise BrokerReadError(f"buying power: output is missing {self._vendor_detail(response)}")
         candidates: list[int] = []
         for key in ("ord_psbl_cash", "nrcv_buy_amt"):
             parsed = _parse_int(output.get(key))
@@ -619,18 +620,29 @@ class KisTradingClient:
                 log_context=f"env={self.binding.env} tr_id={tr_id}",
             )
         except Exception as exc:
-            raise BrokerReadError("account read failed on transport") from exc
+            # Only the exception type: aiohttp messages embed the request URL, whose query carries the account number.
+            raise BrokerReadError(f"account read failed on transport: {type(exc).__name__}") from exc
 
-    @staticmethod
-    def _checked_body(response: TransportResponse, stage: str) -> dict[str, Any]:
+    def _checked_body(self, response: TransportResponse, stage: str) -> dict[str, Any]:
         body = response.body
         if not isinstance(body, dict):
-            raise BrokerReadError(f"{stage}: body is not an object")
+            raise BrokerReadError(f"{stage}: body is not an object http={response.status}")
         if str(body.get("msg_cd", "")) == "EGW00201":
             raise BrokerReadError(f"{stage}: rate limit was not absorbed")
         if body.get("rt_cd") != "0":
-            raise BrokerReadError(f"{stage}: vendor rejected the read")
+            raise BrokerReadError(f"{stage}: vendor rejected the read {self._vendor_detail(response)}")
         return body
+
+    def _vendor_detail(self, response: TransportResponse) -> str:
+        """Return redacted ``http= rt_cd= msg_cd= msg=`` fields of a vendor reply for an error message."""
+        body = response.body if isinstance(response.body, dict) else {}
+        token = self.api_client.token
+        secrets = (self.binding.app_key, self.binding.app_secret, self.binding.account_no, token if isinstance(token, str) else "")
+        msg = redact_secrets(str(body.get("msg1", "")).strip(), secrets)[:VENDOR_MSG_MAX_CHARS]
+        rt_cd = redact_secrets(str(body.get("rt_cd", "")), secrets)[:VENDOR_MSG_MAX_CHARS]
+        msg_cd = redact_secrets(str(body.get("msg_cd", "")), secrets)[:VENDOR_MSG_MAX_CHARS]
+        # repr() keeps vendor-controlled text on one log line.
+        return f"http={response.status} rt_cd={rt_cd!r} msg_cd={msg_cd!r} msg={msg!r}"
 
 
 def _fold_cancel_rows(rows: list[BrokerOrder]) -> list[BrokerOrder]:
