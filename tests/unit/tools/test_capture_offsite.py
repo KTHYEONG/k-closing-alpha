@@ -944,16 +944,20 @@ def _write_prune_ledger(root: Path, tier: str, day: str, rels: list[str], archiv
 
 
 def _md5_run_fn(expected_md5: str, calls: list, *, mode: str = "match"):
+    """Fake month listing (`rclone md5sum <root>/<tier>/<YYYY-MM>`) that lists `seg-abc` for every day of the month."""
+
     def run_fn(cmd, **kwargs):
         calls.append(list(cmd))
         assert cmd[1] == "md5sum"
+        month = cmd[2].split("/")[-1]
+        assert len(month) == 7, "prune must list the month directory, not a segment"
         if mode == "error":
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="not found")
         if mode == "raise":
             raise OSError("drive unavailable")
-        if mode == "mismatch":
-            return subprocess.CompletedProcess(cmd, 0, stdout="ffffffffffffffffffffffffffffffff  seg.tar.zst\n", stderr="")
-        return subprocess.CompletedProcess(cmd, 0, stdout=f"{expected_md5}  seg.tar.zst\n", stderr="")
+        md5 = "ffffffffffffffffffffffffffffffff" if mode == "mismatch" else expected_md5
+        lines = "".join(f"{md5}  {month}-{day:02d}/seg-abc.tar.zst\n" for day in range(1, 32))
+        return subprocess.CompletedProcess(cmd, 0, stdout=lines, stderr="")
 
     return run_fn
 
@@ -1153,6 +1157,151 @@ def test_prune_keeps_directory_on_remote_md5_mismatch_and_error(tmp_path: Path, 
         tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn(md5, raise_calls, mode="raise"), config=_config()
     )
     assert report.kept == (("raw/2026-08-01", "remote_unverified"),)
+    assert (tmp_path / "raw" / day).exists()
+
+
+def _listing_run_fn(listings: dict, calls: list, *, fail_months: frozenset = frozenset()):
+    """Fake month listing: listings[(tier, month)] = [(md5, "<date>/<seg>.tar.zst"), ...]."""
+
+    def run_fn(cmd, **kwargs):
+        calls.append(list(cmd))
+        assert cmd[1] == "md5sum"
+        tier, month = cmd[2].split("/")[-2:]
+        if (tier, month) in fail_months:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+        lines = "".join(f"{md5}  {name}\n" for md5, name in listings.get((tier, month), []))
+        return subprocess.CompletedProcess(cmd, 0, stdout=lines, stderr="")
+
+    return run_fn
+
+
+def test_prune_lists_each_remote_month_once_for_many_dates(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    days = ("2026-07-01", "2026-07-02", "2026-07-03", "2026-08-01")
+    for day in days:
+        rel = _raw_rel(day, "a.bin")
+        _write_member(tmp_path, rel, b"x")
+        _write_prune_ledger(tmp_path, "raw", day, [rel], archive_md5=md5)
+    calls: list = []
+
+    # When four expired dates span two months
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn(md5, calls), config=_config()
+    )
+
+    # Then every date is removed with one remote listing per month, not one call per segment
+    assert report.removed == tuple(f"raw/{day}" for day in days)
+    assert sorted(cmd[2] for cmd in calls) == ["gdrive:test/raw/2026-07", "gdrive:test/raw/2026-08"]
+
+
+def test_prune_keeps_date_whose_segment_is_absent_or_ambiguous_in_listing(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    for day in ("2026-07-01", "2026-07-02", "2026-07-03"):
+        rel = _raw_rel(day, "a.bin")
+        _write_member(tmp_path, rel, b"x")
+        _write_prune_ledger(tmp_path, "raw", day, [rel], archive_md5=md5)
+    listings = {
+        ("raw", "2026-07"): [
+            (md5, "2026-07-01/seg-abc.tar.zst"),
+            # 07-02 absent from the remote listing
+            (md5, "2026-07-03/seg-abc.tar.zst"),
+            ("ffffffffffffffffffffffffffffffff", "2026-07-03/seg-abc.tar.zst"),
+        ]
+    }
+
+    # When one segment is missing remotely and another name is duplicated with differing MD5s
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_listing_run_fn(listings, []), config=_config()
+    )
+
+    # Then only the uniquely verified date goes; the others stay as remote_unverified
+    assert report.removed == ("raw/2026-07-01",)
+    assert report.kept == (("raw/2026-07-02", "remote_unverified"), ("raw/2026-07-03", "remote_unverified"))
+    assert (tmp_path / "raw" / "2026-07-02").exists() and (tmp_path / "raw" / "2026-07-03").exists()
+
+
+def test_prune_does_not_confirm_segment_from_a_name_with_spaces(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    day = "2026-07-01"
+    rel = _raw_rel(day, "a.bin")
+    _write_member(tmp_path, rel, b"x")
+    _write_prune_ledger(tmp_path, "raw", day, [rel], archive_md5=md5)
+    listings = {("raw", "2026-07"): [(md5, "2026-07-01/seg-abc.tar.zst renamed")]}
+
+    # When only a renamed object whose name starts with the ledger name carries the MD5
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_listing_run_fn(listings, []), config=_config()
+    )
+
+    # Then the ledger path is not considered present remotely and the directory stays
+    assert report.kept == (("raw/2026-07-01", "remote_unverified"),)
+    assert (tmp_path / "raw" / day).exists()
+
+
+def test_prune_listing_failure_keeps_only_that_month_without_retry(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    days = ("2026-07-01", "2026-07-02", "2026-08-01")
+    for day in days:
+        rel = _raw_rel(day, "a.bin")
+        _write_member(tmp_path, rel, b"x")
+        _write_prune_ledger(tmp_path, "raw", day, [rel], archive_md5=md5)
+    listings = {("raw", "2026-08"): [(md5, "2026-08-01/seg-abc.tar.zst")]}
+    calls: list = []
+
+    # When the July listing fails
+    report = prune_local_sealed_capture(
+        tmp_path,
+        today=date(2026, 9, 24),
+        run_fn=_listing_run_fn(listings, calls, fail_months=frozenset({("raw", "2026-07")})),
+        config=_config(),
+    )
+
+    # Then both July dates stay, August is removed, and the failed month is listed once
+    assert report.removed == ("raw/2026-08-01",)
+    assert report.kept == (("raw/2026-07-01", "remote_unverified"), ("raw/2026-07-02", "remote_unverified"))
+    assert [cmd[2] for cmd in calls].count("gdrive:test/raw/2026-07") == 1
+
+
+def test_prune_keeps_date_whose_ledger_points_outside_the_remote_root(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import LedgerEntry, SegmentMember, _append_ledger_entry, _ledger_path
+    from src.tools.capture_offsite import prune_local_sealed_capture
+
+    _patch_rclone(monkeypatch)
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    day = "2026-07-01"
+    rel = _raw_rel(day, "a.bin")
+    _write_member(tmp_path, rel, b"x")
+    entry = LedgerEntry(
+        tier="raw",
+        trading_date=day,
+        segment_name="seg-abc",
+        remote_path=f"gdrive:elsewhere/raw/2026-07/{day}/seg-abc.tar.zst",
+        members=(SegmentMember(path=rel, size=1, sha256="0" * 64),),
+        archive_bytes=10,
+        archive_md5=md5,
+        committed_at="2026-09-15T00:00:00+00:00",
+    )
+    _append_ledger_entry(_ledger_path(tmp_path, "raw", day), entry)
+
+    # When the listing under the configured root happens to carry the same name and MD5
+    report = prune_local_sealed_capture(
+        tmp_path, today=date(2026, 9, 24), run_fn=_md5_run_fn(md5, []), config=_config()
+    )
+
+    # Then the directory stays: the listing does not describe where the ledger says the copy lives
+    assert report.kept == (("raw/2026-07-01", "remote_unverified"),)
     assert (tmp_path / "raw" / day).exists()
 
 
@@ -1456,6 +1605,18 @@ def test_verify_remote_segments_reports_missing_and_mismatched(tmp_path: Path) -
     assert report.checked == 2
     assert report.missing == (remote_a,)
     assert report.mismatched == (remote_b,)
+
+
+def test_verify_remote_segments_flags_duplicate_names_with_differing_md5(tmp_path: Path) -> None:
+    from src.tools.capture_offsite import verify_remote_segments
+
+    remote = _write_verify_ledger(tmp_path, "raw", "2026-09-10", "seg-aaa", "a" * 32)
+    listings = {("raw", "2026-09"): [("f" * 32, "2026-09-10/seg-aaa.tar.zst"), ("a" * 32, "2026-09-10/seg-aaa.tar.zst")]}
+
+    report = verify_remote_segments(tmp_path, run_fn=_verify_run_fn(listings, []), config=_config())
+
+    assert report.missing == ()
+    assert report.mismatched == (remote,)
 
 
 def test_verify_remote_segments_uses_one_call_per_tier_month(tmp_path: Path) -> None:

@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -48,6 +49,7 @@ from src.utils.cli_logging import configure_cli_logging
 from src.utils.file_lock import open_lock_descriptor
 
 logger = logging.getLogger(__name__)
+_MD5_HEX = re.compile(r"[0-9a-fA-F]{32}")
 
 RUN_DIR_DEPTH: Mapping[str, int] = {"raw": 5, "normalized": 2, "manifests": 2}
 
@@ -417,6 +419,50 @@ def _save_scan_state(capture_root: Path, state: Mapping[str, int]) -> None:
 
 def _remote_path(config: OffsiteConfig, tier: str, trading_date: str, seg: str) -> str:
     return f"{config.remote_root}/{tier}/{trading_date[:7]}/{trading_date}/{seg}.tar.zst"
+
+
+def _list_remote_month_md5(
+    rclone: str,
+    config: OffsiteConfig,
+    tier: str,
+    month: str,
+    *,
+    run_fn: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, str | None]:
+    """MD5 of every segment object under one remote (tier, YYYY-MM) directory, from a single `rclone md5sum` listing.
+
+    Keys are ``<YYYY-MM-DD>/<segment>.tar.zst`` (lower-case). A name listed more than once with differing MD5s
+    (Drive allows duplicate names) maps to None, so callers can never confirm it by picking one of the copies.
+
+    Raises:
+        RuntimeError: The listing exited non-zero (unverifiable is never treated as verified).
+    """
+    remote_dir = f"{config.remote_root}/{tier}/{month}"
+    result = run_fn(
+        [rclone, "md5sum", remote_dir],
+        capture_output=True,
+        text=True,
+        timeout=config.rclone_timeout_sec,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"offsite md5 listing failed: {remote_dir}")
+    listed: dict[str, str | None] = {}
+    for line in result.stdout.splitlines():
+        # The whole remainder is the path: a name with spaces must not collapse onto a shorter ledger name.
+        parts = line.split(maxsplit=1)
+        if len(parts) < 2 or not _MD5_HEX.fullmatch(parts[0]):
+            continue
+        key, md5 = parts[1].lower(), parts[0].lower()
+        if key in listed and listed[key] != md5:
+            listed[key] = None
+        else:
+            listed[key] = md5
+    return listed
+
+
+def _segment_listing_key(entry: LedgerEntry) -> str:
+    return f"{entry.trading_date}/{entry.segment_name}.tar.zst".lower()
 
 
 def _parse_remote_md5(stdout: str) -> str | None:
@@ -1076,8 +1122,9 @@ def prune_local_sealed_capture(
         config: Offsite contract (tiers, remote_root, rclone timeout).
         dry_run: List targets without deleting (still holds the seal lock).
         deadline: Aware instant after which no further directory is started. The pass holds the shared Drive
-            lock for its whole duration, so a large backlog (one remote MD5 per segment) would otherwise starve
-            every other Drive writer on the host; directories not reached are handled by the next run.
+            lock for its whole duration, so a large backlog would otherwise starve every other Drive writer on
+            the host; directories not reached are handled by the next run. Remote MD5s come from one listing
+            per (tier, YYYY-MM), so the remote cost scales with months, not segments.
 
     Returns:
         Removed directories, expired directories kept with a reason, and bytes reclaimed; or an empty
@@ -1103,6 +1150,9 @@ def prune_local_sealed_capture(
             capture_root = Path(capture_root)
             cutoff = today - timedelta(days=retention_days)
             rclone: str | None = None
+            # One remote listing per (tier, YYYY-MM), reused by every expired date of that month in this pass.
+            # A snapshot is safe: nothing in this project deletes or moves sealed segment objects.
+            month_listings: dict[tuple[str, str], dict[str, str | None] | None] = {}
             removed: list[str] = []
             kept: list[tuple[str, str]] = []
             bytes_removed = 0
@@ -1182,25 +1232,26 @@ def prune_local_sealed_capture(
                         continue
                     if rclone is None:
                         rclone = _resolve_rclone_bin()
-                    verified = True
-                    for ledger_entry in entries:
+                    month_key = (tier, name[:7])
+                    if month_key not in month_listings:
                         try:
-                            result = run_fn(
-                                [rclone, "md5sum", ledger_entry.remote_path],
-                                capture_output=True,
-                                text=True,
-                                timeout=config.rclone_timeout_sec,
-                                check=False,
+                            month_listings[month_key] = _list_remote_month_md5(
+                                rclone, config, tier, name[:7], run_fn=run_fn
                             )
-                        except Exception:  # noqa: BLE001 - any runner failure keeps the directory
-                            verified = False
-                            break
-                        if result.returncode != 0:
-                            verified = False
-                            break
-                        if _parse_remote_md5(result.stdout) != ledger_entry.archive_md5:
-                            verified = False
-                            break
+                        except Exception as exc:  # noqa: BLE001 - any listing failure keeps the whole month
+                            logger.warning(
+                                "[SYS] stage=capture_prune status=LISTING_FAILED tier=%s month=%s error=%r",
+                                tier,
+                                name[:7],
+                                exc,
+                            )
+                            month_listings[month_key] = None
+                    listing = month_listings[month_key]
+                    verified = listing is not None and all(
+                        ledger_entry.remote_path == _remote_path(config, tier, name, ledger_entry.segment_name)
+                        and listing.get(_segment_listing_key(ledger_entry)) == ledger_entry.archive_md5.lower()
+                        for ledger_entry in entries
+                    )
                     if not verified:
                         kept.append((label, "remote_unverified"))
                         continue
@@ -1513,28 +1564,13 @@ def verify_remote_segments(
     missing: list[str] = []
     mismatched: list[str] = []
     for tier, month in sorted(grouped):
-        remote_dir = f"{config.remote_root}/{tier}/{month}"
-        result = run_fn(
-            [rclone, "md5sum", remote_dir],
-            capture_output=True,
-            text=True,
-            timeout=config.rclone_timeout_sec,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"offsite verify listing failed: {remote_dir}")
-        listed: dict[str, str] = {}
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            listed[parts[1].lower()] = parts[0].lower()
+        listed = _list_remote_month_md5(rclone, config, tier, month, run_fn=run_fn)
         for entry in grouped[(tier, month)]:
             checked += 1
-            actual = listed.get(f"{entry.trading_date}/{entry.segment_name}.tar.zst".lower())
-            if actual is None:
+            key = _segment_listing_key(entry)
+            if key not in listed:
                 missing.append(entry.remote_path)
-            elif actual != entry.archive_md5.lower():
+            elif listed[key] != entry.archive_md5.lower():
                 mismatched.append(entry.remote_path)
     return RemoteVerifyReport(checked=checked, missing=tuple(sorted(missing)), mismatched=tuple(sorted(mismatched)))
 

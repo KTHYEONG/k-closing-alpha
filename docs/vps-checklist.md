@@ -554,10 +554,10 @@ def b_prune():
         cutoff = last - timedelta(days=30)
         kept_local = []
         for tier in ("raw", "normalized", "manifests"):
-            for p in (CAP / tier).iterdir():
+            for p in sorted((CAP / tier).iterdir()):
                 if re.fullmatch(r"\d{4}-\d{2}-\d{2}", p.name) and date.fromisoformat(p.name) < cutoff and datetime.fromtimestamp(p.stat().st_mtime, KST) < at(last, "21:00:00"):
                     kept_local.append(f"{tier}/{p.name}")
-        out("B05", lv(not summ or bool(failed), kept != "0" or bool(kept_local)), last_prune=last, summary=bool(summ), failed=failed or "-", sealed_kept=kept, kept_local_pre_prune=kept_local[:5] or "-", remote_deleted=ages)
+        out("B05", lv(not summ or bool(failed), kept != "0" or bool(kept_local)), last_prune=last, summary=bool(summ), failed=failed or "-", sealed_kept=kept, kept_local_pre_prune_n=len(kept_local), kept_local_pre_prune=kept_local[:5] or "-", remote_deleted=ages)
 def a_heartbeat(expect_date=None):
     @check("A01")
     def _():
@@ -994,7 +994,7 @@ Known conditions:
 | 2026-11-05 | C15 WARN `cntr_str_share=0.857` (39/273 rows NaN incl. 005930, 000660, 005490): rule needs >= 0.9; 11-04 was 0.945 (530 rows) | C15 WARN | 2026-11-12 | cause found (Kiwoom ranking list coverage vs cohort) or rule recalibrated |
 | 2026-11-04 | `decision_extras` absent for 2026-09-18..10-02 (local raw already pruned after sealing) | none (C15 is N-only, D-scoped) | — | restore sealed raw if those days are needed |
 | 2026-11-04 | `pit1520_panel` rebuilt before the superset drain finishes shows many `NOT_FETCHED` exclusions | none (manual build only) | 2026-11-12 | rebuild after the drain |
-| 2026-11-03 | Local capture backlog: on 10-30 a sweep rewrote 85 old-date `raw/` dirs (2026-01..10); `capture_prune` drains it under its time budget (`status=DEADLINE`, removed 82 on 11-02, one `rclone md5sum` per sealed entry), disk 35% | B05 WARN `kept_local_pre_prune` shrinking each run | 2026-11-05 M | still listing 2026-0x dirs at 11-05 M → prune throughput defect (batch md5 via one `lsjson --hash` instead of per-entry `md5sum`) |
+| 2026-11-13 | Local capture backlog after the 11-04 manual Toss pre-retention backfill (909 old `raw/` dates 2023-01..2026-10, 7.7 GB; plus the 10-30 sweep). Root cause of the slow drain: one `rclone md5sum <segment>` per ledger entry costs ~6.9 s (path walk), so the 40-min budget removed only 64-199 dirs/run (77 on 11-12). Fixed: prune reuses one `rclone md5sum <tier>/<YYYY-MM>` listing per month (~3.6 s) | B05 WARN `kept_local_pre_prune_n` > 0 until the first run after deploy | 2026-11-16 N (first weekday prune after deploy) | N shows B05 PASS (`kept_local_pre_prune_n=0`) and `stage=capture_prune` without `status=DEADLINE`; else recheck `status=LISTING_FAILED` in the prune journal |
 | 2026-11-02 | D1 prune purge cap 7 per subtree vs daily backup | B05 PASS; FAIL `cap_risk` after a ≥1-week prune outage | 2026-12-01 | cap sized from the backup cadence (fix pending) |
 | 2026-11-02 | D2 `audit_daily_completeness` omits `intraday_complete` (added in `main()` :2308) | C11 derives it from the journal | 2026-12-01 | helper returns 8 keys (fix pending) |
 | 2026-11-02 | D3 heartbeat severity fallback parses the subject (`daily_audit.py:1910-1913`) | none (latent) | 2026-12-01 | fix pending |
