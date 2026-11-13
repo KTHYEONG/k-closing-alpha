@@ -239,11 +239,20 @@ class KisTradingClient:
         )
 
     async def ensure_token(self, session: aiohttp.ClientSession, *, rejected_token: str | None = None) -> None:
-        """Load or issue the binding's access token; raises on issuance failure."""
-        if rejected_token is None:
-            await self.api_client.ensure_token(session)
-        else:
-            await self.api_client.ensure_token(session, rejected_token=rejected_token)
+        """Load or issue the binding's access token; raises BrokerReadError on any token failure.
+
+        The order session and operator resolve treat a token failure like any other unreadable account
+        (DEGRADED outcome, reconcile retry on the next poll); a raw issuance error would crash the run instead.
+        """
+        try:
+            if rejected_token is None:
+                await self.api_client.ensure_token(session)
+            else:
+                await self.api_client.ensure_token(session, rejected_token=rejected_token)
+        except Exception as exc:
+            # Any failure, including a malformed issuance reply (TypeError/AttributeError while parsing it); cancellation
+            # is a BaseException and passes. Only the type: the error message carries the raw vendor reply.
+            raise BrokerReadError(f"token: ensure failed: {type(exc).__name__}") from exc
 
     async def submit_order(self, session: aiohttp.ClientSession, intent: OrderIntent) -> SubmitResult:
         """Send exactly one order POST and classify it; never raises for transport or vendor errors."""
@@ -619,6 +628,8 @@ class KisTradingClient:
                 log_stage="kis_order",
                 log_context=f"env={self.binding.env} tr_id={tr_id}",
             )
+        except BrokerReadError:
+            raise  # a failed auth refresh already names its cause
         except Exception as exc:
             # Only the exception type: aiohttp messages embed the request URL, whose query carries the account number.
             raise BrokerReadError(f"account read failed on transport: {type(exc).__name__}") from exc

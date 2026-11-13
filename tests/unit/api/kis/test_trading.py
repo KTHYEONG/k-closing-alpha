@@ -8,6 +8,7 @@ import logging
 import aiohttp
 import pytest
 
+from src.api.shared_token import TokenStoreLockTimeout
 from src.api.kis.client import KisApiClient
 from src.api.kis.trading import (
     ORDER_EXCHANGE_CODE,
@@ -486,6 +487,69 @@ def test_auth_rejection_refreshes_token_then_returns(tmp_path) -> None:
     assert result.verdict is SubmitVerdict.AUTH_REJECTED
     assert api.token == "NEW"
     assert len(session.requests_to("/uapi/domestic-stock/v1/trading/order-cash")) == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("토큰 발급 실패: {'msg1': 'vendor text'}"),
+        TokenStoreLockTimeout("lock busy"),
+        aiohttp.ClientConnectionError("down"),
+        TimeoutError(),
+        OSError("lock file"),
+        ValueError("bad expires_in"),
+        TypeError("unsupported type for timedelta seconds component: str"),
+    ],
+)
+def test_ensure_token_failure_is_a_broker_read_error(tmp_path, monkeypatch, error) -> None:
+    client, api, _ = _trading_client(_mock_binding(), tmp_path, bearer=None)
+
+    async def _fail(*_a: object, **_kw: object) -> str:
+        raise error
+
+    monkeypatch.setattr(api, "ensure_token", _fail)
+    with pytest.raises(BrokerReadError) as err:
+        asyncio.run(client.ensure_token(object()))  # type: ignore[arg-type]
+    assert str(err.value) == f"token: ensure failed: {type(error).__name__}"
+    assert err.value.__cause__ is error
+
+
+def test_ensure_token_issuance_rejection_hides_the_vendor_reply(tmp_path) -> None:
+    client, _, _ = _trading_client(_mock_binding(), tmp_path, bearer=None)
+    session = scripted_session([], token_bodies=[{"error_code": "EGW00103", "error_description": "bad key"}],
+                               token_path="/oauth2/tokenP")
+    with pytest.raises(BrokerReadError, match=r"^token: ensure failed: RuntimeError$"):
+        asyncio.run(client.ensure_token(session))  # type: ignore[arg-type]
+
+
+def test_ensure_token_malformed_issuance_reply_is_a_broker_read_error(tmp_path) -> None:
+    client, _, _ = _trading_client(_mock_binding(), tmp_path, bearer=None)
+    session = scripted_session([], token_bodies=[{"access_token": "TOK", "expires_in": "86400"}],
+                               token_path="/oauth2/tokenP")
+    with pytest.raises(BrokerReadError, match=r"^token: ensure failed: TypeError$"):
+        asyncio.run(client.ensure_token(session))  # type: ignore[arg-type]
+
+
+def test_ensure_token_lets_cancellation_through(tmp_path, monkeypatch) -> None:
+    client, api, _ = _trading_client(_mock_binding(), tmp_path, bearer=None)
+
+    async def _cancelled(*_a: object, **_kw: object) -> str:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(api, "ensure_token", _cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(client.ensure_token(object()))  # type: ignore[arg-type]
+
+
+def test_account_read_with_failed_refresh_names_the_token_cause(tmp_path) -> None:
+    client, _, _ = _trading_client(_mock_binding(), tmp_path, bearer="OLD")
+    session = scripted_session(
+        [FakeBrokerResponse(body={"rt_cd": "1", "msg_cd": "EGW00123", "msg1": "expired"}, status=200)],
+        token_bodies=[{"rt_cd": "1", "msg_cd": "XXXX"}],
+        token_path="/oauth2/tokenP",
+    )
+    with pytest.raises(BrokerReadError, match=r"^token: ensure failed: RuntimeError$"):
+        asyncio.run(client.fetch_orderable_cash(session, symbol="005930", limit_price=70000))  # type: ignore[arg-type]
 
 
 def test_order_send_never_replays(tmp_path, monkeypatch) -> None:

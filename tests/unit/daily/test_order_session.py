@@ -709,6 +709,37 @@ def test_reconcile_survives_transient_read_failure(mock_binding, runner) -> None
     assert report.outcome == "OK"
 
 
+def test_reconcile_retries_after_a_real_token_failure(mock_binding, runner, tmp_path) -> None:
+    from src.api.kis.client import KisApiClient
+    from src.api.kis.trading import KisTradingClient
+
+    api = KisApiClient(app_key=mock_binding.app_key, app_secret=mock_binding.app_secret,
+                       base_url=mock_binding.base_url, token_file=str(tmp_path / "tok.json"),
+                       rest_tps=mock_binding.rest_tps)
+    trading = KisTradingClient(mock_binding, http_timeout_seconds=5.0, api_client=api)
+    failures = [RuntimeError("토큰 발급 실패: {}")]
+
+    async def _issue(*_a: object, **_kw: object) -> str:
+        if failures:
+            raise failures.pop()
+        return "TOK"
+
+    api.ensure_token = _issue  # type: ignore[method-assign]
+
+    class _RealTokenBroker(FakeBroker):
+        async def ensure_token(self, session: Any) -> None:
+            self.ensure_calls += 1
+            await trading.ensure_token(session)
+
+    broker, journal = _RealTokenBroker(), runner.journal()
+    _add_acked(journal, _entry_intent("005930", DAY, 10, 70_000), "n1")
+    broker.positions = [BrokerPosition(symbol="005930", holding_qty=10, sellable_qty=10)]
+    broker.daily_script = [[_broker_row("n1", "005930", OrderSide.BUY, 10, 70_000, 10, 700_000)]]
+    report = runner.run("reconcile-entry", DAY, broker=broker, journal=journal, clock=[ts("153100")] * 10)
+    assert report.outcome == "OK"
+    assert broker.ensure_calls == 2
+
+
 def test_reconcile_reports_unreadable_broker(mock_binding, runner) -> None:
     broker, journal = FakeBroker(), runner.journal()
     _add_acked(journal, _entry_intent("005930", DAY, 10, 70_000), "n1")
