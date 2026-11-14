@@ -24,6 +24,7 @@
 | C04 | COLLECT | Evening archive, 7 streams (regular/krx_after/nxt_after bars+ticks, nxt_pre bars): each manifest complete, or a ticks PARTIAL healed by a complete `tape-<D>-<session>-publish` | N (M) | 21:15 | P1 |
 | C07 | COLLECT | EOD panel: `price_ingest OK`, `panel_max_date == expected_panel_date == P`, `stale_panel=false` | O | 09:50 | P1 |
 | C08 | COLLECT | Tape sweep report covers D, `expiring_needs=0 expired=0 expired_recoverable=0 disk_guard=false` (Kiwoom tape depth 30 d) | N | 21:15 | P1 |
+| C17 | COLLECT | Tape sweep runtime: need scan (20:35 → last `stage=tape_universe`) ≤ 30 min, report by 21:10, no `status=DEADLINE` (walk deadline 21:15; an overrun exits 0 and is otherwise invisible); trend 17.6 min 11-12, 19.6 min 11-13 | N | 21:15 | P2 |
 | C11 | STORE | All 8 completeness keys True (`archive close_confirmed decision paper_entry paper_exit minute_bars intraday_complete price_history_fresh`) | N (M) | 21:50 | P1 |
 | Q08 | STORE | Non-empty partitions for D: 1m `regular nxt_premarket nxt_aftermarket krx_aftermarket`, ticks `regular krx_aftermarket nxt_aftermarket`, `orderbook/aftermarket` | N (M) | 21:15 | P1 |
 | Q01 | STORE | `archive.parquet` D: rows>0, unique symbols, 0 nulls, confirmed share ≥0.9, OHLC/등락률 consistent, 0 causality violations | E | 15:45 | P0 |
@@ -44,7 +45,7 @@
 | **O** post-exit (mandatory) | business day 09:45–11:00 | exit window closed 09:30; price-ingest D-1 landed (a failed 08:30 run is auto-rerun at 09:40) | `kca_probe O` | R01 R02 C05 C07 Q05 P02 P03 P06 A01 A03 X01 |
 | **E** post-decision (mandatory) | business day 15:45–16:30 | entry chain ends 15:45; the archive row is still the decision snapshot | `kca_probe E` | R01 R02 C01 C05 C12 C13 C14 C16 Q01 P01 P03 P04 P06 A01 A03 X01 |
 | **L** liveness (optional) | 16:30–19:50 | aftermarket-book is the only long live capture (runs to ~19:59) | §5.2 `R06` | R06 |
-| **N** evening (mandatory; M re-checks if missed) | business day 21:50–22:10 | archive 20:05, tape 20:35, prune 21:00 and audit 21:20 are done; must finish before the 22:15 backup takes the Drive lock | `kca_probe N` | R01 R03 C03 C04 C06 C08 C13 C15 C11 Q06 Q07 Q08 Q09 Q10 B05 A01 A03 X01 |
+| **N** evening (mandatory; M re-checks if missed) | business day 21:50–22:10 | archive 20:05, tape 20:35, prune 21:00 and audit 21:20 are done; must finish before the 22:15 backup takes the Drive lock | `kca_probe N` | R01 R03 C03 C04 C06 C08 C17 C13 C15 C11 Q06 Q07 Q08 Q09 Q10 B05 A01 A03 X01 |
 | **W** weekly (mandatory) | Monday 07:30–08:20, after M | Sat 22:00 retrain, Sun 10:00 snapshot, Sun 11:00 verify | `kca_probe W` + §5.1 local | H02 H03 H04 R04 P08 B07 B08 Q11 A05 |
 | **Ev** event | after a deploy/alert/incident | parity of what changed | H02 H04 + affected rows | — |
 
@@ -791,6 +792,15 @@ def _():
     n = lambda x: len(x) if isinstance(x, (list, tuple, dict)) else int(x or 0)
     out("C08", lv(r.get("days_checked", [""])[-1] != str(D) or bool(r.get("disk_guard")), n(r.get("expiring_needs")) > 0 or n(r.get("expired_recoverable")) > 0 or n(r.get("expired")) > 0),
         last_day=r.get("days_checked", ["-"])[-1], needs=r.get("needs"), expiring=n(r.get("expiring_needs")), expired=n(r.get("expired")), expired_recoverable=n(r.get("expired_recoverable")), unresolved=n(r.get("unresolved")), disk_guard=r.get("disk_guard"))
+@check("C17")
+def _():
+    # Scan cost grows with the 30-day need window (17.6 min 11-12, 19.6 min 11-13); the walk deadline is 21:15 and an overrun exits 0.
+    L = jr("tape-sweep", at(D, "20:30:00"), at(D, "23:59:59"), pat=r"stage=(tape_universe|tape_sweep_report)|stage=tape_sweep status=NOOP|status=DEADLINE")
+    ts = lambda l: datetime.strptime(l[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+    uni = [l for l in L if "stage=tape_universe" in l]; rep = [l for l in L if "stage=tape_sweep_report" in l or "status=NOOP" in l]
+    scan = round((ts(uni[-1]) - at(D, "20:35:00")).total_seconds() / 60, 1) if uni else None
+    end = ts(rep[-1]) if rep else None; dl = sum("status=DEADLINE" in l for l in L)
+    out("C17", lv(end is None, scan is None or scan > 30 or dl > 0 or end > at(D, "21:10:00")), scan_min=scan, finished=f"{end:%H:%M}" if end else "-", deadline=dl)
 c_complete(D)
 q_partitions(D)
 @check("Q06")

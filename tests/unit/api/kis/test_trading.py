@@ -896,7 +896,7 @@ def test_orderable_cash_ignores_margin_fields(tmp_path) -> None:
     client, _, _ = _trading_client(_mock_binding(), tmp_path)
     body = {
         "rt_cd": "0",
-        "output": {"ord_psbl_cash": "9950000", "nrcv_buy_amt": None, "max_buy_amt": "25000000"},
+        "output": {"ord_psbl_cash": "9950000", "nrcvb_buy_amt": None, "max_buy_amt": "25000000"},
     }
     session = scripted_session([FakeBrokerResponse(body=body, status=200)])
     assert asyncio.run(client.fetch_orderable_cash(session, symbol="005930", limit_price=70000)) == 9_950_000  # type: ignore[arg-type]
@@ -906,14 +906,14 @@ def test_orderable_cash_ignores_margin_fields(tmp_path) -> None:
 
 def test_orderable_cash_takes_smaller_cash_figure(tmp_path) -> None:
     client, _, _ = _trading_client(_mock_binding(), tmp_path)
-    body = {"rt_cd": "0", "output": {"ord_psbl_cash": "9950000", "nrcv_buy_amt": "9000000"}}
+    body = {"rt_cd": "0", "output": {"ord_psbl_cash": "9950000", "nrcvb_buy_amt": "9000000"}}
     session = scripted_session([FakeBrokerResponse(body=body, status=200)])
     assert asyncio.run(client.fetch_orderable_cash(session, symbol="005930", limit_price=70000)) == 9_000_000  # type: ignore[arg-type]
 
 
 def test_orderable_cash_without_parseable_figure_fails(tmp_path) -> None:
     client, _, _ = _trading_client(_mock_binding(), tmp_path)
-    for output in ({"ord_psbl_cash": None, "nrcv_buy_amt": None}, {"ord_psbl_cash": "abc", "nrcv_buy_amt": ""}):
+    for output in ({"ord_psbl_cash": None, "nrcvb_buy_amt": None}, {"ord_psbl_cash": "abc", "nrcvb_buy_amt": ""}):
         session = scripted_session([FakeBrokerResponse(body={"rt_cd": "0", "output": output}, status=200)])
         with pytest.raises(BrokerReadError):
             asyncio.run(client.fetch_orderable_cash(session, symbol="005930", limit_price=70000))  # type: ignore[arg-type]

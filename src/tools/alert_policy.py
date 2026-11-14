@@ -48,6 +48,7 @@ class IncidentKind(StrEnum):
     BACKUP_FAILING = "backup_failing"
     KRX_DEFERRED_RECREATE = "krx_deferred_recreate"
     KSE_PAGE_UNDELIVERED = "kse_page_undelivered"
+    VPS_DISK_WATCH = "vps_disk_watch"
 
 
 class SourceScope(StrEnum):
@@ -181,6 +182,12 @@ INCIDENT_TEXTS: Mapping[IncidentKind, IncidentText] = MappingProxyType(
             auto_action="없음(외부 프로젝트 유닛).",
             action="다음 장 시작(08:00) 전에 krx-alpha 수집기 컨테이너 상태를 확인하고 재생성하세요.",
         ),
+        IncidentKind.VPS_DISK_WATCH: IncidentText(
+            summary="VPS 디스크 여유 경고",
+            what="호스트 디스크 감시(vps-disk-watch)가 여유 공간 부족 또는 소진 예상 시점 임박을 알렸습니다(감시 자체 실패 포함).",
+            auto_action="없음(정리는 각 프로젝트 보존 정책에 따름).",
+            action="오늘 안에 vps-disk-watch 로그의 증가 상위 항목을 확인하고, 멈춘 정리나 업로드 작업이 있으면 복구하세요.",
+        ),
         IncidentKind.KSE_PAGE_UNDELIVERED: IncidentText(
             summary="kse 긴급 알림 전달 실패",
             what="k-stock-engine의 긴급 알림을 kse가 직접 보내지 못해 kca가 대신 알립니다.",
@@ -201,6 +208,8 @@ CRITICAL_UNITS: Mapping[str, IncidentKind] = MappingProxyType(
         "kca-finalize-close": IncidentKind.FINALIZE_CLOSE,
         "kca-kis-token-warmup": IncidentKind.KIS_TOKEN_WARMUP,
         "krx-deferred-recreate": IncidentKind.KRX_DEFERRED_RECREATE,
+        # krx deploy/host/vps_disk_watch.py signals WARN/CRIT only through its exit code (OnFailure relay).
+        "vps-disk-watch": IncidentKind.VPS_DISK_WATCH,
     }
 )
 

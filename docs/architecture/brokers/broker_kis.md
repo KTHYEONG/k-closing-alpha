@@ -368,7 +368,7 @@ custtype: P
 * **Query Params:** `CANO`, `ACNT_PRDT_CD`, `PDNO`, `ORD_UNPR`, `ORD_DVSN`, `CMA_EVLU_AMT_ICLD_YN`, `OVRS_ICLD_YN`.
 * **Output (`output`):**
   * `ord_psbl_cash`: 주문가능현금
-  * `nrcv_buy_amt`: 미수없는매수금액
+  * `nrcvb_buy_amt`: 미수없는매수금액
   * `max_buy_amt`: 최대매수금액
   * `dnca_tot_amt`: 예수금총금액 (D+2 예수금)
 

@@ -496,7 +496,7 @@ class KisTradingClient:
         if not isinstance(output, dict):
             raise BrokerReadError(f"buying power: output is missing {self._vendor_detail(response)}")
         candidates: list[int] = []
-        for key in ("ord_psbl_cash", "nrcv_buy_amt"):
+        for key in ("ord_psbl_cash", "nrcvb_buy_amt"):
             parsed = _parse_int(output.get(key))
             if parsed is not None and parsed >= 0:
                 candidates.append(parsed)

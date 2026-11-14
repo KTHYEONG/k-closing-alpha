@@ -29,6 +29,7 @@ def _kst(hh: int, mm: int = 0, day: int = 3) -> datetime:
         ("kca-finalize-close.service", IncidentKind.FINALIZE_CLOSE),
         ("kca-kis-token-warmup.service", IncidentKind.KIS_TOKEN_WARMUP),
         ("krx-deferred-recreate.service", IncidentKind.KRX_DEFERRED_RECREATE),
+        ("vps-disk-watch.service", IncidentKind.VPS_DISK_WATCH),
         ("kse-alert@kse-morning.service.service", IncidentKind.KSE_PAGE_UNDELIVERED),
         ("kse-alert@kse-evening.service", IncidentKind.KSE_PAGE_UNDELIVERED),
         ("kca-predict", IncidentKind.PREDICT),
