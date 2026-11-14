@@ -290,6 +290,10 @@ def main(argv: list[str] | None = None) -> None:
     if session_day.kind is SessionKind.CLOSED:
         _skip(snapshot_date, "non_trading_day")
         return
+    if session_day.kind is SessionKind.SHIFTED:
+        # The timer fires on the standard clock, outside a shifted session's closing-auction window.
+        _skip(snapshot_date, "session_shifted")
+        return
     if session_day.kind is SessionKind.UNKNOWN or session_day.clock is None:
         _skip(snapshot_date, "session_unknown")
         return

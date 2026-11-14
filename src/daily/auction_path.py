@@ -339,6 +339,17 @@ def main(argv: list[str] | None = None) -> None:
         )
         logger.info("[DATA] stage=auction_path status=SKIP reason=non_trading_day date=%s", snapshot_date)
         return
+    if session_day.kind is SessionKind.SHIFTED:
+        # collect publishes no close cohort on a shifted day and the timer fires on the standard clock.
+        record_run_outcome(
+            "auction_path",
+            RUN_OUTCOME_SKIPPED,
+            run_date=snapshot_date,
+            reason="session_shifted",
+            metrics={"session": "SHIFTED"},
+        )
+        logger.info("[DATA] stage=auction_path status=SKIP reason=session_shifted date=%s", snapshot_date)
+        return
     manifest = asyncio.run(_run_async(snapshot_date, profile))
     logger.info(
         "[DATA] stage=auction_path status=%s date=%s entries=%d",

@@ -1130,6 +1130,37 @@ def test_main_logs_non_trading_day_skip(tmp_path, monkeypatch, caplog) -> None:
     ]
 
 
+@pytest.mark.parametrize("phase", ["open", "close"])
+def test_main_skips_shifted_session_without_capture(tmp_path, monkeypatch, phase) -> None:
+    from datetime import date
+
+    from src.daily import auction_capture
+    from src.data.session_calendar import SessionDay, SessionKind
+
+    async def _forbidden(*a: Any, **k: Any) -> None:
+        raise AssertionError("a shifted day must not capture")
+
+    monkeypatch.setattr(auction_capture, "CollectionSettings", lambda: _profile(tmp_path))
+    monkeypatch.setattr(auction_capture, "_run_async", _forbidden)
+    monkeypatch.setattr(
+        auction_capture,
+        "resolve_session_day",
+        lambda _d, **_k: SessionDay(trading_date=date(2026, 11, 19), kind=SessionKind.SHIFTED, clock=None, provenance="krx_calendar"),
+    )
+    recorded: list[tuple] = []
+    monkeypatch.setattr(
+        auction_capture, "record_run_outcome", lambda job, outcome, **kw: recorded.append((job, outcome, kw))
+    )
+    auction_capture.main(["--phase", phase, "--date", "2026-11-19"])
+    assert recorded == [
+        (
+            "auction_capture",
+            "SKIPPED",
+            {"run_date": "2026-11-19", "reason": "session_shifted", "metrics": {"session": "SHIFTED", "phase": phase}},
+        )
+    ]
+
+
 def _shifted_close_clock(trading_day):
     from datetime import datetime
     from zoneinfo import ZoneInfo

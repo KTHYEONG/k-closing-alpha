@@ -210,14 +210,16 @@ _ALERTED_OUTCOMES: frozenset[str] = frozenset({"DEGRADED", "NO_DECISION"})
 CRITICAL_RUN_OUTCOMES: Mapping[str, OutcomeRule] = MappingProxyType(
     {
         "order_entry": OutcomeRule(IncidentKind.ORDER_ENTRY, _ALERTED_OUTCOMES),
-        "order_exit": OutcomeRule(IncidentKind.ORDER_EXIT, _ALERTED_OUTCOMES),
+        # A SHIFTED day exists only as a verified calendar entry or an operator override, so holding lots to the
+        # next standard session is the planned outcome; the unverified-calendar hold still pages.
+        "order_exit": OutcomeRule(IncidentKind.ORDER_EXIT, _ALERTED_OUTCOMES, frozenset({"shifted_session_hold"})),
         # An unfilled closing-auction limit buy leaves cash idle, not money at risk.
         "order_reconcile_entry": OutcomeRule(
             IncidentKind.ORDER_RECONCILE_ENTRY, _ALERTED_OUTCOMES, frozenset({"partial_or_unfilled"})
         ),
         "order_reconcile_exit": OutcomeRule(IncidentKind.ORDER_RECONCILE_EXIT, _ALERTED_OUTCOMES),
         "collect": OutcomeRule(IncidentKind.COLLECT, frozenset({"NO_DECISION"})),
-        "predict": OutcomeRule(IncidentKind.PREDICT, frozenset({"NO_DECISION"})),
+        "predict": OutcomeRule(IncidentKind.PREDICT, frozenset({"NO_DECISION"}), frozenset({"session_shifted"})),
         "finalize_close": OutcomeRule(
             IncidentKind.FINALIZE_CLOSE,
             frozenset({"DEGRADED"}),

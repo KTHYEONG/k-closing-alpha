@@ -183,13 +183,15 @@ def _is_trading_day(day: str, ingested: set[str]) -> bool:
     """Whether a KST day is a candidate for tape recovery.
 
     The verified session calendar is authoritative; price history only excludes
-    in-range holidays. Never calls the network; invalid ISO dates raise ValueError.
+    in-range holidays. SHIFTED days are never candidates: tape sessions are carved with
+    standard-clock windows, so a shifted day would settle truncated sessions as COMPLETE.
+    Never calls the network; invalid ISO dates raise ValueError.
     """
     moment = date.fromisoformat(day)
     if moment.weekday() >= 5:
         return False
     kind = resolve_session_day(moment).kind
-    if kind is SessionKind.CLOSED:
+    if kind in (SessionKind.CLOSED, SessionKind.SHIFTED):
         return False
     if kind is SessionKind.UNKNOWN:
         return day in ingested

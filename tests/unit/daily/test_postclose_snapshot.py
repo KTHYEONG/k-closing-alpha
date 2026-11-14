@@ -552,6 +552,7 @@ def test_main_partial_snapshot_records_degraded(monkeypatch: Any) -> None:
     ("session_kind", "trading", "reason"),
     [
         (SessionKind.CLOSED, True, "non_trading_day"),
+        (SessionKind.SHIFTED, True, "session_shifted"),
         (SessionKind.UNKNOWN, True, "session_unknown"),
         (SessionKind.STANDARD, False, "non_trading_day"),
     ],

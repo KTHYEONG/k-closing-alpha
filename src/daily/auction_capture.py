@@ -1594,6 +1594,20 @@ def main(argv: list[str] | None = None) -> None:
     if trading_day.weekday() >= 5:
         logger.info("[DATA] stage=auction_capture status=SKIP reason=holiday date=%s", snapshot_date)
         return
+    if resolve_session_day(trading_day, overrides=profile.COLLECTION_SESSION_OVERRIDES).kind is SessionKind.SHIFTED:
+        # The timers fire on the standard clock (open 08:39:55, close 15:20:25) and collect publishes no
+        # close cohort on a shifted day; waiting for shifted rounds would outlive the unit's start timeout.
+        record_run_outcome(
+            "auction_capture",
+            RUN_OUTCOME_SKIPPED,
+            run_date=snapshot_date,
+            reason="session_shifted",
+            metrics={"session": "SHIFTED", "phase": args.phase},
+        )
+        logger.info(
+            "[DATA] stage=auction_capture status=SKIP reason=session_shifted phase=%s date=%s", args.phase, snapshot_date
+        )
+        return
     stats: dict[str, float | str] = {}
     manifest = asyncio.run(_run_async(snapshot_date, args.phase, profile, stats_sink=stats))
     if manifest is None:

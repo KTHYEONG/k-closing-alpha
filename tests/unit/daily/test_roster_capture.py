@@ -314,6 +314,7 @@ def test_main_stale_panel_records_degraded(monkeypatch: pytest.MonkeyPatch, tmp_
     ("kind", "app_key", "reason"),
     [
         (SessionKind.CLOSED, "key", "non_trading_day"),
+        (SessionKind.SHIFTED, "key", "session_shifted"),
         (SessionKind.UNKNOWN, "key", "session_unknown"),
         (SessionKind.STANDARD, "", "no_kiwoom_credentials"),
     ],

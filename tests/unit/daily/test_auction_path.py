@@ -426,6 +426,22 @@ def test_auction_path_main_skips_non_trading_day(tmp_path, monkeypatch) -> None:
     assert recorded and recorded[0][1] == "SKIPPED" and recorded[0][2]["reason"] == "non_trading_day"
 
 
+def test_auction_path_main_skips_shifted_session(tmp_path, monkeypatch) -> None:
+    _live_settings(monkeypatch, tmp_path)
+    recorded = _recorded(monkeypatch)
+    monkeypatch.setattr(
+        auction_path,
+        "resolve_session_day",
+        lambda trading_date, overrides=None: SessionDay(
+            trading_date=trading_date, kind=SessionKind.SHIFTED, clock=None, provenance="test"
+        ),
+    )
+    monkeypatch.setattr(auction_path, "_run_async", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no run")))
+
+    auction_path.main(["--date", DATE])
+    assert len(recorded) == 1 and recorded[0][1] == "SKIPPED" and recorded[0][2]["reason"] == "session_shifted"
+
+
 def test_auction_path_main_runs_live_bindings(tmp_path, monkeypatch) -> None:
     import asyncio
     from datetime import date as _date

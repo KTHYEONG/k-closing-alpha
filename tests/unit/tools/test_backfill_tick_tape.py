@@ -1475,6 +1475,20 @@ def test_calendar_closed_beats_price_history() -> None:
         tr._is_trading_day("not-a-date", set())
 
 
+def test_shifted_session_day_is_never_a_tape_candidate(tmp_path, monkeypatch) -> None:
+    # 2026-11-19 (CSAT) runs 10:00-16:30; standard-clock tape windows would settle it truncated.
+    assert tr._is_trading_day("2026-11-19", {"2026-11-18", "2026-11-19", "2026-11-20"}) is False
+    assert tr._is_trading_day("2026-11-18", {"2026-11-18", "2026-11-19", "2026-11-20"}) is True
+    _patch_roots(tmp_path, monkeypatch)
+    store = CaptureStore(tmp_path / "capture")
+    monkeypatch.setattr(tr, "_day_universe", lambda day, store, *_: ["005930"])
+    monkeypatch.setattr(tr, "_ingested_trading_days", lambda: {"2026-11-18", "2026-11-19"})
+    monkeypatch.setattr(tr, "_session_closed", lambda day, session, now: True)
+    monkeypatch.setattr(tr, "_session_need", lambda symbol, day, spec, cache: True)
+    needs = tr.collect_tape_needs(["2026-11-18", "2026-11-19"], ["KRX", "NXT"], store, {}, False)
+    assert needs and {need.day for need in needs} == {"2026-11-18"}
+
+
 def test_task_pairs_partition_the_needs() -> None:
     needs = [
         tr.Need(symbol="A", day="2026-10-01", session="regular", venue="KRX"),

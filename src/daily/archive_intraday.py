@@ -895,6 +895,17 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
         )
         logger.info("[DATA] stage=intraday_archive status=SKIP reason=non_trading_day date=%s", snap_date)
         return (0, 0, 0)
+    if session_day.kind is SessionKind.SHIFTED:
+        # collect publishes no cohort on a shifted day, and the stream windows are standard-clock.
+        record_run_outcome(
+            "archive_intraday",
+            RUN_OUTCOME_SKIPPED,
+            run_date=str(snap_date),
+            reason="session_shifted",
+            metrics={"session": "SHIFTED"},
+        )
+        logger.info("[DATA] stage=intraday_archive status=SKIP reason=session_shifted date=%s", snap_date)
+        return (0, 0, 0)
     store = CaptureStore(_capture_root(prof))
     active_phases = {"regular", "aftermarket"} if phase == "all" else {phase}
 
@@ -1028,12 +1039,7 @@ def run_intraday_archive(snapshot_date: str | None = None, bar_interval_minutes:
                     slots[spec.return_slot] += counts[spec.key]
             return (slots[0], slots[1], slots[2])
 
-    n_bars, n_nxt, n_ticks = asyncio.run(_run())
-    if session_day.kind is SessionKind.SHIFTED:
-        record_run_outcome(
-            "archive_intraday", RUN_OUTCOME_DEGRADED, run_date=str(snap_date), reason="shifted_session_standard_window"
-        )
-    return (n_bars, n_nxt, n_ticks)
+    return asyncio.run(_run())
 
 
 def main() -> None:

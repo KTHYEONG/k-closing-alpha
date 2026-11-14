@@ -1368,7 +1368,8 @@ def test_collection_archive_publish_rows_rejects_nonpositive() -> None:
         CollectionSettings(COLLECTION_ARCHIVE_PUBLISH_ROWS=0)
 
 
-def test_run_intraday_archive_flags_shifted_day_degraded(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("phase", ["regular", "aftermarket", "all"])
+def test_run_intraday_archive_skips_shifted_day_before_any_read(monkeypatch, tmp_path, phase) -> None:
     from datetime import date
 
     from src.config.collection import CollectionSettings
@@ -1380,35 +1381,12 @@ def test_run_intraday_archive_flags_shifted_day_degraded(monkeypatch, tmp_path) 
         archive_intraday, "resolve_session_day",
         lambda _d, **_k: SessionDay(trading_date=target, kind=SessionKind.SHIFTED, clock=None, provenance="krx_calendar"),
     )
-    monkeypatch.setattr(archive_intraday, "_resolve_cohort_codes", lambda *a, **k: (["005930"], False))
 
-    async def _is_trading(_c, _s, _d):
-        return True
+    def _forbidden(*a, **k):
+        raise AssertionError("a shifted day must not touch the broker or the cohort")
 
-    monkeypatch.setattr(archive_intraday, "is_kis_trading_day", _is_trading)
-
-    class _FakeSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return False
-
-    class _FakeKisClient:
-        def create_session(self):
-            return _FakeSession()
-
-        async def ensure_token(self, session):
-            return "tok"
-
-    async def _noop_collector(*a, **k):
-        return None
-
-    monkeypatch.setattr(archive_intraday, "KisApiClient", lambda *a, **kw: _FakeKisClient())
-    monkeypatch.setattr(archive_intraday, "LsApiClient", lambda: None)
-    monkeypatch.setattr(archive_intraday, "KiwoomApiClient", lambda: None)
-    monkeypatch.setattr(archive_intraday, "collect_intraday_bars", _noop_collector)
-    monkeypatch.setattr(archive_intraday, "collect_intraday_trade_ticks", _noop_collector)
+    monkeypatch.setattr(archive_intraday, "_resolve_cohort_codes", _forbidden)
+    monkeypatch.setattr(archive_intraday, "KisApiClient", _forbidden)
     outcomes: list[tuple] = []
     monkeypatch.setattr(
         archive_intraday, "record_run_outcome", lambda *a, **k: outcomes.append((a, k))
@@ -1417,11 +1395,14 @@ def test_run_intraday_archive_flags_shifted_day_degraded(monkeypatch, tmp_path) 
         COLLECTION_ROOT=tmp_path / "capture", _env_file=None
     )
 
-    result = archive_intraday.run_intraday_archive(snapshot_date="2026-11-19", phase="regular", profile=profile)
+    result = archive_intraday.run_intraday_archive(snapshot_date="2026-11-19", phase=phase, profile=profile)
 
     assert result == (0, 0, 0)
     assert outcomes == [
-        (("archive_intraday", "DEGRADED"), {"run_date": "2026-11-19", "reason": "shifted_session_standard_window"})
+        (
+            ("archive_intraday", "SKIPPED"),
+            {"run_date": "2026-11-19", "reason": "session_shifted", "metrics": {"session": "SHIFTED"}},
+        )
     ]
 
 
