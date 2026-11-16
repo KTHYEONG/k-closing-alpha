@@ -39,7 +39,7 @@ flowchart LR
 ```
 
 - 수집(`kca-collect`)은 15:20, 예측(`kca-predict`)은 15:21, 종가 확정(`kca-finalize-close`)은 15:30:30에 실행됩니다(systemd 타이머 설정 기준, [`deploy/systemd`](./deploy/systemd)). 모의 매매(`paper_trade`)와 실주문(`order_session`)은 서비스가 분리되어 있습니다.
-- 증권사별 역할을 나눴습니다: 키움(전종목 스캔), 한국투자증권(호가·예상체결·수급), DB금융투자(장전 마스터, 분봉), LS증권(정규장 분봉), 토스증권(시세 보조). 호출 제한은 [`api_master.md`](./docs/architecture/brokers/api_master.md)에 정리했습니다.
+- 증권사별 역할을 나눴습니다: 키움(전종목 스캔), 한국투자증권(호가·예상체결·수급), DB금융투자(장전 마스터, 분봉), LS증권(정규장 분봉), 토스증권(시세 보조). 호출 제한과 TR 명세는 별도 저장소 api-manager의 `docs/brokers/api_master.md`에 정리했습니다.
 - 운영은 systemd 타이머 29개로 자동화했고, GitHub Actions가 테스트 후 ARM64 도커 이미지를 빌드해 서버에 배포합니다([`deploy.yml`](./.github/workflows/deploy.yml)).
 
 ## 🔧 핵심 설계 결정
@@ -171,4 +171,4 @@ AI는 주로 코드 작성에 사용했고, 아이디어를 정리하거나 도�
 ## 📚 참고
 
 - 종가매매 전략 연구 매트릭스 (비공개 전략 저장소에 보관): 118개 전략의 백테스트 표
-- [브로커 API 마스터 명세](./docs/architecture/brokers/api_master.md): 증권사별 TR, 호출 제한
+- 브로커 API 마스터 명세(별도 저장소 api-manager의 `docs/brokers/api_master.md`): 증권사별 TR, 호출 제한
