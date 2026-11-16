@@ -6,7 +6,7 @@
 
 ## 0. Agent contract
 
-- Loop: pick the window (§2) → run that window's bundled probe (§5.1) in ONE ssh call → every line is `ID STATUS key=val …` → for each non-PASS run the row's Drill (§4/§5.2) → triage (§6) → report per `/home/kth/krx-alpha/docs/vps-ops-agent.md` §8. Shared rules (secrets, freeze, destructive actions, commit/deploy, report format) live only in that brief.
+- Loop: pick the window (§2) → run that window's bundled probe (§5.1) in ONE ssh call → every line is `ID STATUS key=val …` → for each non-PASS run the row's Drill (§4/§5.2) → triage (§6) → report per `/home/kth/krx-alpha/docs/vps-agent.md` §8. Shared rules (secrets, freeze, destructive actions, commit/deploy, report format) live only in that brief.
 - Verdicts: `PASS | WARN | FAIL | UNKNOWN` (probe exception or missing evidence; never counts as PASS) `| SKIP(reason)` (not applicable by day kind or optional timer off). `CTX INFO` is the first line; `ALL SKIP(non_trading_day)` ends the run on a closed D.
 - kca deltas to the shared rules:
   - **Blackout** (`src/tools/deploy_window.py:18-58`): Mon–Fri **08:30–09:40** and **15:10–15:43** (weekday holidays count). Inside: only `systemctl`, `journalctl`, `ls`, `stat`, small-file reads. No bundled probe, no `uv run`, no `rclone`, no parquet reads.
