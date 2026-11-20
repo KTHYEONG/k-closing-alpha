@@ -217,6 +217,9 @@ def kind(d):
     return resolve_session_day(d).kind.value
 def is_td(d):
     return kind(d) in ("STANDARD", "SHIFTED")
+def shifted(d):
+    return kind(d) == "SHIFTED"
+SHIFT_HOLD = "SKIPPED:session_shifted"
 def prev_td(d):
     x = d - timedelta(days=1)
     while not is_td(x):
@@ -370,6 +373,9 @@ def c_research_e(d):
             status=m.get("status", "missing"), completed=done.strftime("%T") if done else "-", members=n, outcome=(o or {}).get("outcome", "absent"))
     @check("C13")
     def _():
+        if kind(d) == "SHIFTED":
+            out("C13", "SKIP(session_shifted)")
+            return
         found, tot, cut = _research_share(d, [f"auction-close-{d}-"])
         share = cut / tot if tot else 0.0
         out("C13", lv(False, "missing" in found.values() or share > 0.10), **found, entries=tot, cut_share=round(share, 3))
@@ -377,6 +383,9 @@ def c_research_e(d):
     def _():
         if not timer_active("postclose-snapshot"):
             out("C14", "SKIP(timer_off)")
+            return
+        if kind(d) == "SHIFTED":
+            out("C14", "SKIP(session_shifted)")
             return
         st = manifest_status(d, f"postclose-{d}-")
         runs_ = sorted(st)
@@ -409,6 +418,9 @@ def c_research_n(d):
 def c_decision(d):
     @check("C01")
     def _():
+        if kind(d) == "SHIFTED":
+            out("C01", "SKIP(session_shifted)")
+            return
         st = manifest_status(d, f"decision-{d}-")
         cov = jr("collect", at(d, "15:19:00"), at(d, "15:35:00"), r"stage=realtime_coverage")
         m = re.search(r"coverage=([\d.]+) status=(\w+)", cov[-1]) if cov else None
@@ -440,12 +452,15 @@ def p_ledger(d, p, morning):
         unexited = sorted(set(buys["order_id"].astype(str)) - exited)
         tr = pd.read_parquet(ROOT / "paper/trades.parquet")
         no_trade = sorted(set(sells[sells["entry_order_id"].astype(str).isin(buys["order_id"].astype(str))]["order_id"].astype(str)) - set(tr["exit_order_id"].astype(str)))
+        if shifted(d):  # exit is held on a SHIFTED day: the previous lots must stay open, with no sell yet
+            out("P02", lv(len(unexited) != len(buys) or no_trade or stale not in ([], [str(p)])), hold="shifted", prev_lots=len(buys), unexited=len(unexited), sells_without_trade=len(no_trade), stale_open_decisions=stale or "-")
+            return
         out("P02", lv(bool(stale) or bool(unexited) or bool(no_trade)), prev_lots=len(buys), unexited=len(unexited), sells_without_trade=len(no_trade), stale_open_decisions=stale or "-")
     @check("P03")
     def _():
         nav = pd.read_parquet(ROOT / "paper/nav.parquet")
         nav["day"] = nav["as_of_date"].astype(str).str[:10]
-        row = nav[nav["day"] == str(d)]
+        row = nav[nav["day"] == str(p if shifted(d) else d)]  # no nav row is written on a SHIFTED day
         gap = abs(float(row.iloc[-1]["nav"]) - float(row.iloc[-1]["cash"]) - float(row.iloc[-1]["open_market_value"])) if len(row) else float("nan")
         dup = int(nav.duplicated(["day"]).sum())
         cc = nav.sort_values("day")["cumulative_cost"].astype(float).diff().dropna()
@@ -632,9 +647,13 @@ def _():
     skipped = "non_trading_day" in w
     out("R05", lv(not skipped and (len(slots) < 7 or not rot)), kis_slots=len(slots), slots=slots or "-", kiwoom=bool(rot), closed_skip=skipped)
 c_decision(D)
-c_manifests_live(D)
-c_complete(D)
-q_partitions(D)
+if shifted(D):  # a KRX-shifted D has no cohort, archive or 1m/tick partitions by design (collect/archive_intraday skip it)
+    for _cid in ("C03", "C04", "C05", "C11", "Q08"):
+        out(_cid, "SKIP(session_shifted)")
+else:
+    c_manifests_live(D)
+    c_complete(D)
+    q_partitions(D)
 p_ledger(D, P, morning=False)
 b_offsite(D)
 b_prune()
@@ -655,8 +674,9 @@ Window O (post-exit):
 import pandas as pd
 runs("R01", [("price-ingest", D, "08:30:00", 1), ("auction-open", D, "08:39:55", 1), ("order-exit", D, "08:40:10", 1),
              ("order-reconcile-exit", D, "09:00:40", 1), ("paper-exit", D, "09:01:00", 1)])
-o = expect("R02", D, {"price_ingest": {"OK"}, "order_exit": {"OK", "SKIPPED:no_open_positions", "SKIPPED:trading_disabled"},
-                      "order_reconcile_exit": {"OK", "SKIPPED:no_orders", "SKIPPED:trading_disabled"}})
+o = expect("R02", D, {"price_ingest": {"OK"},
+                      "order_exit": {"DEGRADED:shifted_session_hold"} if shifted(D) else {"OK", "SKIPPED:no_open_positions", "SKIPPED:trading_disabled"},
+                      "order_reconcile_exit": {SHIFT_HOLD} if shifted(D) else {"OK", "SKIPPED:no_orders", "SKIPPED:trading_disabled"}})
 @check("C07")
 def _():
     m = o["price_ingest"]["metrics"]
@@ -678,6 +698,9 @@ def _():
     if not timer_active("auction-open"):
         out("C05", "SKIP(timer_off)")
         return
+    if shifted(D):
+        out("C05", "SKIP(session_shifted)")
+        return
     st = manifest_status(D, f"auction-open-{D}-")
     j = jr("auction-open", at(D, "08:39:00"), at(D, "09:40:00"), r"stage=auction_capture status=\w+ phase=open")
     out("C05", lv(not st, "complete" not in st.values()), open=",".join(st.values()) or "missing", journal=j[-1].split("status=")[1].split()[0] if j else "absent")
@@ -685,8 +708,8 @@ p_ledger(D, P, morning=True)
 @check("P06")
 def _():
     ex, rc = o["order_exit"].get("metrics", {}), o["order_reconcile_exit"].get("metrics", {})
-    if o["order_exit"]["outcome"] == "SKIPPED":
-        out("P06", "SKIP(" + o["order_exit"].get("reason", "") + ")")
+    if shifted(D) or o["order_exit"]["outcome"] == "SKIPPED":
+        out("P06", "SKIP(" + (o["order_exit"].get("reason", "") or "session_shifted") + ")")
         return
     acc = ex.get("n_acked", 0) + ex.get("n_rejected", 0) + ex.get("n_skipped", 0)
     bad = ex.get("n_unknown", 1) or ex.get("n_unknown_unresolved_total", 1) or rc.get("n_unknown", 1) or rc.get("n_missing_at_broker", 1) or rc.get("position_shortfalls") or rc.get("n_unknown_unresolved_total", 1)
@@ -704,11 +727,16 @@ import numpy as np
 import pandas as pd
 runs("R01", [("collect", D, "15:20:00", 1), ("research-roster", D, "15:20:30", 1), ("predict", D, "15:21:00", 1), ("auction-close", D, "15:20:25", 1), ("order-entry", D, "15:21:15", 1),
              ("finalize-close", D, "15:30:30", 1), ("order-reconcile-entry", D, "15:30:40", 1), ("paper-entry", D, "15:30:30", 1), ("postclose-snapshot", D, "15:31:30", 1)])
-o = expect("R02", D, {"predict": {"OK"}, "order_entry": {"OK", "SKIPPED:trading_disabled"}, "finalize_close": {"OK"},
-                      "order_reconcile_entry": {"OK", "SKIPPED:trading_disabled"}})
+o = expect("R02", D, {"predict": {"NO_DECISION:session_shifted", SHIFT_HOLD} if shifted(D) else {"OK"},
+                      "order_entry": {SHIFT_HOLD} if shifted(D) else {"OK", "SKIPPED:trading_disabled"},
+                      "finalize_close": {SHIFT_HOLD, "OK:session_shifted"} if shifted(D) else {"OK"},
+                      "order_reconcile_entry": {SHIFT_HOLD} if shifted(D) else {"OK", "SKIPPED:trading_disabled"}})
 c_decision(D)
 @check("Q01")
 def _():
+    if shifted(D):
+        out("Q01", "SKIP(session_shifted)")
+        return
     a = pd.read_parquet(ROOT / "history/archive.parquet")
     a["day"] = a["스냅샷_날짜"].astype(str).str[:10]
     d = a[a["day"] == str(D)]
@@ -733,6 +761,9 @@ def _():
     if not timer_active("auction-close"):
         out("C05", "SKIP(timer_off)")
         return
+    if shifted(D):
+        out("C05", "SKIP(session_shifted)")
+        return
     st = manifest_status(D, f"auction-close-{D}-")
     out("C05", lv(not st, "complete" not in st.values()), close=",".join(st.values()) or "missing")
 c_research_e(D)
@@ -742,6 +773,9 @@ def _():
         out("C16", "SKIP(timer_off)")
         return
     rec = o.get("auction_close")
+    if rec is None and shifted(D):
+        out("C16", "SKIP(session_shifted_no_outcome)")
+        return
     if rec is None:
         out("C16", "WARN", outcome="absent")
         return
@@ -759,8 +793,8 @@ p_ledger(D, P, morning=False)
 @check("P06")
 def _():
     en, rc = o["order_entry"].get("metrics", {}), o["order_reconcile_entry"].get("metrics", {})
-    if o["order_entry"]["outcome"] == "SKIPPED":
-        out("P06", "SKIP(" + o["order_entry"].get("reason", "") + ")")
+    if shifted(D) or o["order_entry"]["outcome"] == "SKIPPED":
+        out("P06", "SKIP(" + (o["order_entry"].get("reason", "") or "session_shifted") + ")")
         return
     picks = en.get("n_picks", en.get("n_lots"))
     acc = en.get("n_acked", 0) + en.get("n_rejected", 0) + en.get("n_not_sent", 0) + en.get("n_skipped", 0)
@@ -780,12 +814,16 @@ runs("R01", [("archive-intraday-regular", D, "15:40:00", 1), ("aftermarket-book"
              ("tape-sweep", D, "20:35:00", 1), ("backup-prune", D, "21:00:00", 1), ("daily-audit", D, "21:20:00", 1)]
      + ([("altdata-capture", D, "21:35:00", 1)] if NOW > at(D, "21:45:00") else []))
 r_degraded(D)
-c_manifests_live(D)
-@check("C06")
-def _():
-    st = manifest_status(D, f"auction-path-{D}-")
-    out("C06", lv(False, "complete" not in st.values()), status=",".join(st.values()) or "missing")
-c_research_n(D)
+if shifted(D):  # archive-intraday, auction-path, cohort completeness and the 1m/tick partitions are skipped by design on a KRX-shifted day
+    for _cid in ("C03", "C04", "C05", "C06", "C13", "C15", "C11", "Q06", "Q08"):
+        out(_cid, "SKIP(session_shifted)")
+else:
+    c_manifests_live(D)
+    @check("C06")
+    def _():
+        st = manifest_status(D, f"auction-path-{D}-")
+        out("C06", lv(False, "complete" not in st.values()), status=",".join(st.values()) or "missing")
+    c_research_n(D)
 @check("C08")
 def _():
     r = json.loads((CAP / "staging/tape_sweep/last_report.json").read_text())
@@ -801,15 +839,16 @@ def _():
     scan = round((ts(uni[-1]) - at(D, "20:35:00")).total_seconds() / 60, 1) if uni else None
     end = ts(rep[-1]) if rep else None; dl = sum("status=DEADLINE" in l for l in L)
     out("C17", lv(end is None, scan is None or scan > 30 or dl > 0 or end > at(D, "21:10:00")), scan_min=scan, finished=f"{end:%H:%M}" if end else "-", deadline=dl)
-c_complete(D)
-q_partitions(D)
-@check("Q06")
-def _():
-    m = pd.read_parquet(ROOT / f"history/intraday/1m/regular/{D:%Y-%m}/{D}.parquet")
-    dup = int(m.duplicated(["symbol", "ts_hms"]).sum())
-    bad = int(((m["high"] < m["low"]) | (m["volume"] < 0) | (m["close"] <= 0)).sum())
-    ts = pd.to_numeric(m["ts_hms"], errors="coerce")
-    out("Q06", lv(dup > 0 or bad > 0 or ts.min() > 90100 or ts.max() < 152900), rows=len(m), symbols=m["symbol"].nunique(), vendors={k: int(v) for k, v in m["vendor"].astype(str).value_counts().items()}, dup=dup, invalid=bad, ts=f"{int(ts.min())}..{int(ts.max())}")
+if not shifted(D):
+    c_complete(D)
+    q_partitions(D)
+    @check("Q06")
+    def _():
+        m = pd.read_parquet(ROOT / f"history/intraday/1m/regular/{D:%Y-%m}/{D}.parquet")
+        dup = int(m.duplicated(["symbol", "ts_hms"]).sum())
+        bad = int(((m["high"] < m["low"]) | (m["volume"] < 0) | (m["close"] <= 0)).sum())
+        ts = pd.to_numeric(m["ts_hms"], errors="coerce")
+        out("Q06", lv(dup > 0 or bad > 0 or ts.min() > 90100 or ts.max() < 152900), rows=len(m), symbols=m["symbol"].nunique(), vendors={k: int(v) for k, v in m["vendor"].astype(str).value_counts().items()}, dup=dup, invalid=bad, ts=f"{int(ts.min())}..{int(ts.max())}")
 @check("Q07")
 def _():
     ph = pd.read_parquet(ROOT / "history/price_history.parquet", columns=["date", "symbol", "volume", "close_raw"])
