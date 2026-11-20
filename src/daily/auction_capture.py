@@ -9,7 +9,7 @@ import functools
 import logging
 import math
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import date, datetime, timedelta
 from typing import Any, Literal
@@ -58,6 +58,7 @@ _TRANSIENT_VENDOR_RETRIES: int = 1
 _INPUT_POLL_SECONDS: float = 0.5
 NO_OPEN_TRADE_REASON: str = "no_open_trade"
 _ROUND0_INPUT_MARGIN: timedelta = timedelta(seconds=5)
+_OPEN_BASIS_MAX_LOOKBACK: int = 5
 
 
 def _previous_trading_day(snapshot_date: str) -> str:
@@ -108,14 +109,48 @@ def _close_cohort(store: CaptureStore, snapshot_date: str, now: datetime) -> tup
         return declared, "declared"
 
 
+def _is_shifted_day(day: str, session_overrides: Mapping[str, SessionClock] | None) -> bool:
+    return resolve_session_day(date.fromisoformat(day), overrides=session_overrides).kind is SessionKind.SHIFTED
+
+
+def _open_basis_day(
+    store: CaptureStore,
+    prev_day: str,
+    now: datetime,
+    *,
+    session_overrides: Mapping[str, SessionClock] | None,
+    max_lookback: int = _OPEN_BASIS_MAX_LOOKBACK,
+) -> str:
+    """Day whose close cohort and research roster populate the opening capture.
+
+    A SHIFTED previous session has no collected cohort by design, so the nearest earlier
+    day with a cohort published by ``now`` is used instead; otherwise ``prev_day`` is kept.
+    """
+    if not _is_shifted_day(prev_day, session_overrides):
+        return prev_day
+    day = prev_day
+    for _ in range(max_lookback):
+        day = _previous_trading_day(day)
+        try:
+            store.read_cohort(day, available_by=now)
+        except FileNotFoundError:
+            continue
+        return day
+    return prev_day
+
+
 def _resolve_roster(
     snapshot_date: str,
     phase: str,
     store: CaptureStore,
     now: datetime,
     previous_trading_day: str | None = None,
+    *,
+    session_overrides: Mapping[str, SessionClock] | None = None,
 ) -> tuple[list[str], str | None, bool]:
-    roster, cohort_id, incomplete, _ = _resolve_roster_source(snapshot_date, phase, store, now, previous_trading_day)
+    roster, cohort_id, incomplete, _ = _resolve_roster_source(
+        snapshot_date, phase, store, now, previous_trading_day, session_overrides=session_overrides
+    )
     return roster, cohort_id, incomplete
 
 
@@ -125,16 +160,33 @@ def _resolve_roster_source(
     store: CaptureStore,
     now: datetime,
     previous_trading_day: str | None = None,
+    *,
+    session_overrides: Mapping[str, SessionClock] | None = None,
 ) -> tuple[list[str], str | None, bool, str | None]:
     if phase == "close":
         cohort, source = _close_cohort(store, snapshot_date, now)
         return [str(item) for item in cohort.eligible_symbols], cohort.cohort_id, False, source
     prev_day = previous_trading_day or _previous_trading_day(snapshot_date)
+    basis_day = _open_basis_day(store, prev_day, now, session_overrides=session_overrides)
+    if basis_day != prev_day:
+        logger.info(
+            "[DATA] stage=auction_cohort status=FALLBACK reason=previous_shifted date=%s prev=%s basis=%s",
+            snapshot_date,
+            prev_day,
+            basis_day,
+        )
     held = load_held_roster()
     try:
-        prev_cohort = store.read_cohort(prev_day, available_by=now)
+        prev_cohort = store.read_cohort(basis_day, available_by=now)
     except FileNotFoundError:
-        logger.warning("[DATA] stage=auction_cohort status=INCOMPLETE reason=missing_previous date=%s prev=%s", snapshot_date, prev_day)
+        logger.warning("[DATA] stage=auction_cohort status=INCOMPLETE reason=missing_previous date=%s prev=%s", snapshot_date, basis_day)
+        if _is_shifted_day(basis_day, session_overrides):
+            logger.warning(
+                "[DATA] stage=auction_cohort status=INCOMPLETE reason=missing_previous_after_shifted date=%s prev=%s lookback=%d",
+                snapshot_date,
+                basis_day,
+                _OPEN_BASIS_MAX_LOOKBACK,
+            )
         if not held.ok:
             logger.warning(
                 "[DATA] stage=auction_cohort status=INCOMPLETE reason=held_roster_unavailable error=%s date=%s",
@@ -1127,9 +1179,23 @@ async def run_auction_capture(
         inputs_wait_s = (now_clock() - wait_started).total_seconds()
     now = now_clock()
     roster, cohort_id, cohort_incomplete, cohort_source = _resolve_roster_source(
-        snapshot_date, phase, store, now, previous_trading_day
+        snapshot_date,
+        phase,
+        store,
+        now,
+        previous_trading_day,
+        session_overrides=profile.COLLECTION_SESSION_OVERRIDES,
     )
-    roster_date = snapshot_date if phase == "close" else (previous_trading_day or _previous_trading_day(snapshot_date))
+    roster_date = (
+        snapshot_date
+        if phase == "close"
+        else _open_basis_day(
+            store,
+            previous_trading_day or _previous_trading_day(snapshot_date),
+            now,
+            session_overrides=profile.COLLECTION_SESSION_OVERRIDES,
+        )
+    )
     extras = research_extras(
         store,
         roster_date,

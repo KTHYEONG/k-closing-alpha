@@ -59,7 +59,14 @@ def _store(tmp_path: Path):
     return CaptureStore(tmp_path / "capture")
 
 
-def _publish_cohort(store: Any, snapshot_date: str, eligible: list[str], *, run_id: str = "decision-1") -> Any:
+def _publish_cohort(
+    store: Any,
+    snapshot_date: str,
+    eligible: list[str],
+    *,
+    run_id: str = "decision-1",
+    completed_at: dt.datetime | None = None,
+) -> Any:
     from src.data.capture_contracts import (
         SEOUL,
         CaptureContext,
@@ -94,7 +101,7 @@ def _publish_cohort(store: Any, snapshot_date: str, eligible: list[str], *, run_
             scheduled_at=None,
         ),
         cohort=cohort,
-        completed_at=dt.datetime(2026, 9, 1, 9, 0, tzinfo=SEOUL),
+        completed_at=completed_at or dt.datetime(2026, 9, 1, 9, 0, tzinfo=SEOUL),
         entries=(),
         artifacts=(),
         status=CaptureStatus.COMPLETE,
@@ -1709,6 +1716,161 @@ def test_open_roster_missing_previous_and_ledger_failure_warns_both(tmp_path, mo
     assert (roster, cohort_id, incomplete) == ([], None, True)
     assert any("reason=missing_previous" in r.message for r in caplog.records)
     assert any("reason=held_roster_unavailable error=OSError" in r.message for r in caplog.records)
+
+
+_SHIFTED_PREV = "2026-11-19"
+_SHIFTED_OVERRIDES: dict[str, Any] = {_SHIFTED_PREV: _clock(_SHIFTED_PREV)}
+
+
+def test_open_after_shifted_prev_uses_earlier_cohort(tmp_path, monkeypatch, caplog) -> None:
+    """Shifted previous session: the nearest earlier cohort populates the opening roster, with one FALLBACK line."""
+    import logging
+
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    cohort = _publish_cohort(store, "2026-11-18", ["000001", "000002"])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster(("000003",), True, None))
+    with caplog.at_level(logging.INFO, logger=auction_capture.logger.name):
+        roster, cohort_id, incomplete, source = auction_capture._resolve_roster_source(  # type: ignore[arg-type]
+            "2026-11-20", "open", store, _seoul(2026, 11, 20, 8, 30), _SHIFTED_PREV, session_overrides=_SHIFTED_OVERRIDES,
+        )
+    assert (roster, cohort_id, incomplete, source) == (["000001", "000002", "000003"], cohort.cohort_id, False, None)
+    fallback = [r.message for r in caplog.records if "status=FALLBACK" in r.message]
+    assert len(fallback) == 1
+    assert "date=2026-11-20 prev=2026-11-19 basis=2026-11-18" in fallback[0]
+
+
+def test_open_after_shifted_prev_reads_basis_day_research_roster(tmp_path, monkeypatch) -> None:
+    """The research extras of the opening capture come from the basis day, not the shifted previous day."""
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-11-18", ["000001"])
+    _publish_research_roster(store, "2026-11-18", ["000009"], completed_at=_seoul(2026, 11, 18, 15, 20))
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), True, None))
+    profile = _profile(
+        tmp_path,
+        COLLECTION_OPEN_CONFIRM_SECONDS=600,
+        COLLECTION_SESSION_OVERRIDES={_SHIFTED_PREV: _clock(_SHIFTED_PREV)},
+    )
+    state = {"now": _seoul(2026, 11, 20, 8, 30)}
+
+    async def _sleep(seconds: float) -> None:
+        state["now"] += dt.timedelta(seconds=seconds)
+
+    client = _FakeClient(price_seq={"000001": [100], "000009": [100]}, calls=[])
+    manifest = _run(
+        auction_capture.run_auction_capture(
+            "2026-11-20",
+            phase="open",
+            profile=profile,
+            store=store,
+            clients=[client],
+            session_clock=_clock("2026-11-20"),
+            now_fn=lambda: state["now"],
+            sleep_fn=_sleep,
+            previous_trading_day=_SHIFTED_PREV,
+        )
+    )
+
+    assert {e.symbol for e in manifest.entries} == {"000001"}
+    research = [m for m in store.read_manifests("2026-11-20") if m.context.capture_reason == "auction-open-research"]
+    assert len(research) == 1
+    assert {e.symbol for e in research[0].entries} == {"000009"}
+
+
+def test_open_missing_prev_standard_day_stays_incomplete(tmp_path, monkeypatch, caplog) -> None:
+    """A missing cohort on a standard previous day never falls back to an earlier day."""
+    import logging
+
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-09-15", ["000001"])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster(("000003",), True, None))
+    with caplog.at_level(logging.INFO, logger=auction_capture.logger.name):
+        roster, cohort_id, incomplete = auction_capture._resolve_roster(  # type: ignore[arg-type]
+            "2026-09-17", "open", store, _seoul(2026, 9, 17, 9, 5), "2026-09-16", session_overrides={},
+        )
+    assert (roster, cohort_id, incomplete) == (["000003"], None, True)
+    assert any("reason=missing_previous" in r.message for r in caplog.records)
+    assert not any("status=FALLBACK" in r.message for r in caplog.records)
+
+
+def test_open_fallback_respects_availability_cutoff(tmp_path, monkeypatch) -> None:
+    """A cohort completed after the observation time is not used; the walk continues to earlier days."""
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-11-17", ["000007"])
+    _publish_cohort(store, "2026-11-18", ["000008"], completed_at=_seoul(2026, 11, 20, 10, 0))
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), True, None))
+    roster, cohort_id, incomplete, _ = auction_capture._resolve_roster_source(  # type: ignore[arg-type]
+        "2026-11-20", "open", store, _seoul(2026, 11, 20, 8, 30), _SHIFTED_PREV, session_overrides=_SHIFTED_OVERRIDES,
+    )
+    assert (roster, cohort_id, incomplete) == (["000007"], "c-2026-11-17", False)
+
+
+def test_open_fallback_stops_at_lookback_limit(tmp_path, monkeypatch, caplog) -> None:
+    """Five weekday steps back from the shifted day is the limit; a sixth step is never read."""
+    import logging
+
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-11-11", ["000007"])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster(("000003",), True, None))
+    now = _seoul(2026, 11, 20, 8, 30)
+    assert auction_capture._open_basis_day(  # type: ignore[arg-type]
+        store, _SHIFTED_PREV, now, session_overrides=_SHIFTED_OVERRIDES,
+    ) == _SHIFTED_PREV
+    with caplog.at_level(logging.WARNING, logger=auction_capture.logger.name):
+        roster, cohort_id, incomplete, _ = auction_capture._resolve_roster_source(  # type: ignore[arg-type]
+            "2026-11-20", "open", store, now, _SHIFTED_PREV, session_overrides=_SHIFTED_OVERRIDES,
+        )
+    assert (roster, cohort_id, incomplete) == (["000003"], None, True)
+    assert any("reason=missing_previous_after_shifted" in r.message and "lookback=5" in r.message for r in caplog.records)
+
+
+def test_close_phase_after_shifted_prev_unchanged(tmp_path, monkeypatch) -> None:
+    """Close phase reads only the snapshot's own cohort, regardless of the shifted previous day."""
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    own = _publish_cohort(store, "2026-11-20", ["000001"])
+    _publish_cohort(store, "2026-11-18", ["000009"])
+
+    def _boom() -> HeldRoster:
+        raise AssertionError("ledger must not be read on close")
+
+    monkeypatch.setattr(auction_capture, "load_held_roster", _boom)
+    assert auction_capture._resolve_roster_source(  # type: ignore[arg-type]
+        "2026-11-20", "close", store, _seoul(2026, 11, 20, 15, 0), _SHIFTED_PREV, session_overrides=_SHIFTED_OVERRIDES,
+    ) == (["000001"], own.cohort_id, False, "decision")
+
+
+def test_fallback_never_reads_snapshot_date(tmp_path, monkeypatch) -> None:
+    """A snapshot-day cohort is not observable yet and the basis walk never queries the snapshot date."""
+    from src.daily import auction_capture
+
+    store = _store(tmp_path)
+    _publish_cohort(store, "2026-11-20", ["000001"], completed_at=_seoul(2026, 11, 20, 10, 0))
+    _publish_cohort(store, "2026-11-18", ["000008"])
+    monkeypatch.setattr(auction_capture, "load_held_roster", lambda: HeldRoster((), True, None))
+    queried: list[str] = []
+    original_read_cohort = store.read_cohort
+
+    def _spy(day: str, *, available_by: dt.datetime) -> Any:
+        queried.append(day)
+        return original_read_cohort(day, available_by=available_by)
+
+    monkeypatch.setattr(store, "read_cohort", _spy)
+    roster, cohort_id, incomplete, _ = auction_capture._resolve_roster_source(  # type: ignore[arg-type]
+        "2026-11-20", "open", store, _seoul(2026, 11, 20, 8, 30), _SHIFTED_PREV, session_overrides=_SHIFTED_OVERRIDES,
+    )
+    assert (roster, cohort_id, incomplete) == (["000008"], "c-2026-11-18", False)
+    assert "2026-11-20" not in queried
 
 
 def test_run_async_continues_with_healthy_slots_when_one_token_fails(tmp_path, monkeypatch) -> None:
