@@ -922,9 +922,11 @@ def _seal_locked(
         for ledger_entry in entries:
             for member in ledger_entry.members:
                 sealed[member.path] = member.size
+        # Absent members of dates past local retention are expected prune results, not loss.
+        within_retention = (today - date.fromisoformat(date_name)).days <= LOCAL_SEALED_RETENTION_DAYS
         for sealed_path in sealed:
             full = capture_root / sealed_path
-            if full.is_symlink() or not full.is_file():
+            if (full.is_symlink() or not full.is_file()) and within_retention:
                 missing_sealed_members += 1
         segments = plan_segments(capture_root, tier, date_name, sealed, config)
         if not segments:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 
@@ -680,6 +680,56 @@ def test_seal_uses_default_clock_and_counts_missing_members(tmp_path: Path, monk
     run_fn2, _ = _make_fake(tmp_path / "remote", "gdrive:test")
     report2 = seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn2, now_fn=_utcnow, config=_config())
     assert report2.missing_sealed_members == 1 and report2.segments_committed == 0
+
+
+def test_seal_ignores_absent_members_past_local_retention(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    today = date(2026, 11, 20)
+    day = (today - timedelta(days=45)).isoformat()
+    rels =[_raw_rel(day, "run-1", name) for name in ("a.bin", "b.bin", "c.bin")]
+    for rel in rels:
+        _write_member(tmp_path, rel, b"sealed")
+    _write_prune_ledger(tmp_path, "raw", day, rels)
+    (tmp_path / rels[0]).unlink()
+    (tmp_path / rels[1]).unlink()
+    run_fn, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    report = seal_and_upload(tmp_path, today=today, full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=_config())
+    assert report.missing_sealed_members == 0 and report.segments_committed == 0
+
+
+def test_seal_retention_boundary_is_inclusive_for_missing_members(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import LOCAL_SEALED_RETENTION_DAYS, seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    today = date(2026, 11, 20)
+    for age in (LOCAL_SEALED_RETENTION_DAYS, LOCAL_SEALED_RETENTION_DAYS + 1):
+        day = (today - timedelta(days=age)).isoformat()
+        rel = _raw_rel(day, "run-1", "a.bin")
+        _write_member(tmp_path, rel, b"sealed")
+        _write_prune_ledger(tmp_path, "raw", day, [rel])
+        (tmp_path / rel).unlink()
+    run_fn, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    report = seal_and_upload(tmp_path, today=today, full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=_config())
+    assert report.missing_sealed_members == 1
+
+
+def test_seal_uploads_unsealed_remnant_past_local_retention(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    today = date(2026, 11, 20)
+    day = (today - timedelta(days=45)).isoformat()
+    sealed_rel = _raw_rel(day, "run-1", "a.bin")
+    _write_member(tmp_path, sealed_rel, b"sealed")
+    _write_prune_ledger(tmp_path, "raw", day, [sealed_rel])
+    (tmp_path / sealed_rel).unlink()
+    _write_member(tmp_path, _raw_rel(day, "run-2", "remnant.bin"), b"remnant")
+    run_fn, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    report = seal_and_upload(tmp_path, today=today, full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=_config())
+    assert report.missing_sealed_members == 0
+    assert report.segments_committed == 1
 
 
 def test_seal_raises_on_rclone_failures(tmp_path: Path, monkeypatch) -> None:
