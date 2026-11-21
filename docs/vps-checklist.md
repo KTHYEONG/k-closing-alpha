@@ -854,7 +854,7 @@ def _():
     ph = pd.read_parquet(ROOT / "history/price_history.parquet", columns=["date", "symbol", "volume", "close_raw"])
     ph["day"] = ph["date"].astype(str).str[:10]
     days = sorted(ph["day"].unique())
-    days = [x for x in days if x <= str(P)][-5:]
+    days = [x for x in days if x <= str(P) and not shifted(date.fromisoformat(x))][-5:]  # a SHIFTED day (e.g. CSAT 10:00-16:30) has a truncated 1m partition by design
     def ratio(day):
         mm = pd.read_parquet(ROOT / f"history/intraday/1m/regular/{day[:7]}/{day}.parquet", columns=["symbol", "ts_hms", "volume", "close"])
         pp = ph[ph["day"] == day].set_index(ph[ph["day"] == day]["symbol"].astype(str))
