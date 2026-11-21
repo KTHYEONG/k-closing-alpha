@@ -16,11 +16,15 @@ def _c16_block() -> str:
     return '@check("C16")\n' + tail.split("\np_ledger(D, P, morning=False)", 1)[0]
 
 
-def _run_c16(outcome: dict[str, Any] | None, *, timer_on: bool = True) -> list[tuple[str, str, dict[str, Any]]]:
+def _run_c16(
+    outcome: dict[str, Any] | None, *, timer_on: bool = True, shift: bool = False
+) -> list[tuple[str, str, dict[str, Any]]]:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
     namespace: dict[str, Any] = {
         "o": {} if outcome is None else {"auction_close": outcome},
         "timer_active": lambda name: timer_on,
+        "D": "2026-11-20",
+        "shifted": lambda day: shift,
         "check": lambda cid: lambda fn: fn(),
         "out": lambda cid, st, **detail: emitted.append((cid, st, detail)),
         "lv": lambda fail, warn=False: "FAIL" if fail else "WARN" if warn else "PASS",
@@ -63,6 +67,11 @@ def test_c16_absent_outcome_warns_and_timer_off_skips() -> None:
     assert status == "WARN" and detail == {"outcome": "absent"}
     ((_, status, _),) = _run_c16(_record(), timer_on=False)
     assert status == "SKIP(timer_off)"
+
+
+def test_c16_shifted_day_without_outcome_skips() -> None:
+    ((_, status, _),) = _run_c16(None, shift=True)
+    assert status == "SKIP(session_shifted_no_outcome)"
 
 
 def test_c16_row_and_window_list_match_probe() -> None:
