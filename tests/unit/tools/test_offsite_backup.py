@@ -9,6 +9,12 @@ from zoneinfo import ZoneInfo
 import pytest
 
 KST = ZoneInfo("Asia/Seoul")
+
+
+@pytest.fixture(autouse=True)
+def _stub_raw_dictionary_upload(monkeypatch):
+    # The dictionary step has its own tests in test_capture_offsite; these tests exercise the other steps.
+    monkeypatch.setattr("src.tools.offsite_backup.publish_raw_dictionary", lambda *a, **k: "present")
 UTC = ZoneInfo("UTC")
 
 
@@ -1574,3 +1580,49 @@ def test_classify_ledger_files_ignores_gz_and_no_false_rewrite(tmp_path) -> None
 
     assert appended == [] and unproven == [] and rewritten == []
     assert next_state == {}
+
+
+def test_raw_dictionary_step_runs_after_seal_and_is_reported(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+    order: list[str] = []
+
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
+        order.append("capture_seal")
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    def _dict(rclone, *, run_fn):
+        order.append("raw_dictionary")
+        return "uploaded"
+
+    monkeypatch.setattr("src.tools.offsite_backup.publish_raw_dictionary", _dict)
+
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    report = run_offsite_backup(tmp_path, tmp_path / "data/history/capture", now=_now_kst("2026-11-02", "22:15:00"), run_fn=_run, seal_fn=_seal)
+    assert report.steps["raw_dictionary"] == {"status": "ok", "action": "uploaded"}
+    assert order == ["capture_seal", "raw_dictionary"]
+
+
+def test_raw_dictionary_step_failure_is_isolated(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import SealReport
+    from src.tools.offsite_backup import run_offsite_backup
+
+    monkeypatch.setattr("src.tools.offsite_backup._resolve_rclone_bin", lambda: "rclone")
+
+    def _seal(capture_root: Path, *, today, full_scan, deadline=None) -> SealReport:
+        return SealReport(dates_scanned=0, segments_committed=0, members_committed=0, archive_bytes=0, missing_sealed_members=0)
+
+    def _dict(rclone, *, run_fn):
+        raise RuntimeError("dictionary upload down")
+
+    monkeypatch.setattr("src.tools.offsite_backup.publish_raw_dictionary", _dict)
+
+    def _run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    with pytest.raises(RuntimeError, match="raw_dictionary"):
+        run_offsite_backup(tmp_path, tmp_path / "data/history/capture", now=_now_kst("2026-11-02", "22:15:00"), run_fn=_run, seal_fn=_seal)

@@ -1015,7 +1015,7 @@ def test_run_price_ingest_receipt_constrains_historical_use(tmp_path) -> None:
     received = datetime(2026, 9, 17, 9, 0, 1, tzinfo=SEOUL)
     observer({"OutBlock_1": []}, {"endpoint": "stk", "basDd": "20200102"}, datetime(2026, 9, 17, 9, 0, tzinfo=SEOUL), received, 0, 0)
     observer(None, {"endpoint": "ksq", "basDd": "20200102"}, datetime(2026, 9, 17, 9, 0, tzinfo=SEOUL), received, 0, 1)
-    files = sorted((tmp_path / "cap").rglob("*.json.gz"))
+    files = sorted((tmp_path / "cap").rglob("*.json.zst"))
     assert len(files) == 2
     data = files[0].read_bytes()
     ref = ArtifactRef(path=str(files[0].relative_to(tmp_path / "cap")), sha256=hashlib.sha256(data).hexdigest(), bytes=len(data))
@@ -1045,7 +1045,7 @@ def test_price_page_observer_sanitizes_raw_krx_endpoint_path(tmp_path) -> None:
         datetime(2026, 9, 18, 20, 30, tzinfo=SEOUL), datetime(2026, 9, 18, 20, 30, 1, tzinfo=SEOUL), 0, 0,
     )
 
-    files = sorted((tmp_path / "cap").rglob("*.json.gz"))
+    files = sorted((tmp_path / "cap").rglob("*.json.zst"))
     assert len(files) == 1
     data = files[0].read_bytes()
     ref = ArtifactRef(path=str(files[0].relative_to(tmp_path / "cap")), sha256=hashlib.sha256(data).hexdigest(), bytes=len(data))

@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import json
 import os
+from importlib import resources
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -15,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
+import zstandard as zstd
 
 import src.data.capture_store as store_module
 from src.data.capture_contracts import (
@@ -129,7 +131,7 @@ def test_appended_raw_payload_round_trips(tmp_path: Path) -> None:
     """Raw payload is preserved."""
     store = CaptureStore(tmp_path / "capture")
     ref = store.append_response(_response())
-    assert ref.path == "raw/2026-09-17/kis/PRICE/price/run-1/005930-p0000-a00.json.gz"
+    assert ref.path == "raw/2026-09-17/kis/PRICE/price/run-1/005930-p0000-a00.json.zst"
     envelope = store.read_artifact(ref)
     assert envelope["payload"] == {"output": {"code": "005930", "price": "72000"}}
     assert envelope["source_published_at"] is None
@@ -178,7 +180,7 @@ def test_identical_publication_is_idempotent(tmp_path: Path) -> None:
     second = store.append_response(_response())
     assert first == second
     assert store.root == tmp_path / "capture"
-    assert len(list((tmp_path / "capture" / "raw").rglob("*.json.gz"))) == 1
+    assert len(list((tmp_path / "capture" / "raw").rglob("*.json.zst"))) == 1
 
 
 def test_conflicting_identity_fails(tmp_path: Path) -> None:
@@ -196,7 +198,7 @@ def test_corrupt_evidence_never_qualifies(tmp_path: Path) -> None:
     store = CaptureStore(tmp_path / "capture")
     completed = START + timedelta(minutes=4)
     _publish_decision(store, "run-1", completed)
-    raw_path = tmp_path / "capture" / "raw/2026-09-17/kis/PRICE/price/run-1/005930-p0000-a00.json.gz"
+    raw_path = tmp_path / "capture" / "raw/2026-09-17/kis/PRICE/price/run-1/005930-p0000-a00.json.zst"
     tampered = raw_path.read_bytes() + b"\x00"
     raw_path.write_bytes(tampered)
     with pytest.raises(ValueError, match="hash-inconsistent"):
@@ -845,9 +847,9 @@ def test_iter_run_envelopes_scoped_to_run(tmp_path: Path) -> None:
     yielded = list(store.iter_run_envelopes(DAY.isoformat(), "run-1"))
 
     assert [path for path, _ in yielded] == [
-        "raw/2026-09-17/kis/PRICE/price/run-1/000660-p0000-a00.json.gz",
-        "raw/2026-09-17/kis/PRICE/price/run-1/000660-p0001-a00.json.gz",
-        "raw/2026-09-17/kis/PRICE/price/run-1/005930-p0000-a00.json.gz",
+        "raw/2026-09-17/kis/PRICE/price/run-1/000660-p0000-a00.json.zst",
+        "raw/2026-09-17/kis/PRICE/price/run-1/000660-p0001-a00.json.zst",
+        "raw/2026-09-17/kis/PRICE/price/run-1/005930-p0000-a00.json.zst",
     ]
     assert all(envelope["context"]["run_id"] == "run-1" for _, envelope in yielded)
     assert yielded[0][1]["payload"] == {"output": {"code": "005930", "price": "72000"}}
@@ -1032,3 +1034,70 @@ def test_declaration_prune_listing_failure_never_raises(tmp_path: Path, monkeypa
     ref = store.publish_cohort_declaration(_cohort(), declared_at=datetime(2026, 9, 14, 15, 20, tzinfo=SEOUL_TZ), retain_days=40)
 
     assert ref.path.startswith("declared/")
+
+
+def test_new_raw_artifact_is_dict_zstd_and_round_trips(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    response = _response()
+    ref = store.append_response(response)
+    assert ref.path.endswith(".json.zst")
+    raw = (tmp_path / "capture" / ref.path).read_bytes()
+    assert zstd.get_frame_parameters(raw).dict_id == store_module._raw_zstd_dict().dict_id()
+    assert store.read_artifact(ref) == json.loads(store_module._canonical_json(store._envelope(response)))
+
+
+def test_legacy_gzip_artifact_still_reads(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    completed = START + timedelta(minutes=4)
+    legacy_rel = "raw/2026-09-17/kis/PRICE/price/run-1/005930-p0000-a00.json.gz"
+    legacy = gzip.compress(store_module._canonical_json(store._envelope(_response())), compresslevel=9, mtime=0)
+    (tmp_path / "capture" / legacy_rel).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "capture" / legacy_rel).write_bytes(legacy)
+    legacy_ref = ArtifactRef(path=legacy_rel, sha256=hashlib.sha256(legacy).hexdigest(), bytes=len(legacy))
+    _publish_decision(store, "run-1", completed, entries=[_entry(legacy_ref)])
+    assert store.read_artifact(legacy_ref)["payload"] == {"output": {"code": "005930", "price": "72000"}}
+    assert len(store.read_manifests("2026-09-17")) == 1
+
+
+def test_iter_run_envelopes_mixes_suffixes_sorted(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    legacy_rel = "raw/2026-09-17/kis/PRICE/price/run-1/000660-p0000-a00.json.gz"
+    legacy_path = tmp_path / "capture" / legacy_rel
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.write_bytes(
+        gzip.compress(store_module._canonical_json(store._envelope(_response(context=_context(symbol="000660")))),
+                      compresslevel=9, mtime=0)
+    )
+    store.append_response(_response(context=_context(symbol="005930")))
+
+    yielded = list(store.iter_run_envelopes(DAY.isoformat(), "run-1"))
+
+    assert [path for path, _ in yielded] == [
+        legacy_rel,
+        "raw/2026-09-17/kis/PRICE/price/run-1/005930-p0000-a00.json.zst",
+    ]
+    assert [envelope["context"]["symbol"] for _, envelope in yielded] == ["000660", "005930"]
+
+
+def test_unknown_dictionary_rejected(tmp_path: Path) -> None:
+    store = CaptureStore(tmp_path / "capture")
+    samples = [json.dumps({"output": {"code": f"{i:06d}"}}).encode() for i in range(300)]
+    other = zstd.ZstdCompressor(dict_data=zstd.train_dictionary(16384, samples), write_checksum=True)
+    foreign = other.compress(store_module._canonical_json(store._envelope(_response())))
+    rel = "raw/2026-09-17/kis/PRICE/price/run-1/005930-p0000-a00.json.zst"
+    (tmp_path / "capture" / rel).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "capture" / rel).write_bytes(foreign)
+    ref = ArtifactRef(path=rel, sha256=hashlib.sha256(foreign).hexdigest(), bytes=len(foreign))
+    with pytest.raises(ValueError, match="unknown raw dictionary"):
+        store.read_artifact(ref)
+
+
+def test_dict_file_hash_pinned() -> None:
+    dict_bytes = resources.files("src.data").joinpath("capture_dicts", "raw-v1.zdict").read_bytes()
+    assert hashlib.sha256(dict_bytes).hexdigest() == "96bd7ba530e2d9e4fd0353f285888a2654228a99f2d9ed8febaa1c1108a8d49b"
+    assert len(dict_bytes) == 112640
+
+
+def test_decode_raw_rejects_unknown_suffix() -> None:
+    with pytest.raises(ValueError, match="unsupported raw artifact suffix"):
+        store_module._decode_raw("raw/x.bin", b"")

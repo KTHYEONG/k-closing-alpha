@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import glob
 import gzip
 import hashlib
@@ -12,10 +13,12 @@ import shutil
 import uuid
 from collections.abc import Iterator, Sequence
 from datetime import date, datetime
+from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import pandas as pd
+import zstandard as zstd
 
 from src.config.collection import CollectionSettings
 from src.data.capture_contracts import (
@@ -42,6 +45,10 @@ _MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 _LOCK_TIMEOUT_SECONDS = DEFAULT_LOCK_TIMEOUT_SECONDS
 _DECLARED_DIR = "declared"
 _DATE_DIR_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
+RAW_ZSTD_DICT_ID: Final[str] = "raw-v1"
+RAW_ZSTD_LEVEL: Final[int] = 9
+RAW_SUFFIX_ZSTD: Final[str] = ".json.zst"
+RAW_SUFFIX_GZIP: Final[str] = ".json.gz"
 
 
 def resolve_capture_root(profile: CollectionSettings | None = None) -> Path:
@@ -80,6 +87,27 @@ def _sha256(data: bytes) -> str:
 
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+@functools.cache
+def _raw_zstd_dict() -> zstd.ZstdCompressionDict:
+    data = (resources.files("src.data") / "capture_dicts" / f"{RAW_ZSTD_DICT_ID}.zdict").read_bytes()
+    return zstd.ZstdCompressionDict(data)
+
+
+def _decode_raw(rel: str, data: bytes) -> bytes:
+    if rel.endswith(RAW_SUFFIX_GZIP):
+        return gzip.decompress(data)
+    if rel.endswith(RAW_SUFFIX_ZSTD):
+        dictionary = _raw_zstd_dict()
+        try:
+            frame_dict_id = zstd.get_frame_parameters(data).dict_id
+            if frame_dict_id != dictionary.dict_id():
+                raise ValueError("unknown raw dictionary")
+            return zstd.ZstdDecompressor(dict_data=dictionary).decompress(data)
+        except zstd.ZstdError as exc:
+            raise ValueError(f"corrupt raw evidence: {rel!r}") from exc
+    raise ValueError(f"unsupported raw artifact suffix: {rel!r}")
 
 
 class CaptureStore:
@@ -177,7 +205,7 @@ class CaptureStore:
     def _raw_rel(response: CapturedResponse) -> str:
         context = response.context
         symbol = context.symbol if context.symbol is not None else "nosymbol"
-        name = f"{symbol}-p{response.page_index:04d}-a{response.attempt_index:02d}.json.gz"
+        name = f"{symbol}-p{response.page_index:04d}-a{response.attempt_index:02d}{RAW_SUFFIX_ZSTD}"
         # 동일 run이 여러 endpoint(예: PRICE의 KOSPI/KOSDAQ)를 순회할 때 심볼 없는
         # 첫 페이지 이름이 겹칠 수 있으므로 endpoint를 항상 경로에 반영한다.
         # 실측: 2026-09-20 price_ingest가 KOSPI/KOSDAQ 응답을 같은 경로로 써서
@@ -208,7 +236,10 @@ class CaptureStore:
             OSError: Artifact publication failed.
             ValueError: Invalid JSON evidence or unsafe context.
         """
-        data = gzip.compress(_canonical_json(self._envelope(response)), compresslevel=9, mtime=0)
+        compressor = zstd.ZstdCompressor(
+            level=RAW_ZSTD_LEVEL, dict_data=_raw_zstd_dict(), write_checksum=True, write_content_size=True
+        )
+        data = compressor.compress(_canonical_json(self._envelope(response)))
         return self._publish_bytes(self._raw_rel(response), data, None)
 
     def _verify_manifest_refs(self, manifest: CaptureManifest) -> None:
@@ -645,7 +676,7 @@ class CaptureStore:
         if len(data) != ref.bytes or _sha256(data) != ref.sha256:
             raise ValueError(f"hash-inconsistent evidence: {ref.path!r}")
         try:
-            envelope: dict[str, Any] = json.loads(gzip.decompress(data).decode("utf-8"))
+            envelope: dict[str, Any] = json.loads(_decode_raw(ref.path, data).decode("utf-8"))
         except OSError as exc:
             raise ValueError(f"corrupt raw evidence: {ref.path!r}") from exc
         if not isinstance(envelope, dict) or "payload" not in envelope or "context" not in envelope:
@@ -663,20 +694,21 @@ class CaptureStore:
             Lazy iterator of (root-relative path, decoded envelope); empty when the run has no raw evidence.
 
         Raises:
-            ValueError: Unsafe run identity, invalid date, or a raw artifact that is not gzip-compressed JSON.
+            ValueError: Unsafe run identity, invalid date, or a raw artifact that is not gzip or dictionary-zstd JSON.
         """
         day = date.fromisoformat(snapshot_date)
         _require_path_safe(run_id, "run_id")
         rels = sorted(
             path.relative_to(self._root).as_posix()
-            for path in self._root.glob(f"raw/{day.isoformat()}/*/*/*/{glob.escape(run_id)}/*.json.gz")
+            for suffix in (RAW_SUFFIX_ZSTD, RAW_SUFFIX_GZIP)
+            for path in self._root.glob(f"raw/{day.isoformat()}/*/*/*/{glob.escape(run_id)}/*{suffix}")
         )
         return self._iter_envelopes(rels)
 
     def _iter_envelopes(self, rels: Sequence[str]) -> Iterator[tuple[str, BrokerPayload]]:
         for rel in rels:
             try:
-                envelope = json.loads(gzip.decompress(self._resolve(rel).read_bytes()).decode("utf-8"))
+                envelope = json.loads(_decode_raw(rel, self._resolve(rel).read_bytes()).decode("utf-8"))
             except (OSError, EOFError, ValueError) as exc:
                 raise ValueError(f"corrupt raw evidence: {rel!r}") from exc
             if not isinstance(envelope, dict) or "payload" not in envelope or "context" not in envelope:

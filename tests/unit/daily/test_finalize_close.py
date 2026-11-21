@@ -1514,7 +1514,7 @@ def test_fetch_confirmed_quote_rejects_inconsistent_capture_context() -> None:
 def test_rejected_confirmation_keeps_raw_evidence(tmp_path) -> None:
     """Failed market-code gate still preserves raw output1/output2 evidence."""
     import asyncio
-    import gzip
+    from src.data.capture_store import _decode_raw
     import json
     from pathlib import Path
 
@@ -1537,9 +1537,9 @@ def test_rejected_confirmation_keeps_raw_evidence(tmp_path) -> None:
         fetch_confirmed_quote(client, object(), "005930", capture_store=store, run_id="run-confirm", cohort_id="cohort-x")
     )
     assert is_close_confirmed(price_out, book_out2, datetime(2026, 9, 10, 15, 31, 0, tzinfo=ZoneInfo("Asia/Seoul"))) is False
-    raws = list(Path(tmp_path / "capture" / "raw").rglob("*.json.gz"))
+    raws = list(Path(tmp_path / "capture" / "raw").rglob("*.json.zst"))
     assert len(raws) == 2
-    payloads = [json.loads(gzip.decompress(path.read_bytes()).decode("utf-8")) for path in raws]
+    payloads = [json.loads(_decode_raw(path.name, path.read_bytes()).decode("utf-8")) for path in raws]
     assert any("output1" in (envelope.get("payload") or {}) for envelope in payloads)
     assert any((envelope.get("payload") or {}).get("output2", {}).get("antc_mkop_cls_code") == "121" for envelope in payloads)
 
@@ -1576,10 +1576,10 @@ def test_fetch_confirmed_quote_second_poll_round_does_not_collide_with_first(tmp
 
     assert price_out["stck_prpr"] == "269500"
     assert book_out2["antc_mkop_cls_code"] == "112"
-    raws = list((tmp_path / "capture" / "raw").rglob("*012450-p0000-a0*.json.gz"))
+    raws = list((tmp_path / "capture" / "raw").rglob("*012450-p0000-a0*.json.zst"))
     assert len(raws) == 4
-    assert any(p.name.endswith("-a00.json.gz") for p in raws)
-    assert any(p.name.endswith("-a01.json.gz") for p in raws)
+    assert any(p.name.endswith("-a00.json.zst") for p in raws)
+    assert any(p.name.endswith("-a01.json.zst") for p in raws)
 
 
 def test_confirmation_persistence_failure_records_degraded() -> None:

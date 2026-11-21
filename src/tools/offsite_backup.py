@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.io_utils import atomic_write_text
-from src.tools.capture_offsite import OffsiteConfig, SealReport, seal_and_upload
+from src.tools.capture_offsite import OffsiteConfig, SealReport, publish_raw_dictionary, seal_and_upload
 from src.tools.offsite_common import OFFSITE_REMOTE_BASE
 from src.tools.offsite_common import resolve_rclone_bin as _resolve_rclone_bin
 from src.tools.price_history_offsite import (
@@ -73,6 +73,7 @@ RCLONE_DURATION_EXCEEDED_EXIT: int = 10
 LOOSE_RCLONE_TIMEOUT_SEC: int = 4 * 3600
 PRICE_HISTORY_FORM_STEP: str = "price_history_form"
 LEDGER_STEP: str = "offsite_ledger"
+RAW_DICTIONARY_STEP: str = "raw_dictionary"
 LEDGER_RELPATH: str = "offsite/ledger"
 LEDGER_UPLOAD_STATE_RELPATH: str = "offsite/ledger_upload_state.json"
 
@@ -668,6 +669,11 @@ def _run_offsite_backup_inner(
         }
     except Exception as exc:
         steps["capture_seal"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+
+    try:
+        steps[RAW_DICTIONARY_STEP] = {"status": "ok", "action": publish_raw_dictionary(rclone, run_fn=run_fn)}
+    except Exception as exc:
+        steps[RAW_DICTIONARY_STEP] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
 
     try:
         steps[LEDGER_STEP] = _run_ledger_upload(project_root, capture_root, rclone, snapshot_day, run_fn)

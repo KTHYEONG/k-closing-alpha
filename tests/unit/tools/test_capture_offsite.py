@@ -5,6 +5,8 @@ import subprocess
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 
 def _write_member(root: Path, rel: str, data: bytes) -> Path:
     full = root / rel
@@ -3260,3 +3262,139 @@ def test_compaction_io_failure_keeps_original(tmp_path: Path, monkeypatch) -> No
     assert report.kept == (("raw/2026-08-01", "verify_failed"),)
     assert plain.read_bytes() == before
     assert list(tmp_path.rglob("*.tmp")) == []
+
+
+def _packaged_dict_md5() -> str:
+    from importlib import resources
+
+    return hashlib.md5(resources.files("src.data").joinpath("capture_dicts", "raw-v1.zdict").read_bytes()).hexdigest()  # noqa: S324
+
+
+def _dict_run_fn(md5_replies: list[subprocess.CompletedProcess], calls: list[list[str]]):
+    replies = iter(md5_replies)
+
+    def _run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1] == "md5sum":
+            return next(replies)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    return _run
+
+
+def test_raw_dictionary_upload_is_immutable_and_verified_once(monkeypatch) -> None:
+    from src.tools.capture_offsite import publish_raw_dictionary
+
+    md5 = _packaged_dict_md5()
+    calls: list[list[str]] = []
+    run_fn = _dict_run_fn(
+        [
+            subprocess.CompletedProcess([], 1, stdout="", stderr="object not found"),
+            subprocess.CompletedProcess([], 0, stdout=f"{md5}  raw-v1.zdict\n", stderr=""),
+        ],
+        calls,
+    )
+    assert publish_raw_dictionary("rclone", run_fn=run_fn, config=_config()) == "uploaded"
+    remote = "gdrive:test/_dicts/raw-v1.zdict"
+    assert [c[1] for c in calls] == ["md5sum", "copyto", "md5sum"]
+    assert calls[1][-1] == "--immutable" and calls[1][3] == remote
+    assert calls[0][2] == calls[2][2] == remote
+
+
+def test_raw_dictionary_upload_skipped_when_remote_matches(monkeypatch) -> None:
+    from src.tools.capture_offsite import publish_raw_dictionary
+
+    calls: list[list[str]] = []
+    run_fn = _dict_run_fn(
+        [subprocess.CompletedProcess([], 0, stdout=f"{_packaged_dict_md5()}  raw-v1.zdict\n", stderr="")], calls
+    )
+    assert publish_raw_dictionary("rclone", run_fn=run_fn, config=_config()) == "present"
+    assert [c[1] for c in calls] == ["md5sum"]
+
+
+def test_raw_dictionary_conflicting_remote_is_never_overwritten() -> None:
+    from src.tools.capture_offsite import publish_raw_dictionary
+
+    calls: list[list[str]] = []
+    run_fn = _dict_run_fn([subprocess.CompletedProcess([], 0, stdout="0" * 32 + "  raw-v1.zdict\n", stderr="")], calls)
+    with pytest.raises(ValueError, match="differs from packaged copy"):
+        publish_raw_dictionary("rclone", run_fn=run_fn, config=_config())
+    assert [c[1] for c in calls] == ["md5sum"]
+
+
+def test_raw_dictionary_post_upload_mismatch_and_rclone_failure(monkeypatch) -> None:
+    from src.tools.capture_offsite import publish_raw_dictionary
+
+    calls: list[list[str]] = []
+    bad_post = _dict_run_fn(
+        [
+            subprocess.CompletedProcess([], 1, stdout="", stderr="not found"),
+            subprocess.CompletedProcess([], 0, stdout="f" * 32 + "\n", stderr=""),
+        ],
+        calls,
+    )
+    with pytest.raises(ValueError, match="MD5 mismatch"):
+        publish_raw_dictionary("rclone", run_fn=bad_post, config=_config())
+
+    quota = _dict_run_fn([subprocess.CompletedProcess([], 1, stdout="", stderr="quota exceeded")], [])
+    with pytest.raises(subprocess.CalledProcessError):
+        publish_raw_dictionary("rclone", run_fn=quota, config=_config())
+
+
+def test_restore_mixed_suffix_date_byte_exact(tmp_path: Path, monkeypatch) -> None:
+    from src.tools.capture_offsite import read_ledger, restore_date, seal_and_upload
+
+    _patch_rclone(monkeypatch)
+    day = "2026-09-10"
+    members = {
+        _raw_rel(day, "kis", "PRICE", "price", "run-1", "a.json.zst"): b"\x28\xb5\x2f\xfd-zstd-bytes",
+        _raw_rel(day, "kis", "PRICE", "price", "run-1", "b.json.gz"): b"\x1f\x8b-legacy-gzip-bytes",
+    }
+    for rel, data in members.items():
+        _write_member(tmp_path, rel, data)
+    run_fn, _ = _make_fake(tmp_path / "remote", "gdrive:test")
+    seal_and_upload(tmp_path, today=date(2026, 9, 11), full_scan=True, run_fn=run_fn, now_fn=_utcnow, config=_config())
+    ledger = {m.path: m.sha256 for entry in read_ledger(tmp_path, "raw", day) for m in entry.members}
+
+    dest = tmp_path / "dest"
+    restore_date(tmp_path, "raw", day, dest, run_fn=run_fn, config=_config())
+
+    assert sorted(ledger) == sorted(members)
+    for rel, data in members.items():
+        assert hashlib.sha256((dest / rel).read_bytes()).hexdigest() == ledger[rel] == hashlib.sha256(data).hexdigest()
+
+
+def test_raw_dictionary_upload_failure_paths(monkeypatch) -> None:
+    from src.tools.capture_offsite import publish_raw_dictionary
+
+    upload_fails = _dict_run_fn(
+        [
+            subprocess.CompletedProcess([], 1, stdout="", stderr="object not found"),
+            subprocess.CompletedProcess([], 1, stdout="", stderr="permission denied"),
+        ],
+        [],
+    )
+    with pytest.raises(subprocess.CalledProcessError):
+        publish_raw_dictionary("rclone", run_fn=upload_fails, config=_config())
+
+    post_fails = _dict_run_fn(
+        [
+            subprocess.CompletedProcess([], 1, stdout="", stderr="object not found"),
+            subprocess.CompletedProcess([], 1, stdout="", stderr="transient"),
+        ],
+        [],
+    )
+    with pytest.raises(subprocess.CalledProcessError):
+        publish_raw_dictionary("rclone", run_fn=post_fails, config=_config())
+
+
+def test_raw_dictionary_copy_failure_is_raised(monkeypatch) -> None:
+    from src.tools.capture_offsite import publish_raw_dictionary
+
+    def _run(cmd, **kwargs):
+        if cmd[1] == "md5sum":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="object not found")
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="permission denied")
+
+    with pytest.raises(subprocess.CalledProcessError):
+        publish_raw_dictionary("rclone", run_fn=_run, config=_config())

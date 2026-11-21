@@ -25,12 +25,14 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from importlib import resources
 from pathlib import Path
 from typing import Final
 
 import pyarrow as pa
 
 from src.config.collection import CollectionSettings
+from src.data.capture_store import RAW_ZSTD_DICT_ID
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.io_utils import atomic_write_text
 from src.tools.offsite_common import (
@@ -415,6 +417,47 @@ def _load_scan_state(capture_root: Path) -> dict[str, int]:
 def _save_scan_state(capture_root: Path, state: Mapping[str, int]) -> None:
     path = capture_root / "offsite" / "scan_state.json"
     atomic_write_text(path, json.dumps(dict(state), sort_keys=True), mode=None)
+
+
+def publish_raw_dictionary(rclone: str, *, run_fn: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run, config: OffsiteConfig = OffsiteConfig()) -> str:  # noqa: B008
+    """Upload the packaged raw zstd dictionary once to `<remote_root>/_dicts/` so restores never depend on the repo.
+
+    Returns:
+        "present" when the remote copy already matches the packaged bytes, "uploaded" otherwise.
+
+    Raises:
+        ValueError: The remote object differs from the packaged dictionary, or the post-upload MD5 mismatches.
+        subprocess.CalledProcessError: rclone failure other than a missing remote object.
+    """
+    local = Path(str(resources.files("src.data") / "capture_dicts" / f"{RAW_ZSTD_DICT_ID}.zdict"))
+    local_md5 = _local_md5(local)
+    remote = f"{config.remote_root}/_dicts/{RAW_ZSTD_DICT_ID}.zdict"
+    pre = run_fn(
+        [rclone, "md5sum", remote], capture_output=True, text=True, timeout=config.rclone_timeout_sec, check=False
+    )
+    if pre.returncode == 0:
+        if _parse_remote_md5(pre.stdout) != local_md5:
+            raise ValueError(f"remote raw dictionary differs from packaged copy: {remote}")
+        return "present"
+    if not _is_missing_remote_dir(pre.stderr):
+        raise subprocess.CalledProcessError(pre.returncode, pre.args, pre.stdout, pre.stderr)
+    uploaded = run_fn(
+        [rclone, "copyto", str(local), remote, "--immutable"],
+        capture_output=True,
+        text=True,
+        timeout=config.rclone_timeout_sec,
+        check=False,
+    )
+    if uploaded.returncode != 0:
+        raise subprocess.CalledProcessError(uploaded.returncode, uploaded.args, uploaded.stdout, uploaded.stderr)
+    post = run_fn(
+        [rclone, "md5sum", remote], capture_output=True, text=True, timeout=config.rclone_timeout_sec, check=False
+    )
+    if post.returncode != 0:
+        raise subprocess.CalledProcessError(post.returncode, post.args, post.stdout, post.stderr)
+    if _parse_remote_md5(post.stdout) != local_md5:
+        raise ValueError(f"remote MD5 mismatch for {remote}")
+    return "uploaded"
 
 
 def _remote_path(config: OffsiteConfig, tier: str, trading_date: str, seg: str) -> str:
@@ -1433,6 +1476,8 @@ def restore_date(
 
     Used for disaster recovery and the periodic restore drill. Ledger
     (capture_root) and destination may differ.
+    The raw zstd dictionary needed by `.json.zst` members is restored separately from
+    `<remote_root>/_dicts/` by `publish_raw_dictionary`, not from these segments.
 
     Returns:
         Sorted relative paths written or verified-identical under dest_root.

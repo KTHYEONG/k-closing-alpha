@@ -2157,13 +2157,13 @@ def _capture_cohort(codes=("005930",), trading_day="2026-09-14"):
 
 
 def _raw_envelopes(root):
-    import gzip
+    from src.data.capture_store import _decode_raw
     import json
     from pathlib import Path
 
     return [
-        (str(path), json.loads(gzip.decompress(path.read_bytes()).decode("utf-8")))
-        for path in sorted(Path(root).rglob("*.json.gz"))
+        (str(path), json.loads(_decode_raw(path.name, path.read_bytes()).decode("utf-8")))
+        for path in sorted(Path(root).rglob("*.json.zst"))
     ]
 
 

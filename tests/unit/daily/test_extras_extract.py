@@ -174,7 +174,7 @@ def test_extract_writes_partitions_in_cohort_order(tmp_path: Path) -> None:
 def test_extract_without_vendor_extras_keeps_cohort_with_nulls(tmp_path: Path) -> None:
     store = CaptureStore(_root(tmp_path))
     _seed_decision_run(store)
-    for path in (_root(tmp_path) / "raw" / DATE).rglob("*.json.gz"):
+    for path in (_root(tmp_path) / "raw" / DATE).rglob("*.json.zst"):
         if "/SCAN/" in path.as_posix() or "/PRICE/" in path.as_posix() or "/INVESTOR_ESTIMATE/" in path.as_posix():
             path.unlink()
 
@@ -287,7 +287,7 @@ def test_main_corrupt_raw_evidence_degrades_without_partitions(
     root = _root(tmp_path)
     store = CaptureStore(root)
     _seed_decision_run(store)
-    corrupt = root / "raw" / DATE / "kis" / "PRICE" / "inquire-price" / RUN / "000000-p0000-a09.json.gz"
+    corrupt = root / "raw" / DATE / "kis" / "PRICE" / "inquire-price" / RUN / "000000-p0000-a09.json.zst"
     corrupt.parent.mkdir(parents=True, exist_ok=True)
     corrupt.write_bytes(b"garbage")
     recorded = _patch_main(monkeypatch, root)

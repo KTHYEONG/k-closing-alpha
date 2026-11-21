@@ -230,7 +230,7 @@ def test_collect_bars_unknown_venue_preserves_raw(tmp_path) -> None:
     frame, entry = delivered["005930"]
     assert entry.status.value in ("UNKNOWN", "PARTIAL")
     assert frame.empty
-    assert list((store.root / "raw").rglob("*.json.gz"))
+    assert list((store.root / "raw").rglob("*.json.zst"))
 
 
 def test_collect_ticks_truncated_triggers_bounded_repair(tmp_path) -> None:
@@ -1371,7 +1371,7 @@ def test_collect_intraday_bars_without_capture_kwargs_publishes_certified_eviden
     pending = [item for item in manifests if item.status.value == "PENDING"]
     assert len(pending) == 1
     assert pending[0].context.dataset == CaptureDataset.MINUTE_BARS
-    assert list((tmp_path / "capture" / "raw").rglob("*.json.gz")) != []
+    assert list((tmp_path / "capture" / "raw").rglob("*.json.zst")) != []
 
 
 def test_empty_universe_returns_canonical_empty_frame_without_vendor_calls(tmp_path, monkeypatch) -> None:

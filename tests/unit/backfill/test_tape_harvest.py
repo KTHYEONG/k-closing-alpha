@@ -465,7 +465,7 @@ def test_evidence_is_stored_only_for_pages_holding_requested_days(tmp_path) -> N
         )
     )
     raw_refs = {ref.path for r in out for ref in r.entry.raw_refs if ref.path.startswith("raw/")}
-    assert len(raw_refs) == 1 and raw_refs.pop().endswith("-p0002-a00.json.gz")
+    assert len(raw_refs) == 1 and raw_refs.pop().endswith("-p0002-a00.json.zst")
 
 
 def test_bracketed_day_reason_records_the_proof_used(tmp_path) -> None:
@@ -1091,7 +1091,7 @@ class _RetriedPageTape:
 
 
 def test_retried_page_evidence_has_distinct_attempt_index(tmp_path) -> None:
-    import gzip
+    from src.data.capture_store import _decode_raw
 
     store = CaptureStore(tmp_path / "capture")
     asyncio.run(
@@ -1100,12 +1100,14 @@ def test_retried_page_evidence_has_distinct_attempt_index(tmp_path) -> None:
             store=store, run_id="tape-2020-01-04-034", profile=_profile(tmp_path), on_result=lambda _r: None,
         )
     )
-    files = sorted(store.root.rglob("*-p0000-a0*.json.gz"))
+    files = sorted(store.root.rglob("*-p0000-a0*.json.zst"))
     names = [p.name for p in files]
     assert len(files) == 2
-    assert any(n.endswith("-p0000-a00.json.gz") for n in names)
-    good = gzip.decompress(next(p for p in files if p.name.endswith("-p0000-a03.json.gz")).read_bytes()).decode("utf-8")
-    failed = gzip.decompress(next(p for p in files if p.name.endswith("-p0000-a00.json.gz")).read_bytes()).decode("utf-8")
+    assert any(n.endswith("-p0000-a00.json.zst") for n in names)
+    good_path = next(p for p in files if p.name.endswith("-p0000-a03.json.zst"))
+    good = _decode_raw(good_path.name, good_path.read_bytes()).decode("utf-8")
+    failed_path = next(p for p in files if p.name.endswith("-p0000-a00.json.zst"))
+    failed = _decode_raw(failed_path.name, failed_path.read_bytes()).decode("utf-8")
     assert "stk_tic_chart_qry" in good and "[1631]" not in good
     assert "[1631]" in failed and "stk_tic_chart_qry" not in failed
 
