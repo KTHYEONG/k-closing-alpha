@@ -9,7 +9,7 @@ import pytest
 
 TABLE_PATH = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "kis_slot_assignments.toml"
 CANONICAL_HEADER = "# canonical: krx-alpha/deploy/shared/kis_slot_assignments.toml schema=1"
-PINNED_SHA256 = "c33b94f0bd72dc713dfe423645de4e2912f977228d6263a6cabbbecc250214b2"
+PINNED_SHA256 = "83190436dd6e3fa003a1d5f53916b2b33dc8299923bb95e8ad2791afde2dcfbc"
 
 _WINDOW_RE = re.compile(r"^\d{2}:\d{2}-\d{2}:\d{2}$")
 
@@ -89,6 +89,12 @@ def test_kca_selectors_match_provision_env() -> None:
     for name in declared:
         if name.endswith("_SLOTS"):
             assert name in selectors
+
+
+def test_krx_regular_kis_slots_are_3_4_6() -> None:
+    selectors = _load_doc()["selectors"]["krx"]
+
+    assert selectors["KRX_ALPHA_REGULAR_KIS_CREDENTIAL_SLOTS"] == [3, 4, 6]
 
 
 def test_krx_snapshot_slot_matches() -> None:
