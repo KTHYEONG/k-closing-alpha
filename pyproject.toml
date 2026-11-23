@@ -86,6 +86,7 @@ ignore = [
 "src/processing/*.py" = ["SIM102", "SIM108", "N806", "B905", "C416"]
 "src/utils/display.py" = ["T20", "N806", "B023"]
 "tools/verify.py" = ["T201", "S607"] # tools/verify.py is a developer CLI whose contract IS stdout/stderr text (PASS | ... line + JSON envelope), so print is the correct primitive; git is resolved via PATH by design, matching developer shells and CI.
+"ops/probes/*.py" = ["C416", "E401", "E702", "E731", "I001", "N806", "PERF401", "S603", "S607", "SIM115", "SIM300", "T201"]  # kca probe script copied from the checklist; logic kept verbatim
 
 [tool.ruff.lint.mccabe]
 max-complexity = 15
@@ -109,6 +110,7 @@ exclude = [
     "^\\.git/",
     "^\\.venv/",
     "^tests/.*/conftest\\.py$",
+    "^ops/probes/",
 ]
 
 [[tool.mypy.overrides]]

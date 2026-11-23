@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -4564,8 +4565,8 @@ def test_source_diff_checklist_probe_uses_date_scoped_evidence(tmp_path, heartbe
         heartbeat_path.write_text("invalid JSON" if corrupt else json.dumps({
             "snapshot_date": heartbeat_day, "open_issues": [{"key": issue} for issue in issues],
         }))
-    text = Path("docs/vps-checklist.md").read_text()
-    probe = '@check("Q10")\n' + text.split('\n@check("Q10")\n', 1)[1].split("\nb_prune()", 1)[0]
+    text = Path("ops/probes/kca_probe.py").read_text()
+    probe = '@check("Q10")\n' + textwrap.dedent(text.split('\n    @check("Q10")\n', 1)[1].split("\n    b_prune()", 1)[0])
 
     def _heartbeat():
         path = tmp_path / "logs" / "heartbeat" / "daily_audit.json"

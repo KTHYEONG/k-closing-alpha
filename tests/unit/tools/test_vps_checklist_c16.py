@@ -4,16 +4,18 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import textwrap
 
 import pytest
 
-DOC = Path(__file__).resolve().parents[3] / "docs" / "vps-checklist.md"
+DOC = Path(__file__).resolve().parents[3] / "ops" / "probes" / "kca_probe.py"
+CHECKLIST = Path(__file__).resolve().parents[3] / "docs" / "vps-checklist.md"
 
 
 def _c16_block() -> str:
     text = DOC.read_text()
-    tail = text.split('\n@check("C16")\n', 1)[1]
-    return '@check("C16")\n' + tail.split("\np_ledger(D, P, morning=False)", 1)[0]
+    tail = text.split('\n    @check("C16")\n', 1)[1]
+    return '@check("C16")\n' + textwrap.dedent(tail.split("\n    p_ledger(D, P, morning=False)", 1)[0])
 
 
 def _run_c16(
@@ -75,6 +77,6 @@ def test_c16_shifted_day_without_outcome_skips() -> None:
 
 
 def test_c16_row_and_window_list_match_probe() -> None:
-    text = DOC.read_text()
+    text = CHECKLIST.read_text()
     assert "| C16 | EXT | E |" in text
     assert "C14 C16 Q01" in text
