@@ -49,6 +49,11 @@ class IncidentKind(StrEnum):
     KRX_DEFERRED_RECREATE = "krx_deferred_recreate"
     KSE_PAGE_UNDELIVERED = "kse_page_undelivered"
     VPS_DISK_WATCH = "vps_disk_watch"
+    OPS_PROBE_MORNING = "ops_probe_morning"
+    OPS_PROBE_OPEN = "ops_probe_open"
+    OPS_PROBE_CLOSE = "ops_probe_close"
+    OPS_PROBE_EOD = "ops_probe_eod"
+    OPS_PROBE_WEEKLY = "ops_probe_weekly"
 
 
 class SourceScope(StrEnum):
@@ -194,6 +199,36 @@ INCIDENT_TEXTS: Mapping[IncidentKind, IncidentText] = MappingProxyType(
             auto_action="kse 알림은 kse outbox에 적재되어 재전송 대기 중입니다.",
             action="지금 kse 로그와 kse outbox를 확인해 어떤 긴급 상황인지 파악하고 해당 작업의 마감 전에 조치하세요.",
         ),
+        IncidentKind.OPS_PROBE_MORNING: IncidentText(
+            summary="자동 점검 아침 이상",
+            what="대시보드의 아침 자동 점검(quant-ops-probe@MORNING)에서 PASS가 아닌 항목이 나왔습니다.",
+            auto_action="없음(점검 항목별 판정은 대시보드에 기록됨).",
+            action="메일 본문의 [ERROR] 줄과 대시보드의 자동 점검 항목을 확인하고 장 시작 전에 조치하세요.",
+        ),
+        IncidentKind.OPS_PROBE_OPEN: IncidentText(
+            summary="자동 점검 장 시작 이상",
+            what="대시보드의 장 시작 자동 점검(quant-ops-probe@OPEN)에서 PASS가 아닌 항목이 나왔습니다.",
+            auto_action="없음(점검 항목별 판정은 대시보드에 기록됨).",
+            action="메일 본문의 [ERROR] 줄과 대시보드의 자동 점검 항목을 확인하고 장중 수집 상태를 확인하세요.",
+        ),
+        IncidentKind.OPS_PROBE_CLOSE: IncidentText(
+            summary="자동 점검 장 마감 이상",
+            what="대시보드의 장 마감 자동 점검(quant-ops-probe@CLOSE)에서 PASS가 아닌 항목이 나왔습니다.",
+            auto_action="없음(점검 항목별 판정은 대시보드에 기록됨).",
+            action="메일 본문의 [ERROR] 줄과 대시보드의 자동 점검 항목을 확인하고 마감 후 작업 전에 조치하세요.",
+        ),
+        IncidentKind.OPS_PROBE_EOD: IncidentText(
+            summary="자동 점검 장후 이상",
+            what="대시보드의 장후 자동 점검(quant-ops-probe@EOD)에서 PASS가 아닌 항목이 나왔습니다.",
+            auto_action="없음(점검 항목별 판정은 대시보드에 기록됨).",
+            action="메일 본문의 [ERROR] 줄과 대시보드의 자동 점검 항목을 확인하고 다음 거래일 전에 조치하세요.",
+        ),
+        IncidentKind.OPS_PROBE_WEEKLY: IncidentText(
+            summary="자동 점검 주간 이상",
+            what="대시보드의 주간 자동 점검(quant-ops-probe@WEEKLY)에서 PASS가 아닌 항목이 나왔습니다.",
+            auto_action="없음(점검 항목별 판정은 대시보드에 기록됨).",
+            action="메일 본문의 [ERROR] 줄과 대시보드의 자동 점검 항목을 확인하고 다음 주간 작업 전에 조치하세요.",
+        ),
     }
 )
 
@@ -210,6 +245,11 @@ CRITICAL_UNITS: Mapping[str, IncidentKind] = MappingProxyType(
         "krx-deferred-recreate": IncidentKind.KRX_DEFERRED_RECREATE,
         # krx deploy/host/vps_disk_watch.py signals WARN/CRIT only through its exit code (OnFailure relay).
         "vps-disk-watch": IncidentKind.VPS_DISK_WATCH,
+        "quant-ops-probe@MORNING": IncidentKind.OPS_PROBE_MORNING,
+        "quant-ops-probe@OPEN": IncidentKind.OPS_PROBE_OPEN,
+        "quant-ops-probe@CLOSE": IncidentKind.OPS_PROBE_CLOSE,
+        "quant-ops-probe@EOD": IncidentKind.OPS_PROBE_EOD,
+        "quant-ops-probe@WEEKLY": IncidentKind.OPS_PROBE_WEEKLY,
     }
 )
 

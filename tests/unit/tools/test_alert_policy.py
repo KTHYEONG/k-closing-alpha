@@ -30,6 +30,11 @@ def _kst(hh: int, mm: int = 0, day: int = 3) -> datetime:
         ("kca-kis-token-warmup.service", IncidentKind.KIS_TOKEN_WARMUP),
         ("krx-deferred-recreate.service", IncidentKind.KRX_DEFERRED_RECREATE),
         ("vps-disk-watch.service", IncidentKind.VPS_DISK_WATCH),
+        ("quant-ops-probe@MORNING.service", IncidentKind.OPS_PROBE_MORNING),
+        ("quant-ops-probe@OPEN.service", IncidentKind.OPS_PROBE_OPEN),
+        ("quant-ops-probe@CLOSE.service", IncidentKind.OPS_PROBE_CLOSE),
+        ("quant-ops-probe@EOD.service", IncidentKind.OPS_PROBE_EOD),
+        ("quant-ops-probe@WEEKLY.service", IncidentKind.OPS_PROBE_WEEKLY),
         ("kse-alert@kse-morning.service.service", IncidentKind.KSE_PAGE_UNDELIVERED),
         ("kse-alert@kse-evening.service", IncidentKind.KSE_PAGE_UNDELIVERED),
         ("kca-predict", IncidentKind.PREDICT),
@@ -63,6 +68,8 @@ def test_critical_units(unit: str, kind: IncidentKind) -> None:
         "krx-host-backup.service",
         "vps-image-gc.service",
         "crypto-pilot-backup.service",
+        "quant-ops-probe@NIGHT.service",
+        "quant-ops-probe@.service",
     ],
 )
 def test_silent_units(unit: str) -> None:
