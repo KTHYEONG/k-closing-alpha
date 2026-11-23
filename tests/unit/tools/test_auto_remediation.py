@@ -486,3 +486,69 @@ def test_repeated_skip_is_recorded_once_per_day() -> None:
         [key], now=_now(day="2026-10-08", clock="10:00:00"), history=history, unit_busy=lambda u: False
     )
     assert [item[0].outcome.value for item in next_day] == ["skipped_forbidden"]
+
+
+def _write_ledger(path: Path, records, extra_lines: tuple[str, ...] = ()) -> list[str]:
+    from src.tools.auto_remediation import _record_to_json
+
+    lines = [_record_to_json(rec) for rec in records] + list(extra_lines)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+    return lines
+
+
+def test_compact_ledger_keeps_window_boundary_unsettled_started_and_invalid_lines(tmp_path: Path) -> None:
+    from datetime import date
+
+    from src.tools.auto_remediation import compact_remediation_ledger, read_remediation_ledger, settle_remediation
+
+    # Given today=2026-11-23, retention=60 -> cutoff 2026-09-24 (KST)
+    ledger = tmp_path / "ledger.jsonl"
+    old_started_settled = _rec("tape:a", "started", _now("2026-09-01", "10:00:00"))
+    old_resolved = _rec("tape:a", "resolved", _now("2026-09-01", "10:20:00"))
+    old_unsettled = _rec("tape:b", "started", _now("2026-08-01", "10:00:00"))
+    last_expired = _rec("tape:c", "skipped_window", _now("2026-09-23", "23:59:59"))
+    first_kept = _rec("tape:c", "skipped_window", _now("2026-09-24", "00:00:00"))
+    # 2026-09-23T15:30Z is 2026-09-24 00:30 KST: the boundary is judged in KST
+    utc_kept = _rec("tape:d", "skipped_busy", datetime.fromisoformat("2026-09-23T15:30:00+00:00"))
+    lines = _write_ledger(
+        ledger,
+        [old_started_settled, old_resolved, old_unsettled, last_expired, first_kept, utc_kept],
+        extra_lines=("{not json", "", '{"ts": "2026-01-01T00:00:00+09:00"}'),
+    )
+    before = settle_remediation(set(), now=_now("2026-11-23"), history=read_remediation_ledger(ledger), path=tmp_path / "probe-a.jsonl")
+
+    # When
+    report = compact_remediation_ledger(today=date(2026, 11, 23), retention_days=60, path=ledger)
+
+    # Then expired settled rows go; the unsettled STARTED, in-window rows and both invalid lines stay verbatim in order
+    # (blank separator lines carry no record and are not rewritten)
+    assert ledger.read_text(encoding="utf-8").splitlines() == [lines[2], lines[4], lines[5], lines[6], lines[8]]
+    assert (report.kept, report.dropped, report.invalid_kept) == (5, 3, 2)
+    # And settlement sees the same unsettled start as before compaction
+    after = settle_remediation(set(), now=_now("2026-11-23"), history=read_remediation_ledger(ledger), path=tmp_path / "probe-b.jsonl")
+    assert [(r.issue_key, r.outcome) for r in after] == [(r.issue_key, r.outcome) for r in before]
+    assert [r.issue_key for r in after] == ["tape:b"]
+
+
+def test_compact_ledger_dry_run_absent_file_and_nothing_expired_do_not_write(tmp_path: Path) -> None:
+    from datetime import date
+
+    from src.tools.auto_remediation import compact_remediation_ledger
+
+    # Given an absent ledger
+    absent = tmp_path / "absent.jsonl"
+    assert compact_remediation_ledger(today=date(2026, 11, 23), retention_days=60, path=absent).kept == 0
+    assert not absent.exists()
+
+    # Given one expired row
+    ledger = tmp_path / "ledger.jsonl"
+    _write_ledger(ledger, [_rec("tape:a", "resolved", _now("2026-01-01"))])
+    before = ledger.read_bytes()
+
+    # When dry-run
+    report = compact_remediation_ledger(today=date(2026, 11, 23), retention_days=60, path=ledger, dry_run=True)
+
+    # Then it reports without rewriting
+    assert report.dropped == 1
+    assert ledger.read_bytes() == before

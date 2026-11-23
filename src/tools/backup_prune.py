@@ -9,10 +9,15 @@ kca-backup 은 덮어쓴 파일을 _deleted/<subtree>/<YYYY-MM-DD>/ 로 옮긴�
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import logging
+import os
+import re
 import shutil
 import subprocess
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -28,14 +33,23 @@ from src.data.partition_eviction import (
     eviction_families,
     validate_retention,
 )
+from src.tools.auto_remediation import RemediationCompactionReport, compact_remediation_ledger
 from src.tools.capture_offsite import (
     LedgerCompactionReport,
     LocalRetentionReport,
     compact_old_ledgers,
     prune_local_sealed_capture,
 )
-from src.tools.offsite_common import DATED_DIR_RE, OFFSITE_REMOTE_BASE, resolve_rclone_bin
+from src.tools.offsite_common import (
+    DATED_DIR_RE,
+    OFFSITE_REMOTE_BASE,
+    OPS_LOG_DAY_RELDIRS,
+    OPS_LOG_MONTHLY_RELDIRS,
+    OPS_LOG_ORPHAN_RELFILES,
+    resolve_rclone_bin,
+)
 from src.utils.cli_logging import configure_cli_logging
+from src.utils.file_lock import open_lock_descriptor
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +63,17 @@ BACKUP_MAX_PURGE_DIRS_PER_SUBTREE: int = 7
 SEALED_PRUNE_BUDGET: timedelta = timedelta(minutes=40)
 HISTORY_EVICTION_BUDGET: timedelta = timedelta(minutes=30)
 LOCAL_INTRADAY_BACKUP_RETENTION_DAYS: int = 3
+# Ops diagnostics are local-only; 60 days covers post-incident reading without unbounded growth.
+OPS_LOG_RETENTION_DAYS: int = 60
+# Remediation-ledger writers (daily_audit, audit_reconcile) run under `flock %t/kca-audit.lock`; compaction joins it.
+AUDIT_WRITER_LOCK_NAME: str = "kca-audit.lock"
+AUDIT_WRITER_LOCK_TIMEOUT: timedelta = timedelta(minutes=2)
+AUDIT_WRITER_LOCK_POLL_SEC: float = 0.5
 RCLONE_TIMEOUT_SEC: int = 600
 # rclone 문서화된 종료코드: 3 = directory not found (아직 한 번도 옮겨진 파일이 없는 하위 트리)
 RCLONE_EXIT_DIRECTORY_NOT_FOUND: int = 3
 _DATED_DIR = DATED_DIR_RE
+_MONTH_DIR = re.compile(r"^\d{4}-\d{2}$")
 
 
 _resolve_rclone_bin = resolve_rclone_bin
@@ -178,8 +199,119 @@ def prune_local_intraday_backups(
     return sorted(purged)
 
 
+def _expired_day_files(day_dir: Path, today: pd.Timestamp, retention_days: int) -> list[Path]:
+    by_day: dict[str, list[Path]] = {}
+    for path in day_dir.iterdir():
+        if path.is_file():
+            by_day.setdefault(path.name.split(".", 1)[0], []).append(path)
+    return [path for day in expired_snapshot_dirs(list(by_day), today, retention_days) for path in sorted(by_day[day])]
+
+
+def prune_local_ops_logs(
+    *,
+    today: pd.Timestamp,
+    data_dir: Path | None = None,
+    retention_days: int = OPS_LOG_RETENTION_DAYS,
+    dry_run: bool = False,
+) -> list[str]:
+    """Delete ops diagnostic day files dated older than the retention window, plus orphan files.
+
+    Day files are `<YYYY-MM-DD>.<ext>` directly under `OPS_LOG_DAY_RELDIRS` or under a `<YYYY-MM>`
+    child of `OPS_LOG_MONTHLY_RELDIRS` (a month dir is removed only once empty); other names are kept.
+    Returns the sorted DATA_DIR-relative paths removed (or that would be, with dry_run).
+    Raises OSError when a file cannot be removed.
+    """
+    root = Path(data_dir) if data_dir is not None else Path(settings.DATA_DIR)
+    purged: list[str] = []
+    day_dirs = [root / reldir for reldir in OPS_LOG_DAY_RELDIRS]
+    month_dirs: list[Path] = []
+    for reldir in OPS_LOG_MONTHLY_RELDIRS:
+        base = root / reldir
+        if base.is_dir():
+            month_dirs.extend(sorted(p for p in base.iterdir() if p.is_dir() and _MONTH_DIR.match(p.name)))
+    for day_dir in (*day_dirs, *month_dirs):
+        if not day_dir.is_dir():
+            continue
+        for path in _expired_day_files(day_dir, today, retention_days):
+            if not dry_run:
+                path.unlink()
+            purged.append(path.relative_to(root).as_posix())
+    if not dry_run:
+        for month_dir in month_dirs:
+            if not any(month_dir.iterdir()):
+                month_dir.rmdir()
+    for relfile in OPS_LOG_ORPHAN_RELFILES:
+        orphan = root / relfile
+        if orphan.is_file():
+            if not dry_run:
+                orphan.unlink()
+            logger.info("[SYS] stage=backup_prune step=local_ops_logs orphan_removed=%s dry_run=%s", relfile, dry_run)
+            purged.append(relfile)
+    return sorted(purged)
+
+
+@contextlib.contextmanager
+def _audit_writer_lock(lock_path: Path, timeout: timedelta) -> Iterator[bool]:
+    # No unlink on release: flock(1) holders keep this inode, so replacing the file would split the lock.
+    fd = open_lock_descriptor(lock_path)
+    try:
+        deadline = time.monotonic() + timeout.total_seconds()
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(AUDIT_WRITER_LOCK_POLL_SEC)
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def audit_writer_lock_path() -> Path:
+    """Return `$XDG_RUNTIME_DIR/kca-audit.lock` (systemd `%t`).
+
+    Raises:
+        RuntimeError: XDG_RUNTIME_DIR is unset, so the writers' lock cannot be joined (compaction must not run).
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not runtime:
+        raise RuntimeError("XDG_RUNTIME_DIR unset; cannot join the remediation ledger writers' lock")
+    return Path(runtime) / AUDIT_WRITER_LOCK_NAME
+
+
+def compact_local_remediation_ledger(
+    *,
+    today: pd.Timestamp,
+    lock_path: Path | None = None,
+    ledger_path: Path | None = None,
+    retention_days: int = OPS_LOG_RETENTION_DAYS,
+    lock_timeout: timedelta = AUDIT_WRITER_LOCK_TIMEOUT,
+    dry_run: bool = False,
+) -> RemediationCompactionReport | None:
+    """Bound the remediation ledger under the writers' lock; None when the lock stayed busy (retried next run).
+
+    Raises:
+        RuntimeError: The lock path cannot be resolved.
+        OSError: The ledger cannot be read or replaced.
+    """
+    lock = lock_path if lock_path is not None else audit_writer_lock_path()
+    with _audit_writer_lock(lock, lock_timeout) as held:
+        if not held:
+            logger.warning("[SYS] stage=backup_prune step=remediation_compact status=LOCK_BUSY lock=%s", lock)
+            return None
+        return compact_remediation_ledger(
+            today=pd.Timestamp(today).date(), retention_days=retention_days, path=ledger_path, dry_run=dry_run
+        )
+
+
 def main(argv: list[str] | None = None) -> None:
-    """Run remote purge, local intraday prune and local sealed prune as isolated steps.
+    """Run remote purge and the local prunes (intraday, sealed, ledgers, history, ops logs) as isolated steps.
 
     Every step runs even if an earlier one raised; each failure is logged with its
     traceback, and the process exits 1 after all steps if any failed, so the
@@ -198,6 +330,8 @@ def main(argv: list[str] | None = None) -> None:
     failures: list[str] = []
     purged: list[str] = []
     local_purged: list[str] = []
+    ops_log_purged: list[str] = []
+    remediation_dropped = "not_run"
     sealed_report = LocalRetentionReport(removed=(), kept=(), bytes_removed=0)
     history_report = EvictionReport(evicted=(), kept=(), bytes_freed=0, stopped_by_deadline=False, capped=False)
     ledger_report = LedgerCompactionReport(compacted=(), kept=(), bytes_before=0, bytes_after=0)
@@ -241,12 +375,23 @@ def main(argv: list[str] | None = None) -> None:
             max_files=profile.HISTORY_EVICTION_MAX_FILES_PER_RUN,
         )
 
+    def _run_ops_logs() -> None:
+        nonlocal ops_log_purged
+        ops_log_purged = prune_local_ops_logs(today=today, dry_run=args.dry_run)
+
+    def _run_remediation_compact() -> None:
+        nonlocal remediation_dropped
+        report = compact_local_remediation_ledger(today=today, dry_run=args.dry_run)
+        remediation_dropped = "lock_busy" if report is None else str(report.dropped)
+
     steps = [
         ("remote", _run_remote),
         ("local_intraday", _run_local),
         ("local_sealed", _run_sealed),
         ("ledger_compact", _run_ledger_compact),
         ("local_history", _run_history),
+        ("local_ops_logs", _run_ops_logs),
+        ("remediation_compact", _run_remediation_compact),
     ]
     for name, fn in steps:
         try:
@@ -255,11 +400,12 @@ def main(argv: list[str] | None = None) -> None:
             logger.exception("[SYS] stage=backup_prune step=%s status=failed", name)
             failures.append(name)
     logger.info(
-        "[SYS] stage=backup_prune dry_run=%s purged=%d targets=%s local_purged=%d local_targets=%s sealed_removed=%d sealed_bytes=%d sealed_kept=%d sealed_skipped=%s history_evicted=%d history_bytes=%d history_kept=%d ledger_compacted=%d ledger_bytes_saved=%d",
+        "[SYS] stage=backup_prune dry_run=%s purged=%d targets=%s local_purged=%d local_targets=%s sealed_removed=%d sealed_bytes=%d sealed_kept=%d sealed_skipped=%s history_evicted=%d history_bytes=%d history_kept=%d ledger_compacted=%d ledger_bytes_saved=%d ops_logs_removed=%d remediation_dropped=%s",
         args.dry_run, len(purged), purged, len(local_purged), local_purged,
         len(sealed_report.removed), sealed_report.bytes_removed, len(sealed_report.kept), sealed_report.skipped_reason,
         len(history_report.evicted), history_report.bytes_freed, len(history_report.kept),
         len(ledger_report.compacted), ledger_report.bytes_before - ledger_report.bytes_after,
+        len(ops_log_purged), remediation_dropped,
     )
     logger.debug("[SYS] stage=backup_prune sealed_kept=%s", sealed_report.kept)
     if failures:

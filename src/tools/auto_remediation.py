@@ -19,6 +19,7 @@ from pathlib import Path
 
 from src import settings
 from src.data.capture_contracts import SEOUL
+from src.data.io_utils import atomic_write_text
 from src.tools.alert_policy import DEFAULT_ALERT_POLICY
 from src.tools.alerts import redact_for_egress
 from src.tools.deploy_window import blackout_remaining
@@ -253,6 +254,64 @@ def read_remediation_ledger(path: Path | None = None) -> tuple[RemediationRecord
             continue
         records.append(rec)
     return tuple(records)
+
+
+@dataclass(frozen=True)
+class RemediationCompactionReport:
+    """Outcome of one remediation-ledger compaction."""
+
+    kept: int
+    dropped: int
+    invalid_kept: int
+
+
+def compact_remediation_ledger(
+    *, today: date, retention_days: int, path: Path | None = None, dry_run: bool = False
+) -> RemediationCompactionReport:
+    """Rewrite the ledger keeping rows dated (KST) on/after today - retention_days, each key's unsettled STARTED row and every unparseable line.
+
+    The caller must hold the ledger writers' lock. Kept lines are written back byte-identical in order;
+    nothing is written when no row expires. An absent file yields an all-zero report.
+
+    Raises:
+        OSError: The ledger cannot be read or atomically replaced.
+    """
+    target = Path(path) if path is not None else remediation_ledger_path()
+    try:
+        text = target.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return RemediationCompactionReport(kept=0, dropped=0, invalid_kept=0)
+    parsed: list[tuple[str, RemediationRecord | None]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = _record_from_json(json.loads(line))
+        except ValueError:
+            rec = None
+        parsed.append((line, rec))
+    history = [rec for _, rec in parsed if rec is not None]
+    # settle_remediation keys on the latest lifecycle row; an unsettled STARTED must survive any age.
+    unsettled: set[int] = set()
+    for key in {rec.issue_key for rec in history}:
+        latest = _latest_record(history, key, lifecycle_only=True)
+        if latest is not None and latest.outcome is RemediationOutcome.STARTED:
+            unsettled.add(id(latest))
+    cutoff = today - timedelta(days=int(retention_days))
+    kept_lines: list[str] = []
+    dropped = 0
+    invalid = 0
+    for line, rec in parsed:
+        if rec is None:
+            invalid += 1
+            kept_lines.append(line)
+        elif _kst_date(rec.ts) >= cutoff or id(rec) in unsettled:
+            kept_lines.append(line)
+        else:
+            dropped += 1
+    if dropped and not dry_run:
+        atomic_write_text(target, "".join(f"{line}\n" for line in kept_lines), mode=None, durable=True)
+    return RemediationCompactionReport(kept=len(kept_lines), dropped=dropped, invalid_kept=invalid)
 
 
 def _attempts_today(

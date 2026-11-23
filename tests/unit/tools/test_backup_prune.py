@@ -2,6 +2,14 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _isolated_runtime_dir(monkeypatch, tmp_path) -> None:
+    # The remediation step joins $XDG_RUNTIME_DIR/kca-audit.lock; keep it off the real runtime dir.
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+
+
+@pytest.fixture(autouse=True)
 def _stub_ledger_compact(monkeypatch) -> None:
     from src.tools import backup_prune
     from src.tools.capture_offsite import LedgerCompactionReport
@@ -175,6 +183,146 @@ def test_prune_local_intraday_backups_ignores_non_date_dirs(tmp_path) -> None:
     assert purged == ["regular/2026-09-17"]
     assert notes.exists()
     assert not expired_dir.exists()
+
+
+def _touch(path, text: str = "x") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def test_prune_local_ops_logs_removes_only_day_files_past_retention(tmp_path) -> None:
+    import pandas as pd
+
+    from src.tools import backup_prune
+
+    # Given today=2026-11-23, retention=60 -> cutoff 2026-09-24 (strictly older is expired)
+    data = tmp_path
+    expired = [
+        data / "logs/audit_digests/2026-09-23.txt",
+        data / "logs/alerts/digest/2026-09-01.jsonl",
+        data / "logs/alerts/silent/2026-08-31.jsonl",
+        data / "logs/events/2026-08/2026-08-01.jsonl",
+        data / "logs/events/2026-09/2026-09-23.jsonl",
+    ]
+    kept = [
+        data / "logs/audit_digests/2026-09-24.txt",
+        data / "logs/alerts/digest/2026-11-23.jsonl",
+        data / "logs/audit_digests/README.txt",
+        data / "logs/alerts/incidents.json",
+        data / "logs/heartbeat/daily_audit.json",
+        data / "logs/remediation/ledger.jsonl",
+        data / "logs/events/2026-09/2026-09-24.jsonl",
+        data / "logs/events/2026-09/notes.txt",
+    ]
+    for path in (*expired, *kept):
+        _touch(path)
+
+    # When
+    purged = backup_prune.prune_local_ops_logs(today=pd.Timestamp("2026-11-23"), data_dir=data, retention_days=60)
+
+    # Then
+    assert purged == [
+        "logs/alerts/digest/2026-09-01.jsonl",
+        "logs/alerts/silent/2026-08-31.jsonl",
+        "logs/audit_digests/2026-09-23.txt",
+        "logs/events/2026-08/2026-08-01.jsonl",
+        "logs/events/2026-09/2026-09-23.jsonl",
+    ]
+    assert not any(path.exists() for path in expired)
+    assert all(path.exists() for path in kept)
+    # An emptied month dir goes; a month dir that still holds files stays
+    assert not (data / "logs/events/2026-08").exists()
+    assert (data / "logs/events/2026-09").is_dir()
+
+
+def test_prune_local_ops_logs_removes_orphan_sentinel_once(tmp_path, caplog) -> None:
+    import logging
+
+    import pandas as pd
+
+    from src.tools import backup_prune
+
+    # Given the orphan left by removed alert code
+    orphan = tmp_path / "logs/alerts/failure_sent.json"
+    _touch(orphan, "{}")
+
+    # When pruning twice
+    with caplog.at_level(logging.INFO, logger="src.tools.backup_prune"):
+        first = backup_prune.prune_local_ops_logs(today=pd.Timestamp("2026-11-23"), data_dir=tmp_path)
+    second = backup_prune.prune_local_ops_logs(today=pd.Timestamp("2026-11-23"), data_dir=tmp_path)
+
+    # Then it is removed and logged once, and the second run is a no-op
+    assert first == ["logs/alerts/failure_sent.json"]
+    assert not orphan.exists()
+    assert second == []
+    assert any("orphan_removed=logs/alerts/failure_sent.json" in r.getMessage() for r in caplog.records)
+
+
+def test_daily_audit_reads_outcomes_for_a_day_inside_the_window_after_prune() -> None:
+    import pandas as pd
+
+    from src.tools import backup_prune
+    from src.tools.run_outcome import RUN_OUTCOME_OK, load_run_outcomes, record_run_outcome
+
+    # Given outcomes recorded 60 days (kept) and 61 days (expired) before today
+    today = pd.Timestamp("2026-11-23")
+    inside = (today - pd.Timedelta(days=60)).date().isoformat()
+    outside = (today - pd.Timedelta(days=61)).date().isoformat()
+    for day in (inside, outside):
+        record_run_outcome("predict", RUN_OUTCOME_OK, run_date=day)
+
+    # When the nightly prune runs on DATA_DIR
+    backup_prune.prune_local_ops_logs(today=today)
+
+    # Then a --date rerun of daily_audit inside the window still sees its outcomes
+    assert load_run_outcomes(inside) == {"predict": RUN_OUTCOME_OK}
+    assert load_run_outcomes(outside) == {}
+
+
+def test_prune_local_ops_logs_dry_run_and_missing_dirs(tmp_path) -> None:
+    import pandas as pd
+
+    from src.tools import backup_prune
+
+    # Given one expired file and no other ops-log dirs
+    target = tmp_path / "logs/alerts/silent/2026-01-02.jsonl"
+    _touch(target)
+
+    # When
+    listed = backup_prune.prune_local_ops_logs(today=pd.Timestamp("2026-11-23"), data_dir=tmp_path, dry_run=True)
+
+    # Then dry run lists without deleting, and the default window is the typed 60-day constant
+    assert listed == ["logs/alerts/silent/2026-01-02.jsonl"]
+    assert target.exists()
+    assert backup_prune.OPS_LOG_RETENTION_DAYS == 60
+    assert backup_prune.prune_local_ops_logs(today=pd.Timestamp("2026-11-23"), data_dir=tmp_path / "absent") == []
+
+
+def test_main_runs_ops_log_prune_on_data_dir(monkeypatch, caplog) -> None:
+    import logging
+    from pathlib import Path
+
+    from src import settings
+    from src.tools import backup_prune
+    from src.tools.capture_offsite import LocalRetentionReport
+
+    # Given an expired digest under the (test-isolated) DATA_DIR and stubbed heavy steps
+    old = Path(settings.DATA_DIR) / "logs/audit_digests/2020-01-01.txt"
+    _touch(old)
+    monkeypatch.setattr(backup_prune, "prune_backups", lambda **kw: [])
+    monkeypatch.setattr(backup_prune, "prune_local_intraday_backups", lambda **kw: [])
+    monkeypatch.setattr(
+        backup_prune, "prune_local_sealed_capture", lambda *a, **kw: LocalRetentionReport(removed=(), kept=(), bytes_removed=0)
+    )
+    monkeypatch.setenv("HISTORY_EVICTION_ENABLED", "false")
+
+    # When
+    with caplog.at_level(logging.INFO, logger="src.tools.backup_prune"):
+        backup_prune.main([])
+
+    # Then
+    assert not old.exists()
+    assert any("ops_logs_removed=1" in r.getMessage() for r in caplog.records)
 
 
 def test_main_purges_remote_and_local_with_single_summary_log(monkeypatch, caplog) -> None:
@@ -484,3 +632,89 @@ def test_ledger_compact_runs_after_sealed_and_reports_savings(monkeypatch, caplo
 
     assert calls == ["sealed", "ledger"]
     assert any("ledger_compacted=1 ledger_bytes_saved=60" in rec.message for rec in caplog.records)
+
+
+def test_remediation_compact_skips_when_writers_hold_the_lock(tmp_path, caplog) -> None:
+    import fcntl
+    import logging
+    import os
+    from datetime import timedelta
+
+    import pandas as pd
+
+    from src.tools import backup_prune
+
+    # Given a writer holding the audit lock (as flock(1) does) and an expired ledger row
+    lock = tmp_path / "kca-audit.lock"
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text('{"ts": "2026-01-01T00:00:00+09:00", "issue_key": "k", "action": "rerun_unit", "unit": "u", "attempt": 1, "outcome": "resolved", "detail": ""}\n', encoding="utf-8")
+    before = ledger.read_bytes()
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        # When
+        with caplog.at_level(logging.WARNING, logger="src.tools.backup_prune"):
+            report = backup_prune.compact_local_remediation_ledger(
+                today=pd.Timestamp("2026-11-23"), lock_path=lock, ledger_path=ledger, lock_timeout=timedelta(seconds=0)
+            )
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    # Then nothing is rewritten and the lock file (shared inode with flock(1)) survives
+    assert report is None
+    assert ledger.read_bytes() == before
+    assert lock.exists()
+    assert any("LOCK_BUSY" in r.getMessage() for r in caplog.records)
+
+    # When the lock is free
+    report = backup_prune.compact_local_remediation_ledger(today=pd.Timestamp("2026-11-23"), lock_path=lock, ledger_path=ledger)
+
+    # Then the expired row is dropped and the lock file is kept
+    assert report is not None and report.dropped == 1
+    assert ledger.read_text(encoding="utf-8") == ""
+    assert lock.exists()
+
+
+def test_audit_writer_lock_path_requires_runtime_dir(monkeypatch) -> None:
+    from src.tools import backup_prune
+
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    with pytest.raises(RuntimeError):
+        backup_prune.audit_writer_lock_path()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    assert str(backup_prune.audit_writer_lock_path()) == "/run/user/1000/kca-audit.lock"
+
+
+def test_remediation_compact_waits_for_a_short_writer_then_runs(tmp_path, monkeypatch) -> None:
+    import fcntl
+    import os
+    import threading
+    from datetime import timedelta
+
+    import pandas as pd
+
+    from src.tools import backup_prune
+
+    # Given a writer that releases the audit lock shortly after the compaction starts waiting
+    monkeypatch.setattr(backup_prune, "AUDIT_WRITER_LOCK_POLL_SEC", 0.01)
+    lock = tmp_path / "kca-audit.lock"
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+
+    def _release() -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    timer = threading.Timer(0.1, _release)
+    timer.start()
+    try:
+        # When
+        report = backup_prune.compact_local_remediation_ledger(
+            today=pd.Timestamp("2026-11-23"), lock_path=lock, ledger_path=tmp_path / "absent.jsonl", lock_timeout=timedelta(seconds=10)
+        )
+    finally:
+        timer.join()
+
+    # Then it acquired the lock instead of skipping
+    assert report is not None and report.kept == 0

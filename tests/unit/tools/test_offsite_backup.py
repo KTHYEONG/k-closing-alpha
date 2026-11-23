@@ -40,7 +40,7 @@ def test_loose_copy_data_excludes_segment_tiers_and_local_snapshots() -> None:
     assert cmd[cmd.index("--backup-dir") + 1] == f"{BACKUP_REMOTE_BASE}/_deleted/data/2026-09-18"
     for pattern in LOOSE_EXCLUDES:
         assert pattern in cmd
-    assert len(LOOSE_EXCLUDES) == 9
+    assert len(LOOSE_EXCLUDES) == 15
     assert "/history/capture/offsite/ledger/**" in LOOSE_EXCLUDES
     assert "/history/capture/manifests/**" in LOOSE_EXCLUDES
     assert "/history/price_history.parquet" in LOOSE_EXCLUDES
@@ -293,6 +293,55 @@ def test_tape_backfill_ledger_is_not_excluded_from_loose_copy() -> None:
     assert "/history/capture/staging/offsite/**" in LOOSE_EXCLUDES
     assert "/history/capture/declared/**" in LOOSE_EXCLUDES
     assert not any(pattern.startswith("/history/capture/staging/**") for pattern in LOOSE_EXCLUDES)
+
+
+def test_loose_copy_excludes_ops_diagnostics_but_keeps_resume_state() -> None:
+    from src.tools.offsite_backup import LOOSE_EXCLUDES, loose_copy_command
+
+    # Given the data subtree copy
+    cmd = loose_copy_command("rclone", Path("/proj"), "data", "2026-11-23")
+    excludes = {cmd[i + 1] for i, part in enumerate(cmd) if part == "--exclude"}
+
+    # Then per-day diagnostics and the orphan sentinel never travel offsite
+    for pattern in (
+        "/logs/audit_digests/**",
+        "/logs/alerts/digest/**",
+        "/logs/alerts/silent/**",
+        "/logs/events/**",
+        "/logs/alerts/outbox/**",
+        "/logs/alerts/failure_sent.json",
+    ):
+        assert pattern in excludes
+    # And no exclude covers state the code reads back after a rebuild, nor the remediation audit trail
+    for kept in (
+        "/logs/**",
+        "/logs/alerts/**",
+        "/logs/heartbeat/**",
+        "/logs/remediation/**",
+        "/logs/alerts/incidents.json",
+    ):
+        assert kept not in LOOSE_EXCLUDES
+
+
+def test_ops_log_day_dirs_match_their_writers(tmp_path: Path) -> None:
+    from src import settings
+    from src.tools.alerts import alert_outbox_dir, digest_record_dir
+    from src.tools.daily_audit import AUDIT_DIGEST_ARCHIVE_RELDIR
+    from src.tools.incident_pager import SILENT_RECORD_RELDIR
+    from src.tools.offsite_common import OPS_LOG_DAY_RELDIRS, OPS_LOG_LOCAL_STATE_RELDIRS, OPS_LOG_MONTHLY_RELDIRS
+    from src.tools.run_outcome import run_events_path
+
+    # Given the writer locations relative to DATA_DIR
+    data = Path(settings.DATA_DIR)
+    digest_rel = digest_record_dir().relative_to(data).as_posix()
+    events_rel = run_events_path("2026-11-23").parent.parent.relative_to(data).as_posix()
+    outbox_rel = alert_outbox_dir().relative_to(data).as_posix()
+
+    # Then the excluded/pruned sets are exactly what those writers produce
+    assert set(OPS_LOG_DAY_RELDIRS) == {AUDIT_DIGEST_ARCHIVE_RELDIR, SILENT_RECORD_RELDIR, digest_rel}
+    assert set(OPS_LOG_MONTHLY_RELDIRS) == {events_rel}
+    assert run_events_path("2026-11-23").parent.name == "2026-11"
+    assert set(OPS_LOG_LOCAL_STATE_RELDIRS) == {outbox_rel}
 
 
 def _write_core_parquet(path, rows: int, max_date: str) -> None:

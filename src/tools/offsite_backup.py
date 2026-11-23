@@ -21,7 +21,13 @@ from zoneinfo import ZoneInfo
 from src.data.capture_store import resolve_capture_root as _capture_root
 from src.data.io_utils import atomic_write_text
 from src.tools.capture_offsite import OffsiteConfig, SealReport, publish_raw_dictionary, seal_and_upload
-from src.tools.offsite_common import OFFSITE_REMOTE_BASE
+from src.tools.offsite_common import (
+    OFFSITE_REMOTE_BASE,
+    OPS_LOG_DAY_RELDIRS,
+    OPS_LOG_LOCAL_STATE_RELDIRS,
+    OPS_LOG_MONTHLY_RELDIRS,
+    OPS_LOG_ORPHAN_RELFILES,
+)
 from src.tools.offsite_common import resolve_rclone_bin as _resolve_rclone_bin
 from src.tools.price_history_offsite import (
     MANIFEST_NAME as PRICE_HISTORY_FORM_MANIFEST,
@@ -55,6 +61,9 @@ LOOSE_EXCLUDES: tuple[str, ...] = (
     "/history/price_history_offsite/**",
     # Append-only seal ledgers are uploaded by their own step without _deleted versioning.
     "/history/capture/offsite/ledger/**",
+    # Ops diagnostics and local-only alert state stay on the host (owner rule 2026-11-23).
+    *(f"/{reldir}/**" for reldir in (*OPS_LOG_DAY_RELDIRS, *OPS_LOG_MONTHLY_RELDIRS, *OPS_LOG_LOCAL_STATE_RELDIRS)),
+    *(f"/{relfile}" for relfile in OPS_LOG_ORPHAN_RELFILES),
 )
 LOOSE_RCLONE_FLAGS: tuple[str, ...] = ("--transfers", "4", "--checkers", "8")
 BACKUP_SLOT_KST: time = time(22, 15)
