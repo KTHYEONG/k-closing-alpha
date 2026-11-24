@@ -166,7 +166,7 @@ Optional timers (`OPTIONAL_MANUAL_TIMERS`, `src/tools/code_sync.py:35-37`): auct
 | A01 | EXT | all | heartbeat `schema_version 2`, `undelivered_alerts 0`, `reconciled_at` ≤ 15 min (07:00–23:05), `snapshot_date == D` after 21:30 (N) and in M; WARN on open issues | P1 | `cat logs/heartbeat/*.json`, `tail remediation/ledger.jsonl` |
 | A02 | EXT | M | digest `logs/audit_digests/<D>.txt` line 1 `[kca] 🟢 <D> 일일점검 완료`; open issue keys each map to a finding; remediation rows `started` without `resolved/unresolved` are in flight; `unresolved/skipped_budget` need the operator; no forbidden unit (collect, predict, finalize, paper-*, aftermarket-book, auction-*, retrain, daily-audit, kiwoom-rotate) in the ledger | P1 | `head -1 audit_digests/<D>.txt` |
 | A03 | EXT | all | every unit with `Failed with result` since the window start has a `kca-alert@<unit>` run | P1 | alert journal |
-| A04 | EXT | M | dashboard kca card all OK (non-OK must map to a finding; its `[[schedule]]` list lives in `quant-dashboard/config.toml`) | P2 | `public/status.json` |
+| A04 | EXT | M | dashboard kca card all OK (non-OK must map to a finding; its `[[schedule]]` list lives in `quant-ops/config.toml`) | P2 | `public/status.json` |
 | A05 | EXT | W | `watchdog.yml` last 5 scheduled runs `success` | P1 | `gh run list --workflow watchdog.yml` |
 | X01 | EXT | all | kca journal since the window start: no `HostBrokerDirNotSharedError AdmissionDirNotSharedError SCHEMA_INVALID` (FAIL); WARN on `IGW00201 EGW00201 EGW00133 EGW00121 AUTH_REJECTED ADOPTED_ROTATED TokenIssueThrottled TokenStoreLockTimeout TOKEN_REPLACED http=429`; any hit on decision units 15:20–15:31 = P1 | P2/P1 | grep with unit names |
 | X02 | EXT | M | Drive lock: kca-backup start delay ≤ 15 min (B01 `start_delay_min`); other holders: `kse-backup` 02:30, `krx-host-backup` 23:30 (`krx-alpha/deploy/host/krx-host-backup.sh:7,131`) | P2 | `journalctl -u kca-backup -u krx-host-backup -u kse-backup` |
@@ -279,7 +279,7 @@ Known conditions:
 | 2026-10-22 | `price_basis_raw_basis_unavailable`: 393 keys, a stable vendor gap growing only with new corporate actions | heartbeat info | 2026-11-30 | — |
 | 2026-10-16 | Daily audit `missing_bars` is judged on D only; extended backfill can rewrite past dates with `vendor=kis` trade-only symbols (10-16: 213) that a re-audit would flag | re-audits of past D may show it | 2026-11-30 | — |
 | 2026-10-09 | `stale_kis_token:*` on CLOSED days (warmup skips; budget exhausted) | regression if seen again (P2) | 2026-11-30 | — |
-| standing | Dashboard `[[schedule]]` list is separate (`quant-dashboard/config.toml`); a removed slot (price-ingest 21:30, `627cd1c`) raises `예정 실행이 지연` there | A04 WARN | on dashboard change | fix in the dashboard config |
+| standing | Dashboard `[[schedule]]` list is separate (`quant-ops/config.toml`); a removed slot (price-ingest 21:30, `627cd1c`) raises `예정 실행이 지연` there | A04 WARN | on dashboard change | fix in the dashboard config |
 | standing | ops-sentinel `job_late` vs `After=`: a unit held behind a slow predecessor stays PENDING (a slow archive-intraday raised a false `job_late:kca-tape-sweep`) | R01 PASS after it finishes | — | — |
 | standing | Failed state persists until the unit's next run (e.g. retrain until next Saturday unless `reset-failed`) | H01 FAIL with the cause named | — | — |
 | standing | `TOKEN_REPLACED` (Toss token shared by PC and VPS), Drive lock and KIS slots are cross-project; attribute precisely | X01/X02 WARN | — | — |

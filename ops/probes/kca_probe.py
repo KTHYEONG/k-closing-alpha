@@ -481,7 +481,7 @@ if W == "M":
     x_tokens(at(D, "15:00:00"))
     @check("A04")
     def _():
-        s = json.loads(Path("/home/ubuntu/quant-dashboard/public/status.json").read_text())
+        s = json.loads(Path("/home/ubuntu/quant-ops/public/status.json").read_text())
         proj = [p for p in s["projects"] if "closing" in p["name"] or p["name"] in ("kca",)]
         bad = [(c["id"], c["level"]) for p in proj for c in p["checks"] if c["level"] != "OK"]
         out("A04", lv(False, bool(bad) or not proj), generated=s["generated_at"][:16], card=[p["name"] for p in proj], non_ok=bad or "-")

@@ -1,7 +1,7 @@
 """Broker API notice watcher: surfaces new notices that touch the TRs/paths any host project calls.
 
 Impact is judged against the `api_surface` manifest (kca, krx, kse). Actionable items persist as pending actions
-in the state file until acknowledged; quant-dashboard renders them per project and an AI/ops check can list them
+in the state file until acknowledged; QuantOps renders them per project and an AI/ops check can list them
 (`--pending`), fix the affected project, then `--ack`. Nothing is mailed.
 """
 
@@ -638,7 +638,7 @@ def ack_pending(state_path: Path, action_ids: Sequence[str]) -> list[str]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - CLI entry; logic covered via run_watch scenarios
-    parser = argparse.ArgumentParser(description="Broker API notice watcher (records notices touching our API surface for quant-dashboard)")
+    parser = argparse.ArgumentParser(description="Broker API notice watcher (records notices touching our API surface for QuantOps)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="print the report; keep state untouched")
     mode.add_argument("--pending", action="store_true", help="list open pending actions and exit")
