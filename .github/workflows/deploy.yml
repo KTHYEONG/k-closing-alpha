@@ -188,6 +188,7 @@ jobs:
           STAGE=stage_lib
           ssh $SSH_OPTS "$REMOTE_USER@$HOST" "mkdir -p ~/k-closing-alpha/.deploy"
           scp $SSH_OPTS deploy/vps-deploy-lib.sh "$REMOTE_USER@$HOST:~/k-closing-alpha/.deploy/vps-deploy-lib-$COMMIT_SHA.sh"
+          scp $SSH_OPTS deploy/host/wait-host-units-idle.sh "$REMOTE_USER@$HOST:~/k-closing-alpha/.deploy/wait-host-units-idle-$COMMIT_SHA.sh"
 
           STAGE=remote
           ssh $SSH_OPTS "$REMOTE_USER@$HOST" bash -s <<EOF
@@ -205,8 +206,14 @@ jobs:
           docker run --rm -e TZ=Asia/Seoul ghcr.io/kthyeong/k-closing-alpha:sha-$COMMIT_SHA uv run python -m src.tools.deploy_window --wait
           if [ "$LATEST_MAIN_SHA" != "$COMMIT_SHA" ]; then
             echo "SKIP: superseded by $LATEST_MAIN_SHA"
-            rm -f ~/k-closing-alpha/.deploy/vps-deploy-lib-$COMMIT_SHA.sh
+            rm -f ~/k-closing-alpha/.deploy/vps-deploy-lib-$COMMIT_SHA.sh ~/k-closing-alpha/.deploy/wait-host-units-idle-$COMMIT_SHA.sh
             exit 0
+          fi
+          # 호스트 체크아웃에서 직접 실행되는 kca 유닛(docker 미경유)이 끝날 때까지 기다린 뒤에만
+          # latest 승격과 체크아웃 교체를 진행한다. 유닛은 중지하지 않으며, 시한 초과 시 실패한다.
+          vps_stage host_units_wait
+          if ! bash ~/k-closing-alpha/.deploy/wait-host-units-idle-$COMMIT_SHA.sh ~/k-closing-alpha 4200 30; then
+            vps_fail host_units_busy
           fi
           vps_stage promote
           vps_promote_latest ghcr.io/kthyeong/k-closing-alpha $COMMIT_SHA
@@ -219,5 +226,5 @@ jobs:
           git fetch origin $COMMIT_SHA --quiet
           git reset --hard $COMMIT_SHA
           ~/.local/bin/uv run python -m src.tools.code_sync --sha $COMMIT_SHA
-          rm -f ~/k-closing-alpha/.deploy/vps-deploy-lib-$COMMIT_SHA.sh
+          rm -f ~/k-closing-alpha/.deploy/vps-deploy-lib-$COMMIT_SHA.sh ~/k-closing-alpha/.deploy/wait-host-units-idle-$COMMIT_SHA.sh
           EOF

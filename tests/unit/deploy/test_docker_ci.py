@@ -105,6 +105,21 @@ def test_deploy_job_serialized_and_bounded() -> None:
     assert "timeout-minutes:" in deploy_job
 
 
+def test_deploy_waits_for_host_units_before_converge() -> None:
+    from pathlib import Path
+
+    workflow = Path(".github/workflows/deploy.yml").read_text(encoding="utf-8")
+
+    superseded = "SKIP: superseded by"
+    wait = "wait-host-units-idle-$COMMIT_SHA.sh ~/k-closing-alpha 4200 30"
+    promote = "vps_stage promote"
+    reset = "git reset --hard $COMMIT_SHA"
+
+    positions = [workflow.index(line) for line in (superseded, wait, promote, reset)]
+    assert positions == sorted(positions)
+    assert "vps_fail host_units_busy" in workflow
+
+
 def test_deploy_skips_superseded_commit() -> None:
     from pathlib import Path
 
