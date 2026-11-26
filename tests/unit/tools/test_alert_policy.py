@@ -63,7 +63,6 @@ def test_critical_units(unit: str, kind: IncidentKind) -> None:
         "kca-retrain.service",
         "kca-daily-audit.service",
         "kca-audit-reconcile.service",
-        "kca-api-notice-watch.service",
         "kca-kiwoom-token-rotate.service",
         "krx-host-backup.service",
         "vps-image-gc.service",

@@ -448,7 +448,8 @@ if W == "M":
         off = [l.split()[0] for l in sh(["systemctl", "--user", "list-unit-files", "kca-*.timer", "--no-legend"]).splitlines() if l.split()[1:2] != ["enabled"]]
         failed = [l.split()[0] for l in sh(["systemctl", "--user", "list-units", "--failed", "--no-legend", "--plain", "kca-*"]).splitlines() if l.strip()]
         linger = sh(["loginctl", "show-user", os.environ.get("USER", "ubuntu"), "-p", "Linger", "--value"]).strip()
-        out("H01", lv(n != 32 or bool(failed) or linger != "yes", bool(off)), timers=n, not_enabled=off or "-", failed=failed or "-", linger=linger)
+        expected = sum(1 for p in (Path(__file__).resolve().parents[2] / "deploy" / "systemd").glob("kca-*.timer") if not p.name.startswith("kca-alert@"))
+        out("H01", lv(n != expected or bool(failed) or linger != "yes", bool(off)), timers=n, expected=expected, not_enabled=off or "-", failed=failed or "-", linger=linger)
     wk = TODAY.weekday() < 5
     runs("R01", [("archive-intraday", D, "20:05:00", 1), ("tape-sweep", D, "20:35:00", 1), ("backup-prune", D, "21:00:00", 1), ("daily-audit", D, "21:20:00", 1),
                  ("altdata-capture", D, "21:35:00", 1), ("backup", YDAY, "22:15:00", 1), ("extended-backfill", YDAY, "23:05:00", 1)]
